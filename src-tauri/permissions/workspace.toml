@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-workspace-read"
+description = "Allow local main-window workspace selection and scoped read-only tree/text browsing."
+commands.allow = ["get_workspace_info", "select_workspace", "read_directory_tree", "read_workspace_text"]

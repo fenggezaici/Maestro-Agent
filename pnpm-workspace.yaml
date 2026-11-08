@@ -1,0 +1,8 @@
+packages:
+  - '.'
+
+overrides:
+  'monaco-editor>dompurify': '3.4.17'
+
+onlyBuiltDependencies:
+  - esbuild

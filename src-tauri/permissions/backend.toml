@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-backend"
+description = "Allow the main window to use the guarded agent and history commands."
+commands.allow = ["get_snapshot", "set_mode", "start_agent", "cancel_agent", "list_runs", "create_session", "list_sessions", "get_session", "decide_plan", "stream_chat"]

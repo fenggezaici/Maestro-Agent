@@ -1,0 +1,46 @@
+import { ArrowLeft, CheckCheck, Coins, FileCode2, Sparkles, TrendingUp } from 'lucide-react';
+import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts';
+import ActivityGrid from './ActivityGrid';
+import type { MockDashboardData } from './activityMock';
+
+export default function ActivityDashboard({ data, projectName, onBack }: {
+  data: MockDashboardData; projectName: string; onBack: () => void;
+}) {
+  const metrics = [
+    { label: 'Total Lines', value: data.totalLines.toLocaleString('en-US'), detail: 'Lines changed', icon: FileCode2 },
+    { label: 'Plans Approved', value: String(data.approvedPlans), detail: 'Plans reviewed', icon: CheckCheck },
+    { label: 'Tokens Used', value: `${(data.totalTokens / 1000000).toFixed(1)}M`, detail: 'Model tokens', icon: Sparkles },
+    { label: 'Cost', value: `$${data.cost.toFixed(2)}`, detail: 'Estimated usage', icon: Coins },
+  ];
+  const trendTotal = data.trend.reduce((total, day) => total + day.tokens, 0);
+  return <section aria-label="Activity Dashboard" className="dashboard-scroll">
+    <div className="dashboard-inner">
+      <button type="button" className="dashboard-back" onClick={onBack}><ArrowLeft size={13} />Back to Chat</button>
+      <div className="dashboard-title"><div><p className="eyebrow">WORKSPACE INSIGHTS</p><h3>Activity Dashboard</h3><p>{projectName} / 过去六个月的工作节奏</p></div><span className="mock-badge">Mock data</span></div>
+      <p className="dashboard-disclaimer">所有指标均为前端 Mock，不代表真实代码修改、模型用量或账单。</p>
+      <div className="dashboard-metrics" aria-label="核心指标">
+        {metrics.map(({ label, value, detail, icon: Icon }) => <article key={label} aria-label={`${label}（Mock）`} className="metric-card">
+          <div className="metric-heading"><Icon size={14} strokeWidth={1.5} /><span className="mock-badge">Mock</span></div>
+          <p>{label}</p><strong>{value}</strong><small>{detail}</small>
+        </article>)}
+      </div>
+      <ActivityGrid days={data.days} />
+      <section aria-label="30 日 Token 趋势" className="dashboard-card trend-card">
+        <header className="dashboard-section-heading"><div><h4><TrendingUp size={15} />Token usage</h4><p>Last 30 days / {trendTotal.toLocaleString('en-US')} tokens</p></div><span className="mock-badge">Mock</span></header>
+        <div className="trend-chart" role="img" aria-label="过去 30 天 Token 消耗折线图（Mock）">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{ width: 520, height: 205 }}>
+            <LineChart data={data.trend} margin={{ top: 15, right: 8, bottom: 0, left: -14 }}>
+              <CartesianGrid stroke="#ffffff08" strokeDasharray="3 5" vertical={false} />
+              <XAxis dataKey="shortDate" axisLine={false} tickLine={false} minTickGap={42} tick={{ fill: '#7d7d7d', fontSize: 9 }} tickMargin={12} />
+              <YAxis axisLine={false} tickLine={false} width={44} tick={{ fill: '#7d7d7d', fontSize: 9 }} tickFormatter={(value: number) => `${Math.round(value / 1000)}k`} />
+              <ChartTooltip cursor={{ stroke: '#ffffff15' }} content={({ active, payload, label }) => active && payload?.length
+                ? <div className="activity-tooltip"><strong>{label} / Mock</strong><p>{Number(payload[0].value).toLocaleString('en-US')} tokens</p></div> : null} />
+              <Line type="monotone" dataKey="tokens" stroke="#aa97c3" strokeWidth={2} dot={false} activeDot={{ r: 4, fill: '#b8a2d1', stroke: '#242424', strokeWidth: 2 }} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="trend-caption">30 个每日样本 · UTC · 示例趋势，不连接用量或计费 API。</p>
+      </section>
+    </div>
+  </section>;
+}
