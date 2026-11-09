@@ -29,3 +29,45 @@ export function changeMockExtension(items: MockExtension[], id: string, action: 
     return item;
   });
 }
+
+// Preview-mode controller: functional local state, zero backend calls.
+import { useState } from 'react';
+import type { ExtensionsController } from '../useExtensions';
+import type { McpServerView, RecommendedItem, SkillView } from '../extensions';
+
+const previewRecommended: RecommendedItem[] = [
+  { id: 'superpowers', kind: 'skill', name: 'Superpowers', description: '社区热门技能合集：TDD、系统化调试、分支工作流。', sourceUrl: 'https://github.com/obra/superpowers', installPayload: 'https://github.com/obra/superpowers' },
+  { id: 'filesystem', kind: 'mcp', name: 'FileSystem', description: '官方文件系统服务：受控目录内的文件读写与目录遍历。', sourceUrl: 'https://github.com/modelcontextprotocol/servers', installPayload: '{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]}' },
+];
+
+export function usePreviewExtensions(): ExtensionsController {
+  const [skills, setSkills] = useState<SkillView[]>([
+    { name: 'code-review', description: 'Review conventions and quality checks', source: 'global', path: '~/.maestro/skills/code-review/SKILL.md' },
+    { name: 'pdf-tools', description: '项目级技能示例', source: 'project', path: '<workspace>/.maestro/skills/pdf-tools/SKILL.md' },
+  ]);
+  const [servers, setServers] = useState<McpServerView[]>([
+    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], disabled: false, running: true, toolCount: 8, error: null },
+    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], disabled: false, running: false, toolCount: 0, error: null },
+  ]);
+  const [pending, setPending] = useState<string | null>(null);
+  const noop = async () => null;
+  return {
+    skills, servers,
+    recommendedSkills: previewRecommended.filter((i) => i.kind === 'skill'),
+    recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
+    mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
+    loading: false, pending,
+    refresh: async () => {},
+    createSkill: async (name, description) => { setSkills((items) => [...items, { name, description, source: 'global', path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
+    importSkill: noop, importSkillGithub: noop,
+    addMcpServer: async (name, command, args) => { setServers((items) => [...items, { name, command, args, disabled: false, running: false, toolCount: 0, error: null }]); return null; },
+    importMcpJson: noop,
+    toggleMcpServer: async (server, enable) => {
+      setPending(`mcp-${server.name}`);
+      setServers((items) => items.map((item) => item.name === server.name ? { ...item, running: enable, toolCount: enable ? 8 : 0 } : item));
+      setPending(null);
+    },
+    removeMcpServer: async (name) => { setServers((items) => items.filter((item) => item.name !== name)); return null; },
+    installRecommended: noop,
+  };
+}

@@ -4,7 +4,7 @@
 
 Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作台。它将对话、会话管理和代码审查组织在可调整的三栏界面中，使用系统 WebView，不引入 Electron。
 
-> **开发阶段：Phase 2 起步。**真实模型聊天和只读文件浏览已经实现；自主代码修改、命令执行和原生 MCP 集成尚未开放。部分界面用于明确标注的 Mock 演示。
+> **开发阶段：Phase 3。**真实模型聊天、工具调用循环（Skill/MCP）和只读文件浏览已经实现；自主代码修改与命令执行尚未开放。部分界面用于明确标注的 Mock 演示。
 
 ## 界面预览
 
@@ -23,16 +23,20 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 
 | 功能 | 当前状态 |
 | --- | --- |
-| OpenAI 兼容聊天 | Rust 请求 `/chat/completions`，SSE 增量回复、停止生成、超时与错误提示 |
+| Provider 聊天 | OpenAI/DeepSeek/Ollama 兼容接口与 Anthropic Messages SSE，增量回复、取消和错误提示 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览 |
 | Review / 审批 | 提议 Diff 与单次计划决定；批准不应用修改，真实模型暂不自动生成审批卡片 |
 | IDE 工作台 | 可拖拽分栏、会话搜索与项目分组、Settings、应用内快捷键 |
-| Activity / 参数控件 | Dashboard、Tokens meter、上下文、Temperature 和主题选择包含明确 Mock |
-| Provider / 扩展 | Anthropic/Ollama 选择与 MCP/Skills/Plugins 状态为 UI 演示，不启用原生协议或工具 |
+| 模型能力 / 会话统计 | 动态思考选项与目录上下文上限，Provider usage/计时；缺失用量明确标为估算 |
+| 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
+| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
+| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`readOnlyHint` 参与模式授权 |
+| 工具循环 | OpenAI/Anthropic 双格式 tool_calls 流式解析，最多 8 轮执行-续流，全程走模式授权与审计 |
+| Activity | Dashboard 仍为 Mock 演示数据 |
 
-**No model tool execution, project-file writes, patch application, or command execution is enabled.** Selecting Execute or approving a plan does not bypass this boundary.
+**Project-file writes, patch application, or shell command execution are still disabled.** Plan / Code (default) / Confirm / Auto are real Rust policies; selecting Auto or approving a plan does not create missing executors. MCP tools honor each server's `readOnlyHint` and the active mode; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
 
 ## 快速开始
 
@@ -69,13 +73,15 @@ pnpm.cmd tauri dev
 
 进入左下角 **Settings → Models**，填写并保存：
 
-- **Base URL**：通常为 `https://your-provider.example/v1`，Rust 自动补全 `/chat/completions`。
-- **API Key**：服务提供的访问密钥。
+- **Provider / Base URL**：选择 OpenAI、DeepSeek、Anthropic 或 Ollama，独立保存配置；Rust 自动补全兼容端点或 Anthropic `/messages`。
+- **API Key**：服务提供的访问密钥；本地 Ollama 可为空，其他 Provider 不会复制已有 Key。
 - **Model**：该服务支持的模型名称。
 
 输入消息并发送，或按 **Ctrl/Cmd+Enter**。右侧 **Explorer** 在开发模式下默认浏览当前仓库，也可通过路径栏选择其他本地项目。
 
 更新 Rust 后，先关闭旧窗口、在启动终端按 Ctrl+C，再重新运行 `pnpm.cmd tauri dev`。当前开发与打包流程面向 Windows；其他平台尚未完成验证。
+
+动态思考能力、估算统计、本地附件和 v3 模式迁移的说明见 [核心交互与模型能力](docs/core-interactions.md)。
 
 ## 安全与数据边界
 
@@ -87,6 +93,7 @@ pnpm.cmd tauri dev
 - Rust 持有模式与运行授权；Plan Mode 拒绝副作用工具和未知名称，但允许应用内部会话/审计落库。
 - Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules` and `target`, and enforce path, link, scan-budget and file-size limits.
 - 文件浏览不会自动把内容发送给模型。只读检查不是完整 OS 沙箱；并发恶意文件系统下的残余 TOCTOU 风险见[工作区文档](docs/workspace-filesystem.md)。
+- 扩展数据存放于 `~/.maestro/`（`skills/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，30s 调用超时，应用退出时统一回收；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
 
 真实聊天上下文由 Rust 从指定会话的已完成记录重建，附加模式提示。前端使用带运行/会话 ID 与序号的 IPC 事件，避免串流和重复追加。
 
@@ -112,6 +119,8 @@ Rust kernel ── model transport (reqwest / SSE)
 | `src-tauri/src/llm.rs` | OpenAI 兼容 HTTP/SSE 与 Rust System Prompt |
 | `src-tauri/src/db.rs` | SQLite 线程、迁移、恢复与事务 |
 | `src-tauri/src/workspace.rs` | 受限文件树与文本读取 |
+| `src-tauri/src/extensions/` | Skill 扫描/解析/导入与最小 stdio MCP 客户端 |
+| `src/extensions.ts`, `src/useExtensions.ts` | 扩展 IPC 契约与面板状态 |
 | `src-tauri/capabilities/`, `permissions/` | 本地主窗口的最小命令权限 |
 
 ## 测试与构建

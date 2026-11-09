@@ -4,7 +4,7 @@ export interface UiPreferences {
   language: 'en' | 'zh-CN'; startupView: 'agents' | 'activity' | 'extensions';
   theme: 'dark' | 'light' | 'system'; editorFont: string; editorFontSize: number;
   contextWindow: 8192 | 32768 | 128000; temperature: number;
-  provider: 'openai' | 'anthropic' | 'ollama'; previewModel: string;
+  provider: 'openai' | 'deepseek' | 'anthropic' | 'ollama'; previewModel: string;
   shortcuts: Record<ShortcutAction, string>;
 }
 
@@ -46,7 +46,7 @@ export function readUiPreferences(source: 'live' | 'preview'): UiPreferences {
     if (Number.isInteger(value.editorFontSize) && value.editorFontSize >= 10 && value.editorFontSize <= 20) result.editorFontSize = value.editorFontSize;
     if ([8192, 32768, 128000].includes(value.contextWindow)) result.contextWindow = value.contextWindow;
     if (Number.isFinite(value.temperature) && value.temperature >= 0 && value.temperature <= 2) result.temperature = value.temperature;
-    if (['openai', 'anthropic', 'ollama'].includes(value.provider)) result.provider = value.provider;
+    if (['openai', 'deepseek', 'anthropic', 'ollama'].includes(value.provider)) result.provider = value.provider;
     if (typeof value.previewModel === 'string' && value.previewModel.length < 128) result.previewModel = value.previewModel;
     for (const action of Object.keys(defaultShortcuts) as ShortcutAction[]) {
       if (typeof value.shortcuts?.[action] === 'string') {

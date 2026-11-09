@@ -8,21 +8,24 @@ export interface ActivityDay {
 export interface WorkbenchProject {
   id: string;
   name: string;
+  path?: string | null;
+  archived?: boolean;
   sessions: SessionView[];
+  archivedSessions?: SessionView[];
   activity?: ActivityDay[];
   today?: { changedLines: number; completedPlans: number };
 }
 
-export function readExpandedProjects(key: string, projects: WorkbenchProject[]): string[] {
-  try {
-    const saved: unknown = JSON.parse(localStorage.getItem(key) ?? 'null');
-    if (Array.isArray(saved) && saved.every((id) => typeof id === 'string')) {
-      return saved.filter((id) => projects.some((project) => project.id === id));
-    }
-  } catch { /* UI preferences must not prevent startup. */ }
-  return projects.map((project) => project.id);
-}
-
-export function saveExpandedProjects(key: string, values: string[]) {
-  try { localStorage.setItem(key, JSON.stringify(values)); } catch { /* Storage may be unavailable. */ }
+/// Unix-second timestamps become compact relative ages; preview fixtures use 1.
+export function relativeSessionAge(updatedAt: number, source?: 'preview' | 'live', now = Date.now()): string {
+  if (source === 'preview' || updatedAt <= 0) return '示例';
+  const seconds = Math.max(0, Math.floor(now / 1000 - updatedAt));
+  if (seconds < 90) return '刚刚';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 365) return `${days} 天前`;
+  return `${Math.floor(days / 365)} 年前`;
 }

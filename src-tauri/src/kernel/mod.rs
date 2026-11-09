@@ -4,11 +4,12 @@ use tokio::sync::{watch, Mutex};
 
 use crate::{
     agent,
-    db::Database,
+    db::{Database, DEFAULT_PROJECT_ID},
+    extensions::ExtensionManager,
     llm::ChatConfig,
     model::{
-        AppResult, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft, RunStatus,
-        RunView, SessionDetail, SessionView, Snapshot,
+        AppResult, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft, ProjectView,
+        RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
     },
     permissions::{self, ToolEffect},
 };
@@ -38,10 +39,14 @@ pub struct Kernel {
     // Serializes mutating commands, without blocking an async worker on SQLite.
     commands: Mutex<()>,
     sink: EventSink,
+    /// On-disk extension subsystem (`~/.maestro`): skills + MCP servers.
+    extensions: ExtensionManager,
+    /// Currently selected workspace, set by stream_chat from WorkspaceService.
+    workspace: Mutex<Option<PathBuf>>,
 }
 
 impl Kernel {
-    pub async fn open(path: PathBuf, sink: EventSink) -> AppResult<Arc<Self>> {
+    pub async fn open(path: PathBuf, maestro_dir: PathBuf, sink: EventSink) -> AppResult<Arc<Self>> {
         let database = Database::open(path).await?;
         let last_run = database.list_runs().await?.into_iter().next();
         let kernel = Arc::new(Self {
@@ -57,9 +62,24 @@ impl Kernel {
             }),
             commands: Mutex::new(()),
             sink,
+            extensions: ExtensionManager::new(maestro_dir)?,
+            workspace: Mutex::new(None),
         });
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
         Ok(kernel)
+    }
+
+    pub fn extensions(&self) -> &ExtensionManager {
+        &self.extensions
+    }
+
+    /// stream_chat supplies the workspace so skills/tools resolve project files.
+    pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
+        *self.workspace.lock().await = root;
+    }
+
+    async fn workspace_root(&self) -> Option<PathBuf> {
+        self.workspace.lock().await.clone()
     }
 
     fn emit_locked(&self, state: &mut RuntimeState, data: EventData) {
@@ -106,7 +126,7 @@ impl Kernel {
         if prompt.trim().is_empty() || prompt.trim().len() > 8192 {
             return Err("Prompt must contain 1–8192 UTF-8 bytes".into());
         }
-        let session = self.create_session().await?;
+        let session = self.create_session(None).await?;
         self.start_in_session(session.id, prompt).await
     }
 
@@ -275,7 +295,85 @@ impl Kernel {
         Ok(result)
     }
 
-    pub async fn create_session(&self) -> AppResult<SessionView> {
+    /// Tool definitions offered to the model this run: load_skill + running MCP tools.
+    pub async fn agent_tools(&self) -> Vec<serde_json::Value> {
+        self.extensions.tool_definitions().await
+    }
+
+    /// Execute one model-requested tool call: authorize, route, audit, return
+    /// bounded text for the next conversation turn.
+    pub(crate) async fn execute_model_tool(
+        &self,
+        run_id: i64,
+        tool: &str,
+        arguments_json: &str,
+    ) -> AppResult<String> {
+        {
+            let _command = self.commands.lock().await;
+            let run = Self::active_run_locked(&*self.state.lock().await, run_id)?;
+            let effect = if tool.starts_with("mcp__") {
+                if self.extensions.mcp.tool_is_read_only(tool).await {
+                    ToolEffect::ReadOnly
+                } else {
+                    ToolEffect::ProcessExecution
+                }
+            } else {
+                permissions::authorize(run.mode, tool)?
+            };
+            if tool.starts_with("mcp__") {
+                permissions::check_mode(run.mode, effect, tool)?;
+            }
+        }
+        let arguments: serde_json::Value = serde_json::from_str(arguments_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let result = match tool {
+            "load_skill" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "load_skill 需要 name 参数".to_string())?;
+                self.extensions
+                    .skills
+                    .body(
+                        name,
+                        self.extensions.maestro_dir(),
+                        self.workspace_root().await.as_deref(),
+                    )
+                    .map(|body| format!("【技能 {name}】\n\n{body}"))
+            }
+            _ if tool.starts_with("mcp__") => {
+                self.extensions.mcp.call_tool(tool, arguments).await
+            }
+            _ => Err("未注册的工具".into()),
+        };
+        match &result {
+            Ok(_) => {
+                self.database
+                    .record_tool(run_id, tool.into(), "extension".into(), true)
+                    .await?;
+            }
+            Err(reason) => {
+                let _ = self
+                    .database
+                    .record_tool(run_id, tool.into(), reason.clone(), false)
+                    .await;
+                let mut state = self.state.lock().await;
+                if Self::active_run_locked(&state, run_id).is_ok() {
+                    self.emit_locked(
+                        &mut state,
+                        EventData::ToolBlocked {
+                            run_id,
+                            tool: tool.into(),
+                            reason: reason.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    pub async fn create_session(&self, project_id: Option<i64>) -> AppResult<SessionView> {
         let _command = self.commands.lock().await;
         let unavailable = {
             let state = self.state.lock().await;
@@ -284,9 +382,95 @@ impl Kernel {
         if unavailable {
             return Err("Application is shutting down or storage is unavailable".into());
         }
-        let session = self.database.create_session().await?;
+        let session = self
+            .database
+            .create_session_in_project(project_id.unwrap_or(DEFAULT_PROJECT_ID))
+            .await?;
         self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
         Ok(session)
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        session_id: i64,
+        archived: bool,
+    ) -> AppResult<SessionView> {
+        let _command = self.commands.lock().await;
+        {
+            let state = self.state.lock().await;
+            if state.shutting_down || state.storage_failed {
+                return Err("Application is shutting down or storage is unavailable".into());
+            }
+            if archived
+                && state
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|run| run.session_id == session_id)
+            {
+                return Err("Cannot archive a session with an active run".into());
+            }
+        }
+        let session = self
+            .database
+            .set_session_archived(session_id, archived)
+            .await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(session)
+    }
+
+    pub async fn rename_session(&self, session_id: i64, title: String) -> AppResult<SessionView> {
+        let _command = self.commands.lock().await;
+        let session = self.database.rename_session(session_id, title).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(session)
+    }
+
+    pub async fn list_projects(&self) -> AppResult<Vec<ProjectView>> {
+        self.database.list_projects().await
+    }
+
+    pub async fn create_project(
+        &self,
+        name: String,
+        path: Option<String>,
+    ) -> AppResult<ProjectView> {
+        let _command = self.commands.lock().await;
+        {
+            let state = self.state.lock().await;
+            if state.shutting_down || state.storage_failed {
+                return Err("Application is shutting down or storage is unavailable".into());
+            }
+        }
+        let project = self.database.create_project(name, path).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(project)
+    }
+
+    pub async fn set_project_archived(
+        &self,
+        project_id: i64,
+        archived: bool,
+    ) -> AppResult<ProjectView> {
+        let _command = self.commands.lock().await;
+        let project = self
+            .database
+            .set_project_archived(project_id, archived)
+            .await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(project)
+    }
+
+    pub async fn delete_project(&self, project_id: i64) -> AppResult<()> {
+        let _command = self.commands.lock().await;
+        {
+            let state = self.state.lock().await;
+            if state.shutting_down || state.storage_failed {
+                return Err("Application is shutting down or storage is unavailable".into());
+            }
+        }
+        self.database.delete_project(project_id).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(())
     }
 
     pub async fn list_sessions(&self) -> AppResult<Vec<SessionView>> {
@@ -355,6 +539,19 @@ impl Kernel {
                 },
             );
         }
+    }
+
+    /// Streaming metrics updates reach the UI as events; only the terminal
+    /// report is durable in SQLite.
+    pub(crate) async fn report_metrics(&self, metrics: RunMetrics, persist: bool) -> AppResult<()> {
+        if persist {
+            self.database.save_metrics(metrics.clone()).await?;
+        }
+        self.emit_locked(
+            &mut *self.state.lock().await,
+            EventData::Metrics { metrics },
+        );
+        Ok(())
     }
 
     pub(crate) async fn finish(&self, run_id: i64, status: RunStatus, error: Option<String>) {
@@ -437,6 +634,7 @@ impl Kernel {
                     .map_err(|_| "Agent stopped without completing shutdown".to_string())?;
             }
         }
+        self.extensions.mcp.shutdown().await;
         self.database.shutdown().await?;
         if self.state.lock().await.storage_failed {
             return Err("Run persistence failed; recovery is required on next startup".into());
@@ -454,8 +652,10 @@ mod tests {
     async fn test_kernel() -> (Arc<Kernel>, Arc<StdMutex<Vec<KernelEvent>>>) {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let captured = events.clone();
+        let maestro_dir = tempfile::tempdir().unwrap().keep();
         let kernel = Kernel::open(
             ":memory:".into(),
+            maestro_dir,
             Arc::new(move |event| captured.lock().unwrap().push(event)),
         )
         .await
@@ -703,7 +903,7 @@ mod tests {
         let snapshot = kernel.snapshot().await;
         assert!(!snapshot.ready);
         assert_eq!(snapshot.active_run.unwrap().status, RunStatus::Failed);
-        assert!(kernel.create_session().await.is_err());
+        assert!(kernel.create_session(None).await.is_err());
         assert!(kernel.start_in_session(1, "late".into()).await.is_err());
         assert!(kernel.authorize_tool(id, "read_session").await.is_err());
         assert!(events

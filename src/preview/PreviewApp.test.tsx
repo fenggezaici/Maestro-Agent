@@ -20,7 +20,7 @@ it('shows explicit preview data without making Rust calls or enabling backend mu
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '批准计划' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '新建会话' })).toBeEnabled();
-  expect(screen.getByLabelText('由 Rust 强制执行')).toBeDisabled();
+  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
   expect(screen.getByRole('tab', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('data-state', 'active');
   fireEvent.keyDown(screen.getByRole('tab', { name: 'tests/BridgeSession.test.cpp' }), { key: 'Enter' });
   expect(screen.getByLabelText('Diff tests/BridgeSession.test.cpp')).toHaveTextContent('stop_is_idempotent');
@@ -32,9 +32,9 @@ it('shows explicit preview data without making Rust calls or enabling backend mu
 
 it('supports search, settings and navigation without pretending unsupported backend features work', () => {
   render(<PreviewApp />);
-  fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: 'migration' } });
-  expect(screen.getByRole('button', { name: /Review database migrations/ })).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /Refactor session lifecycle/ })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: 'Refactor' } });
+  expect(screen.getByRole('button', { name: /Refactor session lifecycle/ })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /Improve event dispatch/ })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
   expect(screen.getByRole('dialog')).toHaveTextContent('General');
   expect(screen.getByRole('button', { name: 'Appearance' })).toBeInTheDocument();
@@ -43,32 +43,28 @@ it('supports search, settings and navigation without pretending unsupported back
   expect(screen.getByText('自动任务尚未接入后端，本次重构仅展示入口。')).toBeInTheDocument();
 });
 
-it('groups sessions by project and creates a local session only in the selected preview project', () => {
+it('lists the current project sessions flat, switches projects from the switcher and creates a session inside it', async () => {
   render(<PreviewApp />);
-  expect(screen.getByRole('button', { name: '项目 Maestro-Agent' })).toHaveTextContent('2');
-  expect(screen.getByRole('button', { name: '项目 Agent Tools' })).toHaveTextContent('2');
-  fireEvent.click(screen.getByRole('button', { name: /Review database migrations/ }));
+  expect(screen.getByRole('button', { name: /Refactor session lifecycle/ })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /Review database migrations/ })).not.toBeInTheDocument();
+  fireEvent.keyDown(screen.getByRole('button', { name: /Preview workspace/ }), { key: 'ArrowDown' });
+  fireEvent.click(await screen.findByRole('menuitem', { name: /Agent Tools/ }));
+  expect(screen.getByRole('button', { name: /Review database migrations/ })).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '新建会话' }));
-  expect(screen.getByRole('button', { name: '项目 Agent Tools' })).toHaveTextContent('3');
-  expect(screen.getByRole('button', { name: '项目 Maestro-Agent' })).toHaveTextContent('2');
-  const target = screen.getByRole('region', { name: '项目 Agent Tools' });
-  expect(within(target).getByRole('button', { name: /新会话/ })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByRole('button', { name: /新会话/ })).toHaveAttribute('aria-pressed', 'true');
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(ipc.invoke).not.toHaveBeenCalled();
   expect(ipc.listen).not.toHaveBeenCalled();
 });
 
-it('preserves collapsed projects across remounts and reveals matching sessions while searching', () => {
-  const view = render(<PreviewApp />);
-  fireEvent.click(screen.getByRole('button', { name: '项目 Maestro-Agent' }));
-  expect(screen.getByRole('button', { name: '项目 Maestro-Agent' })).toHaveAttribute('aria-expanded', 'false');
-  view.unmount();
+it('filters the current project session list by search query', () => {
   render(<PreviewApp />);
-  expect(screen.getByRole('button', { name: '项目 Maestro-Agent' })).toHaveAttribute('aria-expanded', 'false');
   fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: 'Refactor' } });
   expect(screen.getByRole('button', { name: /Refactor session lifecycle/ })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /Improve event dispatch/ })).not.toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: '' } });
-  expect(screen.getByRole('button', { name: '项目 Maestro-Agent' })).toHaveAttribute('aria-expanded', 'false');
+  expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toBeInTheDocument();
 });
 
 it('routes Activity to the middle dashboard, keeps Diff state, and restores chat without a modal', async () => {
@@ -122,20 +118,20 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
   const sentinel = JSON.stringify({ apiKey: 'private-sentinel', baseUrl: 'https://private.example/v1', model: 'private-model' });
   localStorage.setItem(LLM_SETTINGS_KEY, sentinel);
   render(<PreviewApp />);
-  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Plan');
+  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-chat');
-  expect(screen.getByLabelText('Mock context usage')).toHaveAttribute('max', '8192');
+  expect(screen.getByLabelText('实时会话统计')).toHaveTextContent('Turns: 1');
   expect(screen.queryByRole('button', { name: '模型参数' })).not.toBeInTheDocument();
-  fireEvent.keyDown(screen.getByLabelText('Mock 上下文长度'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: '32k tokens' }));
-  expect(screen.getByLabelText('Mock context usage')).toHaveAttribute('max', '32768');
+  fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
+  fireEvent.click(screen.getByRole('option', { name: /gpt-5\.2/ }));
+  expect(screen.getByLabelText('思考强度')).toHaveTextContent('Medium');
+  expect(screen.getByText('400k context')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
   fireEvent.click(screen.getByRole('button', { name: 'Models' }));
   expect(screen.getByLabelText('API Key')).toHaveValue('');
   expect(screen.getByLabelText('API Key')).toBeDisabled();
-  fireEvent.keyDown(screen.getByLabelText('Provider（Mock）'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: 'Anthropic' }));
-  expect(screen.getByRole('dialog')).toHaveTextContent('Anthropic 原生协议尚未接入');
+  fireEvent.click(screen.getByRole('button', { name: 'Anthropic' }));
+  expect(screen.getByLabelText('Base URL')).toHaveValue('https://api.anthropic.com/v1');
   fireEvent.click(screen.getByRole('button', { name: 'Shortcuts' }));
   fireEvent.change(screen.getByLabelText('搜索快捷键'), { target: { value: 'Open Activity' } });
   fireEvent.click(screen.getByRole('button', { name: '重新绑定 Open Activity' }));
@@ -157,13 +153,15 @@ it('switches Review/Explorer, folds folders and preserves virtual extension stat
   fireEvent.keyDown(screen.getByRole('tab', { name: 'Review' }), { key: 'Enter' });
   expect(screen.getByLabelText('Diff src/bridge/BridgeSession.h')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
-  expect(screen.getByLabelText('Extensions 工作区')).toHaveTextContent('Mock');
-  fireEvent.click(screen.getByRole('switch', { name: '启用 Git MCP' }));
-  expect(screen.getByRole('switch', { name: '启用 Git MCP' })).toHaveAttribute('data-state', 'checked');
-  expect(screen.getByRole('switch', { name: '启用 Browser MCP' })).toBeDisabled();
+  expect(screen.getByLabelText('Extensions 工作区')).toBeInTheDocument();
+  expect(screen.getByRole('switch', { name: '启用 filesystem' })).toHaveAttribute('data-state', 'checked');
+  fireEvent.click(screen.getByRole('switch', { name: '启用 github' }));
+  expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
+  fireEvent.mouseDown(screen.getByRole('tab', { name: '发现' }));
+  expect(screen.getByRole('button', { name: '安装 FileSystem' })).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
   fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
-  expect(screen.getByRole('switch', { name: '启用 Git MCP' })).toHaveAttribute('data-state', 'checked');
+  expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
   expect(ipc.invoke).not.toHaveBeenCalled();
 });
 

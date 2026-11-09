@@ -27,7 +27,7 @@ beforeEach(() => {
   channels = new Map();
   snapshot = { ready: true, mode: 'plan', activeRun: null, lastRun: null, sequence: 1 };
   history = [];
-  sessions = [{ id: 1, title: '测试会话', updatedAt: 1, runCount: 0 }];
+  sessions = [{ id: 1, title: '测试会话', updatedAt: 1, runCount: 0, projectId: 1, archived: false }];
   plans = [];
   mocks.listen.mockImplementation(async (name, callback) => {
     if (name === 'kernel-event') receive = callback;
@@ -46,13 +46,14 @@ beforeEach(() => {
       case 'read_workspace_text': return 'actual source from Rust';
       case 'list_runs': return structuredClone(history);
       case 'list_sessions': return structuredClone(sessions);
+      case 'list_projects': return [{ id: 1, name: 'Maestro-Agent', path: null, archived: false, createdAt: 1 }];
       case 'get_session': return structuredClone({
         session: sessions.find((session) => session.id === args!.sessionId),
         runs: history.filter((run) => run.sessionId === args!.sessionId),
         plans: plans.filter((plan) => plan.sessionId === args!.sessionId),
       });
       case 'create_session': {
-        const session = { id: sessions.length + 1, title: '新会话', updatedAt: 2, runCount: 0 };
+        const session = { id: sessions.length + 1, title: '新会话', updatedAt: 2, runCount: 0, projectId: Number(args?.projectId) || 1, archived: false };
         sessions = [session, ...sessions];
         return session;
       }
@@ -133,9 +134,9 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     fireEvent.keyDown(screen.getByLabelText('由 Rust 强制执行'), { key: 'ArrowDown' });
-    fireEvent.click(await screen.findByRole('option', { name: 'Execute' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_mode', { mode: 'execute' }));
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Execute');
+    fireEvent.click(await screen.findByRole('option', { name: /Auto/ }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_mode', { mode: 'auto' }));
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Auto');
   });
 
   it('shows a clear error rather than faking a backend in a plain browser', async () => {
@@ -153,12 +154,12 @@ describe('desktop IPC interface', () => {
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('get_snapshot'));
     act(() => receive({ payload: { type: 'stream_token', runId: 7, token: ' + new', sequence: 6 } }));
     await act(async () => resolveSnapshot({
-      ...snapshot, mode: 'execute', sequence: 5,
+      ...snapshot, mode: 'code', sequence: 5,
       activeRun: { id: 7, sessionId: 1, prompt: 'reload', mode: 'execute', status: 'running', output: 'baseline', error: null },
     }));
     await ready();
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('baseline + new');
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Execute');
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
   });
 
   it('cleans up both StrictMode listener registrations', async () => {
@@ -173,7 +174,7 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     fireEvent.click(screen.getByRole('button', { name: /新建会话/ }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('create_session'));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('create_session', { projectId: 1 }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('get_session', { sessionId: 2 }));
     expect(screen.getByRole('button', { name: /新会话.*0 轮对话/ })).toHaveAttribute('aria-pressed', 'true');
   });
@@ -216,7 +217,7 @@ describe('desktop IPC interface', () => {
   });
 
   it('ignores an old session reply after switching sessions', async () => {
-    const other = { id: 2, title: '会话二', updatedAt: 2, runCount: 1 };
+    const other = { id: 2, title: '会话二', updatedAt: 2, runCount: 1, projectId: 1, archived: false };
     sessions.push(other);
     const otherRun: RunView = { id: 20, sessionId: 2, prompt: 'second', mode: 'plan', status: 'completed', output: 'other session reply', error: null };
     history = [otherRun];
@@ -238,7 +239,7 @@ describe('desktop IPC interface', () => {
   });
 
   it('does not let a delayed new-session reply replace a newer user selection', async () => {
-    sessions.push({ id: 2, title: '会话二', updatedAt: 2, runCount: 0 });
+    sessions.push({ id: 2, title: '会话二', updatedAt: 2, runCount: 0, projectId: 1, archived: false });
     let resolveNew!: (session: SessionView) => void;
     const creation = new Promise<SessionView>((resolve) => { resolveNew = resolve; });
     const original = mocks.invoke.getMockImplementation()!;
@@ -246,9 +247,9 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     fireEvent.click(screen.getByRole('button', { name: /新建会话/ }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('create_session'));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('create_session', { projectId: 1 }));
     fireEvent.click(screen.getByRole('button', { name: /会话二/ }));
-    const created = { id: 3, title: '新会话', updatedAt: 3, runCount: 0 };
+    const created = { id: 3, title: '新会话', updatedAt: 3, runCount: 0, projectId: 1, archived: false };
     sessions.push(created);
     await act(async () => resolveNew(created));
     await screen.findByRole('button', { name: /新会话.*0 轮对话/ });
@@ -367,19 +368,19 @@ describe('desktop IPC interface', () => {
     expect(mocks.invoke.mock.calls.some(([command]) => command === 'stream_chat')).toBe(false);
   });
 
-  it('persists the composer model while keeping mock parameters out of real IPC', async () => {
+  it('persists model thinking strength while keeping unsupported parameters out of IPC', async () => {
     render(<App />);
     await ready();
     fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
-    fireEvent.click(screen.getByRole('option', { name: 'deepseek-chat' }));
-    expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'deepseek-chat' });
-    fireEvent.keyDown(screen.getByLabelText('Mock 上下文长度'), { key: 'ArrowDown' });
-    fireEvent.click(screen.getByRole('option', { name: '32k tokens' }));
+    fireEvent.click(screen.getByRole('option', { name: /gpt-5\.2/ }));
+    expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'gpt-5.2' });
+    fireEvent.keyDown(screen.getByLabelText('思考强度'), { key: 'ArrowDown' });
+    fireEvent.click(screen.getByRole('option', { name: 'High' }));
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'model selection request' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'stream_chat')).toBe(true));
     const payload = mocks.invoke.mock.calls.find(([command]) => command === 'stream_chat')![1];
-    expect(payload).toMatchObject({ model: 'deepseek-chat', api_key: 'test-key' });
+    expect(payload).toMatchObject({ model: 'gpt-5.2', api_key: 'test-key', reasoning_effort: 'high' });
     expect(payload).not.toHaveProperty('temperature');
     expect(payload).not.toHaveProperty('context_window');
   });
@@ -401,5 +402,22 @@ describe('desktop IPC interface', () => {
     fireEvent.keyDown(screen.getByRole('tab', { name: 'Review' }), { key: 'Enter' });
     fireEvent.keyDown(screen.getByRole('tab', { name: 'Explorer' }), { key: 'Enter' });
     expect(screen.getByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
+  });
+
+  it('keeps sent attachments as local bubble placeholders without uploading them', async () => {
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:attachment-local') });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+    render(<App />);
+    await ready();
+    fireEvent.change(screen.getByLabelText('选择本地媒体附件'), { target: { files: [new File(['local-image'], 'attachment.png', { type: 'image/png' })] } });
+    fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'text request with local placeholder' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
+    const image = await screen.findByRole('img', { name: 'attachment.png' });
+    expect(image.closest('.user-message')).not.toBeNull();
+    expect(image.closest('.user-message')?.querySelector('.sent-attachments')).not.toBeNull();
+    const payload = mocks.invoke.mock.calls.find(([command]) => command === 'stream_chat')![1];
+    expect(JSON.stringify(payload)).not.toContain('attachment.png');
+    expect(JSON.stringify(payload)).not.toContain('blob:');
   });
 });

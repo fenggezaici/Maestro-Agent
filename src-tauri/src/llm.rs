@@ -1,5 +1,8 @@
 //! OpenAI-compatible streaming transport. No SQLite or tool execution lives here.
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use reqwest::Url;
@@ -9,7 +12,8 @@ use tokio::sync::watch;
 
 use crate::{
     kernel::Kernel,
-    model::{AppResult, Mode, RunStatus, RunView, SessionDetail},
+    model::{AppResult, Mode, RunMetrics, RunStatus, RunView, SessionDetail},
+    workspace::WorkspaceService,
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -17,18 +21,67 @@ use crate::{
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Rust-internal tool plumbing; frontend never sends these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolCallSpec {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ChatMessage {
+    /// Plain text message with no tool plumbing.
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
 }
 
 // Deliberately no Debug/Serialize: credentials must not enter logs/events/database records.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    #[default]
+    Openai,
+    Deepseek,
+    Anthropic,
+    Ollama,
+}
+impl Provider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Deepseek => "deepseek",
+            Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
+        }
+    }
+}
+
 pub struct ChatConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub provider: Provider,
+    pub reasoning: Option<String>,
 }
 
 impl ChatConfig {
     pub fn validate(&self) -> AppResult<Url> {
-        if self.api_key.trim().is_empty()
+        if (self.api_key.trim().is_empty() && !matches!(self.provider, Provider::Ollama))
             || self.api_key.len() > 8192
             || self.api_key.chars().any(char::is_control)
         {
@@ -49,10 +102,15 @@ impl ChatConfig {
             return Err("Base URL 必须为 HTTP(S)，且不能含账号、查询参数或片段".into());
         }
         let path = url.path().trim_end_matches('/').to_string();
-        let endpoint = if path.ends_with("/chat/completions") {
+        let suffix = if matches!(self.provider, Provider::Anthropic) {
+            "/messages"
+        } else {
+            "/chat/completions"
+        };
+        let endpoint = if path.ends_with(suffix) {
             path
         } else {
-            format!("{path}/chat/completions")
+            format!("{path}{suffix}")
         };
         url.set_path(&endpoint);
         Ok(url)
@@ -60,7 +118,14 @@ impl ChatConfig {
 
     pub fn redact(&self, message: &str) -> String {
         message
-            .replace(self.api_key.trim(), "[redacted]")
+            .replace(
+                if self.api_key.trim().is_empty() {
+                    "\u{0}"
+                } else {
+                    self.api_key.trim()
+                },
+                "[redacted]",
+            )
             .chars()
             .take(700)
             .filter(|character| !character.is_control() || *character == '\n')
@@ -90,15 +155,13 @@ pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
 }
 
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
-    let policy = if run.mode == Mode::Plan {
-        "你处于只读计划模式。只能分析、说明和提出计划，不得执行工具、修改文件或声称已应用变更。"
-    } else {
-        "请协助用户分析与规划。当前没有可执行工具，不得声称已读取工作区、执行命令或应用文件修改。"
+    let policy = match run.mode {
+        Mode::Plan => "你处于只读计划模式。只能分析、说明和提出计划，不得执行工具、修改文件或声称已应用变更。",
+        Mode::Code | Mode::Execute => "你处于 Code 模式。提出代码修改和具体 Diff，每次变更须等待批准。当前未启用执行器，不得声称已应用修改。",
+        Mode::Confirm => "你处于 Confirm 模式。每个工具或命令必须逐步确认。当前未启用工具执行器，不得声称已执行操作。",
+        Mode::Auto => "你处于 Auto 策略。仅可使用实际开放且授权的能力；当前只有文本聊天，不得声称拥有文件写入或命令执行能力。",
     };
-    let mut messages = vec![ChatMessage {
-        role: "system".into(),
-        content: policy.into(),
-    }];
+    let mut messages = vec![ChatMessage::text("system", policy)];
     let prior: Vec<_> = detail
         .runs
         .iter()
@@ -120,19 +183,10 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
         included.push(item);
     }
     for item in included.into_iter().rev() {
-        messages.push(ChatMessage {
-            role: "user".into(),
-            content: item.prompt.clone(),
-        });
-        messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: item.output.clone(),
-        });
+        messages.push(ChatMessage::text("user", item.prompt.clone()));
+        messages.push(ChatMessage::text("assistant", item.output.clone()));
     }
-    messages.push(ChatMessage {
-        role: "user".into(),
-        content: run.prompt.clone(),
-    });
+    messages.push(ChatMessage::text("user", run.prompt.clone()));
     messages
 }
 
@@ -143,11 +197,14 @@ pub async fn stream_chat(
     app: AppHandle,
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
     messages: Vec<ChatMessage>,
     api_key: String,
     base_url: String,
     model: String,
     session_id: Option<i64>,
+    provider: Option<Provider>,
+    reasoning_effort: Option<String>,
 ) -> AppResult<i64> {
     if window.label() != "main" || app.get_webview_window("main").is_none() {
         return Err("Only the main window may start a chat".into());
@@ -157,13 +214,18 @@ pub async fn stream_chat(
             api_key,
             base_url,
             model,
+            provider: provider.unwrap_or_default(),
+            reasoning: reasoning_effort,
         };
         config.validate()?;
         let prompt = validate_messages(&messages)?;
         let id = match session_id {
             Some(id) => id,
-            None => kernel.create_session().await?.id,
+            None => kernel.create_session(None).await?.id,
         };
+        kernel
+            .set_workspace_root(workspace.current_root())
+            .await;
         kernel.inner().start_model(id, prompt, config).await
     }
     .await;
@@ -176,6 +238,10 @@ pub async fn stream_chat(
 #[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Token(String),
+    Usage {
+        input: Option<u64>,
+        output: Option<u64>,
+    },
     Done,
 }
 
@@ -187,6 +253,9 @@ pub struct SseDecoder {
     saw_finish: bool,
     first_line: bool,
     skip_lf: bool,
+    /// Tool calls accumulate across SSE chunks keyed by their stream index
+    /// (OpenAI `delta.tool_calls[].index`, Anthropic `content_block` index).
+    tool_calls: std::collections::BTreeMap<u64, ToolCallSpec>,
 }
 
 impl SseDecoder {
@@ -268,6 +337,64 @@ impl SseDecoder {
                 .unwrap_or("模型服务返回错误")
                 .to_string());
         }
+        if let Some(usage) = value
+            .get("usage")
+            .or_else(|| value.pointer("/message/usage"))
+        {
+            events.push(StreamEvent::Usage {
+                input: usage
+                    .get("prompt_tokens")
+                    .or_else(|| usage.get("input_tokens"))
+                    .and_then(|value| value.as_u64()),
+                output: usage
+                    .get("completion_tokens")
+                    .or_else(|| usage.get("output_tokens"))
+                    .and_then(|value| value.as_u64()),
+            });
+        }
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("content_block_start") => {
+                if value.pointer("/content_block/type").and_then(|t| t.as_str()) == Some("tool_use")
+                {
+                    let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let acc = self.tool_calls.entry(index).or_default();
+                    if let Some(id) = value.pointer("/content_block/id").and_then(|v| v.as_str()) {
+                        acc.id = id.into();
+                    }
+                    if let Some(name) = value.pointer("/content_block/name").and_then(|v| v.as_str()) {
+                        acc.name = name.into();
+                    }
+                }
+                return Ok(());
+            }
+            Some("content_block_delta") => {
+                if let Some(partial) = value
+                    .pointer("/delta/partial_json")
+                    .and_then(|text| text.as_str())
+                {
+                    let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    self.tool_calls.entry(index).or_default().arguments.push_str(partial);
+                    return Ok(());
+                }
+                if let Some(text) = value.pointer("/delta/text").and_then(|text| text.as_str()) {
+                    events.push(StreamEvent::Token(text.into()));
+                }
+                return Ok(());
+            }
+            Some("message_stop") => {
+                self.done = true;
+                events.push(StreamEvent::Done);
+                return Ok(());
+            }
+            Some("message_delta")
+                if value
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(|value| !value.is_null()) =>
+            {
+                self.saw_finish = true;
+            }
+            _ => {}
+        }
         if let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) {
             if choice
                 .get("finish_reason")
@@ -282,8 +409,34 @@ impl SseDecoder {
             {
                 events.push(StreamEvent::Token(content.into()));
             }
+            if let Some(calls) = choice
+                .pointer("/delta/tool_calls")
+                .and_then(|calls| calls.as_array())
+            {
+                for call in calls {
+                    let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let acc = self.tool_calls.entry(index).or_default();
+                    if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                        acc.id = id.into();
+                    }
+                    if let Some(name) = call.pointer("/function/name").and_then(|n| n.as_str()) {
+                        acc.name = name.into();
+                    }
+                    if let Some(args) = call.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        acc.arguments.push_str(args);
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Calls accumulated across the stream; valid once the turn completed.
+    pub fn drain_tool_calls(&mut self) -> Vec<ToolCallSpec> {
+        std::mem::take(&mut self.tool_calls)
+            .into_values()
+            .filter(|call| !call.name.is_empty())
+            .collect()
     }
 
     pub fn finish(&mut self) -> AppResult<Vec<StreamEvent>> {
@@ -304,13 +457,122 @@ impl SseDecoder {
     }
 }
 
+/// One model turn: either the stream completed (`done`, possibly with
+/// `tool_calls` to execute) or it was cancelled.
+pub struct TurnOutcome {
+    pub done: bool,
+    pub tool_calls: Vec<ToolCallSpec>,
+}
+
+/// OpenAI wire format: assistant tool_calls become function objects; tool
+/// results travel as `role: "tool"` messages with `tool_call_id`.
+fn openai_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            if let Some(calls) = &message.tool_calls {
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": if message.content.is_empty() { serde_json::Value::Null } else { message.content.clone().into() },
+                    "tool_calls": calls.iter().map(|call| serde_json::json!({
+                        "id": call.id, "type": "function",
+                        "function": { "name": call.name, "arguments": call.arguments },
+                    })).collect::<Vec<_>>(),
+                })
+            } else if message.role == "tool" {
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": message.content,
+                })
+            } else {
+                serde_json::json!({ "role": message.role, "content": message.content })
+            }
+        })
+        .collect()
+}
+
+/// Anthropic wire format: tool_use blocks inside assistant content arrays and
+/// tool_result blocks folded into following user messages.
+fn anthropic_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {}
+            "tool" => {
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": message.content,
+                });
+                match out.last_mut() {
+                    Some(last)
+                        if last.get("role").and_then(|r| r.as_str()) == Some("user")
+                            && last.get("content").is_some_and(|c| c.is_array()) =>
+                    {
+                        last["content"].as_array_mut().unwrap().push(block);
+                    }
+                    _ => out.push(serde_json::json!({ "role": "user", "content": [block] })),
+                }
+            }
+            "assistant" if message.tool_calls.is_some() => {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": message.content }));
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    content.push(serde_json::json!({
+                        "type": "tool_use", "id": call.id, "name": call.name,
+                        "input": serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    }));
+                }
+                out.push(serde_json::json!({ "role": "assistant", "content": content }));
+            }
+            role => out.push(serde_json::json!({ "role": role, "content": message.content })),
+        }
+    }
+    out
+}
+
+/// Convert our neutral `{name, description, parameters}` definitions into each
+/// provider's tools schema.
+fn provider_tools(tools: &[serde_json::Value], provider: Provider) -> serde_json::Value {
+    match provider {
+        Provider::Anthropic => tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "description": tool.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "input_schema": tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"})),
+                })
+            })
+            .collect(),
+        _ => tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "description": tool.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"})),
+                    },
+                })
+            })
+            .collect(),
+    }
+}
+
 pub async fn stream(
     config: &ChatConfig,
     messages: Vec<ChatMessage>,
+    tools: &[serde_json::Value],
     cancel: &mut watch::Receiver<bool>,
     kernel: &Kernel,
     run_id: i64,
-) -> AppResult<bool> {
+) -> AppResult<TurnOutcome> {
     let url = config.validate()?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -318,14 +580,67 @@ pub async fn stream(
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|_| "无法初始化模型 HTTP 客户端".to_string())?;
-    let request = client.post(url).bearer_auth(config.api_key.trim()).header("Accept", "text/event-stream")
-        .json(&serde_json::json!({ "model": config.model.trim(), "messages": messages, "stream": true }));
+    let mut payload = serde_json::json!({ "model": config.model.trim(), "stream": true });
+    if !tools.is_empty() {
+        payload["tools"] = provider_tools(tools, config.provider);
+    }
+    if matches!(config.provider, Provider::Anthropic) {
+        let system = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        payload["system"] = system.into();
+        payload["messages"] = anthropic_messages(&messages).into();
+        payload["max_tokens"] = 4096.into();
+        if let Some(level) = &config.reasoning {
+            if !config.model.contains("3-7") && !config.model.contains("3.7") {
+                return Err("This Anthropic model has no configured thinking budget".into());
+            }
+            let budget = match level.as_str() {
+                "low" => 2048,
+                "medium" => 4096,
+                "high" => 8192,
+                _ => return Err("Unsupported Anthropic thinking level".into()),
+            };
+            payload["thinking"] = serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+            payload["max_tokens"] = (budget + 4096).into();
+        }
+    } else {
+        payload["messages"] = openai_messages(&messages).into();
+        payload["stream_options"] = serde_json::json!({ "include_usage": true });
+        if let Some(level) = &config.reasoning {
+            if !matches!(config.provider, Provider::Openai)
+                || !(config.model.starts_with("o3") || config.model.starts_with("gpt-5"))
+                || !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh")
+            {
+                return Err("Unsupported reasoning strength for this provider/model".into());
+            }
+            if level == "xhigh" && !config.model.starts_with("gpt-5.2") {
+                return Err("Extra High is not supported by this model mapping".into());
+            }
+            payload["reasoning_effort"] = level.clone().into();
+        }
+    }
+    let mut request = client.post(url).header("Accept", "text/event-stream");
+    if matches!(config.provider, Provider::Anthropic) {
+        let mut key = reqwest::header::HeaderValue::from_str(config.api_key.trim())
+            .map_err(|_| "Invalid Anthropic API key header")?;
+        key.set_sensitive(true);
+        request = request
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01");
+    } else if !config.api_key.is_empty() {
+        request = request.bearer_auth(config.api_key.trim());
+    }
+    let request = request.json(&payload);
+    let started = Instant::now();
     if *cancel.borrow() {
-        return Ok(false);
+        return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
     }
     let response = tokio::select! {
         biased;
-        _ = cancel.changed() => return Ok(false),
+        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
         response = request.send() => response.map_err(|error| if error.is_timeout() { "模型连接超时" } else { "无法连接模型服务，请检查地址、网络和 TLS 证书" }.to_string())?,
     };
     if !response.status().is_success() {
@@ -347,13 +662,32 @@ pub async fn stream(
     let mut body = response.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut output_bytes = 0usize;
+    let mut reported = Instant::now();
+    let session_id = kernel
+        .snapshot()
+        .await
+        .active_run
+        .as_ref()
+        .filter(|run| run.id == run_id)
+        .map(|run| run.session_id)
+        .ok_or("Run no longer active")?;
+    let mut metrics = RunMetrics {
+        run_id,
+        session_id,
+        provider: config.provider.name().into(),
+        model: config.model.clone(),
+        input_tokens: None,
+        output_tokens: None,
+        elapsed_ms: 0,
+        first_token_ms: None,
+    };
     loop {
         if *cancel.borrow() {
-            return Ok(false);
+            return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
         }
         let chunk = tokio::select! {
             biased;
-            _ = cancel.changed() => return Ok(false),
+            _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
             chunk = tokio::time::timeout(Duration::from_secs(60), body.next()) => chunk.map_err(|_| "等待模型 token 超时".to_string())?,
         };
         let events = match chunk {
@@ -365,15 +699,34 @@ pub async fn stream(
             match event {
                 StreamEvent::Token(token) => {
                     if *cancel.borrow() {
-                        return Ok(false);
+                        return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
                     }
                     output_bytes += token.len();
+                    if metrics.first_token_ms.is_none() {
+                        metrics.first_token_ms = Some(started.elapsed().as_millis() as u64);
+                    }
                     if output_bytes > 1048576 {
                         return Err("模型回复超过 1 MiB 限制".into());
                     }
                     kernel.token(run_id, token).await;
+                    if reported.elapsed() >= Duration::from_millis(200) {
+                        metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                        kernel.report_metrics(metrics.clone(), false).await?;
+                        reported = Instant::now();
+                    }
                 }
-                StreamEvent::Done => return Ok(true),
+                StreamEvent::Usage { input, output } => {
+                    metrics.input_tokens = input.or(metrics.input_tokens);
+                    metrics.output_tokens = output.or(metrics.output_tokens);
+                }
+                StreamEvent::Done => {
+                    metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                    kernel.report_metrics(metrics, true).await?;
+                    return Ok(TurnOutcome {
+                        done: true,
+                        tool_calls: decoder.drain_tool_calls(),
+                    });
+                }
             }
         }
     }
@@ -438,6 +791,8 @@ mod tests {
             api_key: "test-secret".into(),
             base_url: "https://example.com/v1/".into(),
             model: "test-model".into(),
+            provider: Provider::Openai,
+            reasoning: None,
         };
         assert_eq!(
             config.validate().unwrap().as_str(),
@@ -452,10 +807,6 @@ mod tests {
             config.base_url = url.into();
             assert!(config.validate().is_err());
         }
-        assert!(validate_messages(&[ChatMessage {
-            role: "system".into(),
-            content: "bypass".into()
-        }])
-        .is_err());
+        assert!(validate_messages(&[ChatMessage::text("system", "bypass")]).is_err());
     }
 }

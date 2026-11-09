@@ -5,6 +5,8 @@ import { BrainCircuit, Globe2, Keyboard, Palette, RotateCcw, Search, Settings2, 
 import LlmSettingsForm from './LlmSettingsForm';
 import { Choice } from './ui';
 import { bindShortcut, defaultShortcuts, formatShortcut, labels, shortcutChord, shortcutLabels, type ShortcutAction, type UiPreferences } from '../uiPreferences';
+import { providers, type ProviderId } from '../modelCapabilities';
+import { hasProviderCredential, readLlmSettings, selectLlmProvider } from '../settings';
 
 type Section = 'general' | 'appearance' | 'models' | 'shortcuts';
 
@@ -13,9 +15,12 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
   preferences: UiPreferences; onPreferences: (value: UiPreferences) => void; onModelsChanged: () => void;
 }) {
   const [section, setSection] = useState<Section>('general');
+  const [modelProvider, setModelProvider] = useState<ProviderId>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
+  const [providerError, setProviderError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [capture, setCapture] = useState<ShortcutAction | null>(null);
   const [bindingError, setBindingError] = useState<string | null>(null);
+  const [credentialsTick, setCredentialsTick] = useState(0);
   const captureArea = useRef<HTMLDivElement>(null);
   const text = labels(preferences.language);
   const sections = [{ id: 'general', icon: Globe2 }, { id: 'appearance', icon: Palette }, { id: 'models', icon: BrainCircuit }, { id: 'shortcuts', icon: Keyboard }] as const;
@@ -35,7 +40,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
         <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{text[id]}</button>)}</nav>
         <span className="settings-version">MAESTRO / DESKTOP</span>
       </div>
-      <div className="settings-content"><Dialog.Description className="settings-intro">{preview ? 'UI preview · 无真实配置读取或执行' : '连接配置真实保存，其余新增能力为 UI Mock'}</Dialog.Description>
+      <div className="settings-content"><Dialog.Description className="settings-intro">{preview ? 'UI preview · 无真实配置读取或执行' : '连接配置与思考强度真实保存；上下文为模型能力参考，实际限制以服务端为准。'}</Dialog.Description>
         <h3>{text[section]}</h3>
         <div hidden={section !== 'general'}>
           <div className="preference-row"><div><strong>Language</strong><p>前端导航与设置标签</p></div><Choice label="界面语言" value={preferences.language} onChange={(value) => update({ language: value as UiPreferences['language'] })} options={[{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }]} /></div>
@@ -43,16 +48,35 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
           <div className="settings-info-card">配置与预览偏好分别存储，不会改变真实模型权限或启动系统任务。</div>
         </div>
         <div hidden={section !== 'appearance'}>
-          <div className="preference-row"><div><strong>Theme</strong><p>主题选项 Mock，工作台保持 Dark</p></div><Choice label="主题" value={preferences.theme} onChange={(value) => update({ theme: value as UiPreferences['theme'] })} options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'system', label: 'System' }]} /></div>
+          <div className="preference-row"><div><strong>Theme</strong><p>Apply Dark, Light or follow system appearance</p></div><Choice label="主题" value={preferences.theme} onChange={(value) => update({ theme: value as UiPreferences['theme'] })} options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'system', label: 'System' }]} /></div>
           <div className="preference-row"><div><strong>Editor font</strong><p>系统等宽字体；不存在时回退到 Consolas</p></div><Choice label="编辑器字体" value={preferences.editorFont} onChange={(value) => update({ editorFont: value })} options={['Cascadia Code', 'Consolas', 'JetBrains Mono'].map((value) => ({ value, label: value }))} /></div>
           <div className="preference-row"><div><strong>Font size</strong><p>{preferences.editorFontSize}px / Monaco</p></div><Slider.Root className="settings-slider font-size-slider" value={[preferences.editorFontSize]} min={10} max={20} step={1} onValueChange={([value]) => update({ editorFontSize: value })}><Slider.Track><Slider.Range /></Slider.Track><Slider.Thumb aria-label="编辑器字号" /></Slider.Root></div>
           <pre className="font-preview" style={{ fontFamily: `"${preferences.editorFont}", Consolas, monospace`, fontSize: preferences.editorFontSize }}>const session = await agent.plan();</pre>
         </div>
         <div hidden={section !== 'models'}>
+          <div className="models-two-pane" data-tick={credentialsTick}>
+            <div className="model-provider-list" role="group" aria-label="Providers">
+              {(Object.keys(providers) as ProviderId[]).map((id) => <button type="button" key={id} className="model-provider-item" aria-label={providers[id].name} aria-current={modelProvider === id ? 'page' : undefined} onClick={() => {
+                try {
+                  if (preview) update({ provider: id, previewModel: providers[id].model }); else { selectLlmProvider(id); onModelsChanged(); }
+                  setModelProvider(id); setProviderError(null);
+                } catch (error) { setProviderError(error instanceof Error ? error.message : 'Cannot change provider'); }
+              }}>
+                <span className="provider-card-icon">{providers[id].name.slice(0, 1)}</span>{providers[id].name}
+                <span className={`provider-status-dot ${preview || hasProviderCredential(id) ? 'configured' : ''}`} />
+              </button>)}
+            </div>
+            <div className="model-provider-detail">
+              <div className="provider-panel-heading"><span className="provider-card-icon">{providers[modelProvider].name.slice(0, 1)}</span>
+                <strong>{providers[modelProvider].name}</strong>
+                <span className={`provider-badge ${preview || hasProviderCredential(modelProvider) ? 'configured' : ''}`}>{preview ? '预览' : hasProviderCredential(modelProvider) ? '已配置' : '未配置'}</span>
+              </div>
+              <p className="provider-panel-note">独立 Provider 配置，凭据不会在 Provider 之间复制。</p>
+              {providerError && <p role="alert" className="settings-form-error">{providerError}</p>}
+              <LlmSettingsForm provider={modelProvider} preview={preview} onSaved={() => { setCredentialsTick((tick) => tick + 1); onModelsChanged(); onOpenChange(false); }} onChanged={() => { setCredentialsTick((tick) => tick + 1); onModelsChanged(); }} />
+            </div>
+          </div>
           <div className="preference-row"><div><strong>Temperature</strong><p>Mock UI parameter / not sent to model</p></div><div className="temperature-setting"><span>{preferences.temperature.toFixed(1)}</span><Slider.Root className="settings-slider" value={[preferences.temperature]} min={0} max={2} step={0.1} onValueChange={([value]) => update({ temperature: value })}><Slider.Track><Slider.Range /></Slider.Track><Slider.Thumb aria-label="Mock Temperature" /></Slider.Root></div></div>
-          <div className="preference-row"><div><strong>Provider</strong><p>Provider 切换仅 UI，实际传输仍为 OpenAI-compatible</p></div><Choice label="Provider（Mock）" value={preferences.provider} onChange={(value) => update({ provider: value as UiPreferences['provider'] })} options={[{ value: 'openai', label: 'OpenAI' }, { value: 'anthropic', label: 'Anthropic' }, { value: 'ollama', label: 'Ollama' }]} /></div>
-          {preferences.provider !== 'openai' && <div className="settings-info-card">{preferences.provider === 'anthropic' ? 'Anthropic 原生协议尚未接入。' : 'Ollama 原生协议尚未接入，可手动配置兼容端点。'} 此选择不覆盖 URL、Key 或 Model。</div>}
-          <LlmSettingsForm preview={preview} onSaved={() => { onModelsChanged(); onOpenChange(false); }} onChanged={onModelsChanged} />
         </div>
         <div hidden={section !== 'shortcuts'}>
           <label className="shortcut-search"><Search size={14} /><input aria-label="搜索快捷键" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search shortcuts…" /></label>

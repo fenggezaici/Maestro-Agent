@@ -6,14 +6,15 @@ export interface ChatMessage { role: 'user' | 'assistant'; content: string }
 export interface ChatToken { sequence: number; runId: number; sessionId: number; token: string }
 export interface ChatTerminal { sequence: number; run: RunView; message?: string }
 
-export type Mode = 'plan' | 'execute';
+export type Mode = 'plan' | 'code' | 'confirm' | 'auto';
+export interface RunMetrics { runId: number; sessionId: number; provider: string; model: string; inputTokens: number | null; outputTokens: number | null; elapsedMs: number; firstTokenMs: number | null }
 export type RunStatus = 'running' | 'completed' | 'cancelled' | 'failed';
 
 export interface RunView {
   id: number;
   sessionId: number;
   prompt: string;
-  mode: Mode;
+  mode: Mode | 'execute';
   status: RunStatus;
   output: string;
   error: string | null;
@@ -32,6 +33,16 @@ export interface SessionView {
   title: string;
   updatedAt: number;
   runCount: number;
+  projectId: number;
+  archived: boolean;
+}
+
+export interface ProjectView {
+  id: number;
+  name: string;
+  path: string | null;
+  archived: boolean;
+  createdAt: number;
 }
 
 export type PlanStatus = 'pending' | 'approved' | 'rejected' | 'invalidated';
@@ -45,10 +56,11 @@ export interface PlanCard {
   status: PlanStatus;
   draft: PlanDraft;
 }
-export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[] }
+export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[] }
 
 export type KernelEvent = { sequence: number } & (
   | { type: 'ready' }
+  | { type: 'metrics'; metrics: RunMetrics }
   | { type: 'backend_error'; message: string }
   | { type: 'client_error'; message: string }
   | { type: 'mode_changed'; mode: Mode }
@@ -65,10 +77,23 @@ export const backend = {
   setMode: (mode: Mode) => invoke<void>('set_mode', { mode }),
   start: (sessionId: number, messages: ChatMessage[], settings: LlmSettings) => invoke<number>('stream_chat', {
     session_id: sessionId, messages, api_key: settings.apiKey, base_url: settings.baseUrl, model: settings.model,
+    ...(settings.provider ? { provider: settings.provider } : {}),
+    ...(settings.reasoning ? { reasoning_effort: settings.reasoning } : {}),
   }),
   cancel: (runId: number) => invoke<void>('cancel_agent', { runId }),
   sessions: () => invoke<SessionView[]>('list_sessions'),
-  createSession: () => invoke<SessionView>('create_session'),
+  projects: () => invoke<ProjectView[]>('list_projects'),
+  createProject: (name: string, path?: string) =>
+    invoke<ProjectView>('create_project', { name, path: path ?? null }),
+  setProjectArchived: (projectId: number, archived: boolean) =>
+    invoke<ProjectView>('set_project_archived', { projectId, archived }),
+  deleteProject: (projectId: number) => invoke<void>('delete_project', { projectId }),
+  createSession: (projectId?: number) =>
+    invoke<SessionView>('create_session', { projectId: projectId ?? null }),
+  setSessionArchived: (sessionId: number, archived: boolean) =>
+    invoke<SessionView>('set_session_archived', { sessionId, archived }),
+  renameSession: (sessionId: number, title: string) =>
+    invoke<SessionView>('rename_session', { sessionId, title }),
   session: (sessionId: number) => invoke<SessionDetail>('get_session', { sessionId }),
   decidePlan: (sessionId: number, planId: number, decision: PlanDecision) =>
     invoke<PlanCard>('decide_plan', { sessionId, planId, decision }),

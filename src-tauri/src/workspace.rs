@@ -83,6 +83,11 @@ impl WorkspaceService {
         .map_err(|_| "Workspace task failed".to_string())?
     }
 
+    /// Synchronous read of the selected root for other services (kernel skills scan).
+    pub fn current_root(&self) -> Option<PathBuf> {
+        self.root.lock().ok().and_then(|root| root.clone())
+    }
+
     pub async fn info(&self) -> Result<WorkspaceInfo, String> {
         self.run(|root| {
             if root.is_none() && cfg!(debug_assertions) {

@@ -38,3 +38,17 @@ monaco.editor.defineTheme('maestro-dark', {
 
 export { monaco };
 
+monaco.editor.defineTheme('maestro-light', {
+  base: 'vs', inherit: true, rules: [], colors: {
+    'editor.background': '#FFFFFF', 'editor.foreground': '#303030', 'editorGutter.background': '#FFFFFF',
+    'editorLineNumber.foreground': '#A0A0A0', 'editor.selectionBackground': '#8B5CF622',
+    'diffEditor.insertedLineBackground': '#6DAB6515', 'diffEditor.removedLineBackground': '#C46A6A12',
+    'diffEditor.insertedTextBackground': '#6DAB652A', 'diffEditor.removedTextBackground': '#C46A6A24',
+    'diffEditor.diagonalFill': '#F1F1F1', 'diffEditor.border': '#00000008',
+  },
+});
+const applyTheme = () => monaco.editor.setTheme(document.documentElement.dataset.theme === 'light' ? 'maestro-light' : 'maestro-dark');
+window.addEventListener('maestro-theme', applyTheme);
+applyTheme();
+if (import.meta.hot) import.meta.hot.dispose(() => window.removeEventListener('maestro-theme', applyTheme));
+

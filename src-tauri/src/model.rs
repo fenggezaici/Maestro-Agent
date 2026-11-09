@@ -6,6 +6,10 @@ pub type AppResult<T> = Result<T, String>;
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Plan,
+    Code,
+    Confirm,
+    Auto,
+    // Historical records only; new UI selections use Code.
     Execute,
 }
 
@@ -13,6 +17,9 @@ impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Plan => "plan",
+            Self::Code => "code",
+            Self::Confirm => "confirm",
+            Self::Auto => "auto",
             Self::Execute => "execute",
         }
     }
@@ -76,6 +83,18 @@ pub struct SessionView {
     pub title: String,
     pub updated_at: i64,
     pub run_count: i64,
+    pub project_id: i64,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectView {
+    pub id: i64,
+    pub name: String,
+    pub path: Option<String>,
+    pub archived: bool,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +103,20 @@ pub struct SessionDetail {
     pub session: SessionView,
     pub runs: Vec<RunView>,
     pub plans: Vec<PlanCard>,
+    pub metrics: Vec<RunMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunMetrics {
+    pub run_id: i64,
+    pub session_id: i64,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub elapsed_ms: u64,
+    pub first_token_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -184,6 +217,9 @@ pub struct KernelEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
     Ready,
+    Metrics {
+        metrics: RunMetrics,
+    },
     BackendError {
         message: String,
     },

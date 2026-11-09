@@ -92,12 +92,12 @@ export const previewPlan: PlanCard = {
 };
 
 const mainRun: RunView = {
-  id: 1001, sessionId: 101, mode: 'plan', status: 'completed', error: null,
+  id: 1001, sessionId: 101, mode: 'code', status: 'completed', error: null,
   prompt: '重构 BridgeSession 的生命周期管理，保留现有 API。\n让重复 stop 安全，并修复并发状态切换问题，先提交修改计划。',
   output: '建议保留公共 API，收敛所有权与状态边界。示例 Diff 为 start / stop 增加幂等保护，并统一并发状态访问。下面是建议的实现计划。',
 };
 
-export const previewSnapshot: Snapshot = { ready: false, mode: 'plan', activeRun: null, lastRun: null, sequence: 0 };
+export const previewSnapshot: Snapshot = { ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0 };
 
 export interface PreviewProject extends Omit<WorkbenchProject, 'sessions'> { sessions: SessionDetail[] }
 
@@ -106,22 +106,22 @@ const sampleActivity: ActivityDay[] = levels.map((level, index) => ({
   date: new Date(Date.UTC(2026, 9, 5) + index * 86400000).toISOString().slice(0, 10), level,
 }));
 
-function exampleSession(id: number, title: string): SessionDetail {
-  return { session: { id, title, updatedAt: 1, runCount: 1 }, plans: [],
+function exampleSession(id: number, title: string, projectId: number): SessionDetail {
+  return { session: { id, title, updatedAt: 1, runCount: 1, projectId, archived: false }, plans: [],
     runs: [{ ...mainRun, id: id * 10, sessionId: id, prompt: title, output: '此会话属于另一个预览项目。所有内容为本地 Mock，未连接 Rust 或模型服务。' }],
   };
 }
 
 export const previewProjects: PreviewProject[] = [
-  { id: 'maestro', name: 'Maestro-Agent', activity: sampleActivity, today: { changedLines: 120, completedPlans: 3 }, sessions: [
-    { session: { id: 101, title: 'Refactor session lifecycle', updatedAt: 1, runCount: 1 }, runs: [mainRun], plans: [previewPlan] },
-    exampleSession(102, 'Improve event dispatch pipeline'),
+  { id: '1', name: 'Maestro-Agent', activity: sampleActivity, today: { changedLines: 120, completedPlans: 3 }, sessions: [
+    { session: { id: 101, title: 'Refactor session lifecycle', updatedAt: 1, runCount: 1, projectId: 1, archived: false }, runs: [mainRun], plans: [previewPlan] },
+    exampleSession(102, 'Improve event dispatch pipeline', 1),
   ] },
-  { id: 'agent-tools', name: 'Agent Tools', activity: sampleActivity, today: { changedLines: 37, completedPlans: 1 }, sessions: [
-    exampleSession(103, 'Review database migrations'), exampleSession(104, 'Add integration test coverage'),
+  { id: '2', name: 'Agent Tools', activity: sampleActivity, today: { changedLines: 37, completedPlans: 1 }, sessions: [
+    exampleSession(103, 'Review database migrations', 2), exampleSession(104, 'Add integration test coverage', 2),
   ] },
-  { id: 'website', name: 'Website', activity: sampleActivity, today: { changedLines: 0, completedPlans: 0 }, sessions: [
-    exampleSession(105, 'Polish landing page'),
+  { id: '3', name: 'Website', activity: sampleActivity, today: { changedLines: 0, completedPlans: 0 }, sessions: [
+    exampleSession(105, 'Polish landing page', 3),
   ] },
 ];
 

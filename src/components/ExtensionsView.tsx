@@ -1,22 +1,166 @@
+import { useState, type FormEvent } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
-import { Blocks, PlugZap, Puzzle, Sparkles, Trash2 } from 'lucide-react';
-import type { MockExtension } from './workbenchMock';
+import { ExternalLink, FolderInput, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
+import type { ExtensionsController } from '../useExtensions';
+import type { McpServerView, RecommendedItem } from '../extensions';
 
-export default function ExtensionsView({ items, onAction }: { items: MockExtension[]; onAction: (id: string, action: 'toggle' | 'install' | 'remove') => void }) {
+function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, onSubmit }: {
+  open: boolean; onOpenChange: (open: boolean) => void; title: string; hint?: string;
+  submitLabel: string;
+  fields: { id: string; label: string; placeholder?: string; required?: boolean; textarea?: boolean }[];
+  onSubmit: (values: Record<string, string>) => Promise<string | null>;
+}) {
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (pending) return;
+    setPending(true);
+    const message = await onSubmit(values);
+    setPending(false);
+    if (message) { setError(message); return; }
+    setValues({}); setError(null); onOpenChange(false);
+  }
+  return <Dialog.Root open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
+    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
+      <Dialog.Content className="project-dialog" aria-describedby={undefined}>
+        <Dialog.Title asChild><h3>{title}</h3></Dialog.Title>
+        {hint && <p className="dialog-hint">{hint}</p>}
+        <form onSubmit={(event) => void submit(event)}>
+          {fields.map((field) => <div key={field.id}>
+            <label htmlFor={`ext-${field.id}`}>{field.label}{field.required !== false && ' *'}</label>
+            {field.textarea
+              ? <textarea id={`ext-${field.id}`} rows={3} value={values[field.id] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />
+              : <input id={`ext-${field.id}`} autoComplete="off" spellCheck={false} value={values[field.id] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />}
+          </div>)}
+          {error && <p role="alert" className="settings-form-error">{error}</p>}
+          <div className="dialog-actions">
+            <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
+            <button type="submit" className="button-approve" disabled={pending || fields.some((f) => f.required !== false && !(values[f.id] ?? '').trim())}>{submitLabel}</button>
+          </div>
+        </form>
+        <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>
+      </Dialog.Content>
+    </Dialog.Portal>
+  </Dialog.Root>;
+}
+
+function SkillList({ c }: { c: ExtensionsController }) {
+  const [dialog, setDialog] = useState<'create' | 'local' | 'github' | null>(null);
+  return <section aria-label="技能列表" className="extension-section">
+    <div className="extension-section-heading">
+      <h4><Sparkles size={14} />技能（Skills）</h4>
+      <div className="extension-actions">
+        <button type="button" className="button-ghost" onClick={() => setDialog('create')}><Plus size={13} />新建技能</button>
+        <button type="button" className="button-ghost" onClick={() => setDialog('local')}><FolderInput size={13} />本地导入</button>
+        <button type="button" className="button-ghost" onClick={() => setDialog('github')}><GitBranch size={13} />GitHub 导入</button>
+      </div>
+    </div>
+    {c.skills.length === 0 && <p className="sidebar-empty">{c.loading ? '加载中…' : '暂无技能。新建或从发现页安装。'}</p>}
+    {c.skills.map((skill) => <article className="extension-card" key={skill.name}>
+      <span className="extension-icon"><Sparkles size={18} /></span>
+      <div className="extension-description"><strong>{skill.name}</strong><p>{skill.description || '（无描述）'}</p>
+        <span className="extension-state">{skill.source === 'project' ? '项目级' : '全局'} · {skill.path}</span></div>
+    </article>)}
+    <FormDialog open={dialog === 'create'} onOpenChange={(o) => !o && setDialog(null)} title="新建技能"
+      hint="在 ~/.maestro/skills/ 下生成标准 SKILL.md 模板。" submitLabel="创建"
+      fields={[{ id: 'name', label: '名称（kebab-case）', placeholder: 'my-skill' }, { id: 'description', label: '描述', placeholder: '这个技能做什么？', textarea: true }]}
+      onSubmit={(v) => c.createSkill(v.name, v.description)} />
+    <FormDialog open={dialog === 'local'} onOpenChange={(o) => !o && setDialog(null)} title="从本地导入技能"
+      hint="选择包含 SKILL.md 的目录或 SKILL.md 文件。" submitLabel="导入"
+      fields={[{ id: 'path', label: '本地路径', placeholder: 'E:\\skills\\my-skill' }]}
+      onSubmit={(v) => c.importSkill(v.path)} />
+    <FormDialog open={dialog === 'github'} onOpenChange={(o) => !o && setDialog(null)} title="从 GitHub 导入技能"
+      hint="克隆仓库并递归导入其中全部 SKILL.md。" submitLabel="导入"
+      fields={[{ id: 'repo', label: '仓库地址', placeholder: 'https://github.com/owner/repo' }]}
+      onSubmit={(v) => c.importSkillGithub(v.repo)} />
+  </section>;
+}
+
+function McpList({ c }: { c: ExtensionsController }) {
+  const [dialog, setDialog] = useState<'add' | 'import' | null>(null);
+  return <section aria-label="MCP 服务列表" className="extension-section">
+    <div className="extension-section-heading">
+      <h4><PlugZap size={14} />MCP 服务</h4>
+      <div className="extension-actions">
+        <button type="button" className="button-ghost" onClick={() => setDialog('add')}><Plus size={13} />添加配置</button>
+        <button type="button" className="button-ghost" onClick={() => setDialog('import')}><FolderInput size={13} />导入 JSON</button>
+      </div>
+    </div>
+    {c.servers.length === 0 && <p className="sidebar-empty">{c.loading ? '加载中…' : '暂无 MCP 服务。添加配置或从发现页安装。'}</p>}
+    {c.servers.map((server) => <McpRow key={server.name} c={c} server={server} />)}
+    <FormDialog open={dialog === 'add'} onOpenChange={(o) => !o && setDialog(null)} title="添加 MCP 服务"
+      hint="写入 ~/.maestro/mcp.json；开启后拉起子进程并把工具注入对话。" submitLabel="添加"
+      fields={[{ id: 'name', label: '名称', placeholder: 'filesystem' }, { id: 'command', label: '启动命令', placeholder: 'npx' }, { id: 'args', label: '参数（空格分隔，可选）', placeholder: '-y @modelcontextprotocol/server-filesystem', required: false }]}
+      onSubmit={(v) => c.addMcpServer(v.name, v.command, (v.args ?? '').split(' ').filter(Boolean))} />
+    <FormDialog open={dialog === 'import'} onOpenChange={(o) => !o && setDialog(null)} title="导入 MCP JSON"
+      hint="读取一个含 mcpServers 字段的 JSON 文件并合并到 ~/.maestro/mcp.json。" submitLabel="导入"
+      fields={[{ id: 'path', label: 'JSON 文件路径', placeholder: 'E:\\config\\mcp.json' }]}
+      onSubmit={(v) => c.importMcpJson(v.path)} />
+  </section>;
+}
+
+function McpRow({ c, server }: { c: ExtensionsController; server: McpServerView }) {
+  const busy = c.pending === `mcp-${server.name}`;
+  return <article className="extension-card" key={server.name}>
+    <span className={`extension-status-dot ${server.running ? 'running' : server.error ? 'error' : ''}`} aria-hidden="true" />
+    <div className="extension-description">
+      <strong>{server.name}</strong>
+      <p><code>{server.command} {server.args.join(' ')}</code></p>
+      <span className="extension-state">
+        {busy ? '处理中…' : server.running ? `运行中 · 已加载 ${server.toolCount} 个工具` : server.error ? server.error : server.disabled ? '已禁用' : '已停止'}
+      </span>
+    </div>
+    <Switch.Root aria-label={`启用 ${server.name}`} className="settings-switch" checked={server.running} disabled={busy}
+      onCheckedChange={(enable) => void c.toggleMcpServer(server, enable)}><Switch.Thumb /></Switch.Root>
+    <button type="button" className="icon-button" aria-label={`删除 ${server.name}`} disabled={busy} onClick={() => void c.removeMcpServer(server.name)}><Trash2 size={13} /></button>
+  </article>;
+}
+
+function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: React.ReactNode; items: RecommendedItem[]; c: ExtensionsController; empty: string }) {
+  return <section aria-label={title} className="extension-section">
+    <div className="extension-section-heading"><h4>{icon}{title}</h4></div>
+    {items.length === 0 && <p className="sidebar-empty">{empty}</p>}
+    {items.map((item) => <article className="extension-card discover-card" key={item.id}>
+      <div className="extension-description">
+        <strong>{item.name}</strong>
+        <p>{item.description}</p>
+        <a className="extension-link" href={item.sourceUrl} target="_blank" rel="noreferrer">{item.sourceUrl}<ExternalLink size={10} /></a>
+      </div>
+      <button type="button" className="button-approve" aria-label={`安装 ${item.name}`} disabled={c.pending === `install-${item.id}`}
+        onClick={async () => { await c.installRecommended(item); }}>{c.pending === `install-${item.id}` ? '安装中…' : '一键安装'}</button>
+    </article>)}
+  </section>;
+}
+
+export default function ExtensionsView({ controller: c }: { controller: ExtensionsController }) {
   return <section aria-label="Extensions 工作区" className="extensions-view">
-    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">WORKSPACE CAPABILITIES</p><h3>Extensions</h3><p>MCP, Skills and Plugins / UI demonstration</p></div><span className="mock-badge">Mock</span></header>
-    <p className="extensions-disclaimer">所有安装状态和开关仅为本地 Mock，不下载插件、不启动 MCP、不执行 Skills。</p>
-    <Tabs.Root defaultValue="mcp" className="extensions-tabs"><Tabs.List aria-label="扩展分类"><Tabs.Trigger value="mcp"><PlugZap size={14} />MCP</Tabs.Trigger><Tabs.Trigger value="skills"><Sparkles size={14} />Skills</Tabs.Trigger><Tabs.Trigger value="plugins"><Blocks size={14} />Plugins</Tabs.Trigger></Tabs.List>
-      {(['mcp', 'skills', 'plugins'] as const).map((kind) => <Tabs.Content key={kind} value={kind}>
-        {items.filter((item) => item.kind === kind).map((item) => <article className="extension-card" key={item.id}>
-          <span className="extension-icon">{kind === 'mcp' ? <PlugZap size={18} /> : kind === 'skills' ? <Sparkles size={18} /> : <Blocks size={18} />}</span>
-          <div className="extension-description"><strong>{item.name}</strong><p>{item.description}</p><span className="extension-state">{item.status === 'installed' ? item.enabled ? 'Enabled / Mock' : 'Disabled / Mock' : item.status === 'available' ? 'Available / Mock' : 'Unavailable / Mock'}</span></div>
-          {item.status === 'available' ? <button type="button" className="button-ghost" aria-label={`模拟安装 ${item.name}`} onClick={() => onAction(item.id, 'install')}>Install</button>
-            : <><Switch.Root aria-label={`启用 ${item.name}`} className="settings-switch" checked={item.enabled} disabled={item.status !== 'installed'} onCheckedChange={() => onAction(item.id, 'toggle')}><Switch.Thumb /></Switch.Root>
-              {item.status === 'installed' && <button type="button" className="icon-button" aria-label={`模拟移除 ${item.name}`} onClick={() => onAction(item.id, 'remove')}><Trash2 size={13} /></button>}</>}
-        </article>)}
-      </Tabs.Content>)}
+    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">WORKSPACE CAPABILITIES</p><h3>Extensions</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
+    <Tabs.Root defaultValue="installed" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
+      <Tabs.Trigger value="installed">已安装</Tabs.Trigger>
+      <Tabs.Trigger value="discover">发现</Tabs.Trigger>
+      <Tabs.Trigger value="config">配置</Tabs.Trigger>
+    </Tabs.List>
+      <Tabs.Content value="installed">
+        <SkillList c={c} />
+        <McpList c={c} />
+      </Tabs.Content>
+      <Tabs.Content value="discover">
+        <div className="discover-columns">
+          <DiscoverGrid title="热门 Skill" icon={<Sparkles size={14} />} items={c.recommendedSkills} c={c} empty="暂无推荐" />
+          <DiscoverGrid title="热门 MCP" icon={<PlugZap size={14} />} items={c.recommendedMcps} c={c} empty="暂无推荐" />
+        </div>
+      </Tabs.Content>
+      <Tabs.Content value="config">
+        <section className="extension-section">
+          <div className="extension-section-heading"><h4>配置文件</h4></div>
+          <p className="provider-panel-note">技能存放在 <code>~/.maestro/skills/</code>（全局）与 <code>&lt;workspace&gt;/.maestro/skills/</code>（项目级，覆盖同名全局技能）。MCP 配置位于 <code>~/.maestro/mcp.json</code>。</p>
+          <pre className="mcp-config-preview" aria-label="mcp.json 内容">{c.mcpConfigText || '{ "mcpServers": {} }'}</pre>
+        </section>
+      </Tabs.Content>
     </Tabs.Root>
   </section>;
 }

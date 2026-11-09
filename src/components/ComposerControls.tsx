@@ -3,32 +3,46 @@ import { BrainCircuit } from 'lucide-react';
 import { Choice } from './ui';
 import { readLlmSettings, saveLlmSettings } from '../settings';
 import type { UiPreferences } from '../uiPreferences';
+import { contextLabel, modelCapability, providers, type ProviderId, type ThinkingLevel } from '../modelCapabilities';
+import ModelCapabilityControls from './ModelCapabilityControls';
 
-export function ContextMeter({ limit }: { limit: number }) {
-  const used = 2400;
-  return <span className="context-meter" aria-label="上下文使用量（Mock）">
-    <span>Tokens: 2.4k / {limit === 8192 ? '8k' : limit === 32768 ? '32k' : '128k'} <small>Mock</small></span>
-    <meter aria-label="Mock context usage" min={0} max={limit} value={used} />
-  </span>;
-}
+const compactContext = (value: number | null) => value === null ? null : contextLabel(value).replace(' context', '');
 
-export default function ComposerControls({ preview, disabled, preferences, onPreferences, settingsVersion, onError }: {
+export default function ComposerControls({ preview, disabled, preferences, onPreferences, settingsVersion, onError, onCapability }: {
   preview: boolean; disabled: boolean; preferences: UiPreferences; onPreferences: (value: UiPreferences) => void;
   settingsVersion: number; onError: (message: string) => void;
+  onCapability: (model: string, provider: ProviderId, context: number | null) => void;
 }) {
   const [model, setModel] = useState(() => preview ? preferences.previewModel : readLlmSettings().model);
-  useEffect(() => { setModel(preview ? preferences.previewModel : readLlmSettings().model); }, [preview, preferences.previewModel, settingsVersion]);
-  const options = [...new Set([model, 'deepseek-chat', 'gpt-4o-mini', 'qwen2.5-coder'])];
+  const [provider, setProvider] = useState<ProviderId>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
+  const [thinking, setThinking] = useState<ThinkingLevel>('medium');
+  useEffect(() => {
+    const value = preview ? null : readLlmSettings();
+    setModel(value?.model ?? preferences.previewModel);
+    setProvider(value?.provider ?? (preview ? preferences.provider : 'openai'));
+    setThinking(value?.reasoning ?? 'medium');
+  }, [preview, preferences.previewModel, preferences.provider, settingsVersion]);
+  const capability = modelCapability(model, provider);
+  useEffect(() => { onCapability(model, provider, capability.context); }, [model, provider, capability.context, onCapability]);
+  const options = [...new Set([model, ...providers[provider].models])];
   return <div className="composer-model-controls">
     <Choice label="选择模型" value={model} disabled={!preview && disabled} className="composer-model-picker"
-      options={options.map((value) => ({ value, label: <span className="model-label"><BrainCircuit size={12} />{value}</span> }))}
+      options={options.map((value) => {
+        const context = compactContext(modelCapability(value, provider).context);
+        return { value, label: <span className="model-option"><span className="model-label"><BrainCircuit size={12} />{value}</span>{context && <small>{context}</small>}</span> };
+      })}
       onChange={(value) => {
         if (preview) { setModel(value); onPreferences({ ...preferences, previewModel: value }); return; }
-        try { saveLlmSettings({ ...readLlmSettings(), model: value }); setModel(value); } catch (error) { onError(error instanceof Error ? error.message : '无法选择模型'); }
+        try {
+          const supported = modelCapability(value, provider).thinking;
+          const reasoning = supported.includes('medium') ? 'medium' : supported[0];
+          saveLlmSettings({ ...readLlmSettings(), model: value, reasoning }); setModel(value); setThinking(reasoning ?? 'medium');
+        } catch (error) { onError(error instanceof Error ? error.message : '无法选择模型'); }
       }} />
-    <Choice label="Mock 上下文长度" className="composer-context-picker" value={String(preferences.contextWindow)}
-      options={[{ value: '8192', label: '8k tokens' }, { value: '32768', label: '32k tokens' }, { value: '128000', label: '128k tokens' }]}
-      onChange={(value) => onPreferences({ ...preferences, contextWindow: Number(value) as UiPreferences['contextWindow'] })} />
-    <ContextMeter limit={preferences.contextWindow} />
+    <ModelCapabilityControls model={model} provider={provider} reasoning={thinking} disabled={!preview && disabled} onReasoning={(value) => {
+      if (preview) { setThinking(value); return; }
+      try { const saved = saveLlmSettings({ ...readLlmSettings(), reasoning: value }); setThinking(saved.reasoning ?? 'medium'); }
+      catch (error) { onError(error instanceof Error ? error.message : 'Cannot save thinking mode'); }
+    }} />
   </div>;
 }

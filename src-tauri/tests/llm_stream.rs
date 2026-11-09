@@ -5,7 +5,7 @@ use std::{
 
 use maestro_lib::{
     kernel::Kernel,
-    llm::{conversation, ChatConfig, ChatMessage},
+    llm::{conversation, ChatConfig, ChatMessage, Provider},
     model::{EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
 };
 use serde_json::Value;
@@ -70,6 +70,8 @@ fn config(base_url: String) -> ChatConfig {
         api_key: "test-secret".into(),
         base_url,
         model: "local-test-model".into(),
+        provider: Provider::Openai,
+        reasoning: None,
     }
 }
 
@@ -104,11 +106,12 @@ async fn real_http_sse_streams_before_completion_and_persists_with_rust_plan_pro
     let captured = events.clone();
     let kernel = Kernel::open(
         ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
         Arc::new(move |event| captured.lock().unwrap().push(event)),
     )
     .await
     .unwrap();
-    let session = kernel.create_session().await.unwrap();
+    let session = kernel.create_session(None).await.unwrap();
     let id = kernel
         .start_model(session.id, "current user question".into(), config(url))
         .await
@@ -150,10 +153,14 @@ async fn real_http_sse_streams_before_completion_and_persists_with_rust_plan_pro
 #[tokio::test]
 async fn http_errors_and_cancellation_finish_without_panicking() {
     let (url, _, server) = provider(401, vec![]).await;
-    let kernel = Kernel::open(":memory:".into(), Arc::new(|_| {}))
-        .await
-        .unwrap();
-    let session = kernel.create_session().await.unwrap();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(|_| {}),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
     kernel
         .start_model(session.id, "auth failure".into(), config(url))
         .await
@@ -179,6 +186,72 @@ async fn http_errors_and_cancellation_finish_without_panicking() {
     );
     kernel.shutdown().await.unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn anthropic_messages_sse_and_usage_are_adapted_without_mixing_system_roles() {
+    let (url, request, server) = provider(
+        200,
+        vec![
+            (
+                0,
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":24,\"output_tokens\":1}}}\n\n",
+            ),
+            (
+                0,
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Bonjour\"}}\n\n",
+            ),
+            (
+                30,
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" monde\"}}\n\n",
+            ),
+            (
+                20,
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            ),
+            (
+                0,
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ],
+    )
+    .await;
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(|_| {}),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    let mut settings = config(url);
+    settings.provider = Provider::Anthropic;
+    settings.model = "claude-3-7-sonnet-latest".into();
+    settings.reasoning = Some("medium".into());
+    kernel
+        .start_model(session.id, "anthropic request".into(), settings)
+        .await
+        .unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(3), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body["system"].as_str().unwrap().contains("只读计划模式"));
+    assert!(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["role"] != "system"));
+    assert_eq!(body["thinking"]["budget_tokens"], 4096);
+    assert_eq!(body["max_tokens"], 8192);
+    idle(&kernel).await;
+    let detail = kernel.session_detail(session.id).await.unwrap();
+    assert_eq!(detail.runs[0].output, "Bonjour monde");
+    assert_eq!(detail.runs[0].status, RunStatus::Completed);
+    assert_eq!(detail.metrics[0].input_tokens, Some(24));
+    assert_eq!(detail.metrics[0].output_tokens, Some(7));
+    kernel.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 #[test]
@@ -211,9 +284,12 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
             title: "session".into(),
             updated_at: 1,
             run_count: 2,
+            project_id: 1,
+            archived: false,
         },
         runs: vec![prior, foreign, current.clone()],
         plans: Vec::new(),
+        metrics: Vec::new(),
     };
     let messages: Vec<ChatMessage> = conversation(&detail, &current);
     assert_eq!(messages.len(), 4);

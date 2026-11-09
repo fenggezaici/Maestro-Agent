@@ -30,7 +30,7 @@ export default function MonacoDiff({ diff, split, fontSize = 12, fontFamily = 'C
       original = originalModel;
       modified = modifiedModel;
       const diffEditor = monaco.editor.createDiffEditor(host.current, {
-        theme: 'maestro-dark', readOnly: true, originalEditable: false,
+        theme: document.documentElement.dataset.theme === 'light' ? 'maestro-light' : 'maestro-dark', readOnly: true, originalEditable: false,
         renderSideBySide: split, automaticLayout: true, minimap: { enabled: false },
         fontFamily: `"${fontFamily}", Consolas, monospace`,
         fontSize, lineHeight: 23, padding: { top: 20, bottom: 24 },

@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod db;
+pub mod extensions;
 pub mod kernel;
 pub mod llm;
 pub mod model;
@@ -56,7 +57,12 @@ pub fn run() {
                 }
             });
             // setup is synchronous; SQLite initialization still runs on its OS thread.
-            let kernel = tauri::async_runtime::block_on(Kernel::open(path, sink))
+            let maestro_dir = app
+                .path()
+                .home_dir()
+                .unwrap_or_else(|_| app.path().app_data_dir().unwrap())
+                .join(".maestro");
+            let kernel = tauri::async_runtime::block_on(Kernel::open(path, maestro_dir, sink))
                 .map_err(std::io::Error::other)?;
             app.manage(kernel);
             app.manage(workspace::WorkspaceService::default());
@@ -69,9 +75,28 @@ pub fn run() {
             commands::cancel_agent,
             commands::list_runs,
             commands::create_session,
+            commands::set_session_archived,
+            commands::rename_session,
+            commands::list_projects,
+            commands::create_project,
+            commands::set_project_archived,
+            commands::delete_project,
             commands::list_sessions,
             commands::get_session,
             commands::decide_plan,
+            commands::scan_skills,
+            commands::create_skill,
+            commands::import_skill,
+            commands::import_skill_github,
+            commands::list_mcp_servers,
+            commands::add_mcp_server,
+            commands::import_mcp_json,
+            commands::start_mcp_server,
+            commands::stop_mcp_server,
+            commands::remove_mcp_server,
+            commands::recommended_skills,
+            commands::recommended_mcps,
+            commands::read_mcp_config,
             llm::stream_chat,
             workspace::get_workspace_info,
             workspace::select_workspace,

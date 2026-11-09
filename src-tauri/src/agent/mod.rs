@@ -13,6 +13,9 @@ use crate::{
 
 use placeholder::{tokens, PlaceholderModel};
 
+const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_TOOL_RESULT_BYTES: usize = 65536;
+
 pub(crate) async fn run_model(
     kernel: Arc<Kernel>,
     run: RunView,
@@ -24,8 +27,63 @@ pub(crate) async fn run_model(
             return Ok(false);
         }
         let detail = kernel.session_detail(run.session_id).await?;
-        let messages = llm::conversation(&detail, &run);
-        llm::stream(&config, messages, &mut cancel, &kernel, run.id).await
+        let mut messages = llm::conversation(&detail, &run);
+        let tools = kernel.agent_tools().await;
+        for _round in 0..MAX_TOOL_ROUNDS {
+            if *cancel.borrow() {
+                return Ok(false);
+            }
+            let outcome = llm::stream(
+                &config,
+                messages.clone(),
+                &tools,
+                &mut cancel,
+                &kernel,
+                run.id,
+            )
+            .await?;
+            if !outcome.done {
+                return Ok(false);
+            }
+            if outcome.tool_calls.is_empty() {
+                return Ok(true);
+            }
+            messages.push(llm::ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(outcome.tool_calls.clone()),
+                tool_call_id: None,
+                name: None,
+            });
+            for call in &outcome.tool_calls {
+                kernel
+                    .token(run.id, format!("\n\n> 调用工具 `{}`…", call.name))
+                    .await;
+                let result = kernel
+                    .execute_model_tool(run.id, &call.name, &call.arguments)
+                    .await;
+                let text = match result {
+                    Ok(text) => {
+                        kernel.token(run.id, " 完成\n".to_string()).await;
+                        text
+                    }
+                    Err(error) => {
+                        kernel
+                            .token(run.id, format!(" 失败：{error}\n"))
+                            .await;
+                        format!("工具调用失败：{error}")
+                    }
+                };
+                messages.push(llm::ChatMessage {
+                    role: "tool".into(),
+                    content: text.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
+                    tool_call_id: Some(call.id.clone()),
+                    name: Some(call.name.clone()),
+                    tool_calls: None,
+                });
+            }
+        }
+        Err("工具调用轮数超过上限（8 轮）".to_string())
     }
     .await;
     let (status, error) = match result {

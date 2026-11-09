@@ -5,9 +5,13 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{
-    AppResult, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus, RunStatus, RunView,
-    SessionDetail, SessionView,
+    AppResult, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics,
+    RunStatus, RunView, SessionDetail, SessionView,
 };
+
+/// Every pre-v4 session migrates into the seeded default project, which can
+/// neither be archived nor deleted.
+pub const DEFAULT_PROJECT_ID: i64 = 1;
 
 type Operation = Box<dyn FnOnce(&mut Connection) + Send>;
 
@@ -84,12 +88,211 @@ impl Database {
         self.create_run_in_session(session.id, prompt, mode).await
     }
 
+    #[cfg(test)]
     pub async fn create_session(&self) -> AppResult<SessionView> {
-        self.call(|connection| {
-            connection
-                .execute("INSERT INTO sessions (title) VALUES ('新会话')", [])
+        self.create_session_in_project(DEFAULT_PROJECT_ID).await
+    }
+
+    pub async fn create_session_in_project(&self, project_id: i64) -> AppResult<SessionView> {
+        self.call(move |connection| {
+            let changed = connection
+                .execute(
+                    "INSERT INTO sessions (title, project_id)
+                     SELECT '新会话', ?1 WHERE EXISTS
+                     (SELECT 1 FROM projects WHERE id = ?1 AND archived_at IS NULL)",
+                    [project_id],
+                )
                 .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Project is missing or archived".into());
+            }
             read_session_view(connection, connection.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        session_id: i64,
+        archived: bool,
+    ) -> AppResult<SessionView> {
+        self.call(move |connection| {
+            let running: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id = ?1 AND status = 'running')",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if archived && running {
+                return Err("Cannot archive a session with an active run".into());
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE sessions SET archived_at = CASE WHEN ?2 THEN unixepoch() ELSE NULL END
+                     WHERE id = ?1",
+                    params![session_id, archived],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Session not found".into());
+            }
+            read_session_view(connection, session_id)
+        })
+        .await
+    }
+
+    pub async fn rename_session(
+        &self,
+        session_id: i64,
+        title: String,
+    ) -> AppResult<SessionView> {
+        let title = title.trim().to_string();
+        if title.is_empty() || title.chars().count() > 200 {
+            return Err("Session title must contain 1–200 characters".into());
+        }
+        self.call(move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE sessions SET title = ?2, updated_at = unixepoch() WHERE id = ?1",
+                    params![session_id, title],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Session not found".into());
+            }
+            read_session_view(connection, session_id)
+        })
+        .await
+    }
+
+    pub async fn list_projects(&self) -> AppResult<Vec<ProjectView>> {
+        self.call(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, name, path, (archived_at IS NOT NULL), created_at
+                     FROM projects ORDER BY created_at, id",
+                )
+                .map_err(db_error)?;
+            let rows = statement.query_map([], project_row).map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn create_project(
+        &self,
+        name: String,
+        path: Option<String>,
+    ) -> AppResult<ProjectView> {
+        let name = name.trim().to_string();
+        if name.is_empty() || name.chars().count() > 128 {
+            return Err("Project name must contain 1–128 characters".into());
+        }
+        let path = path
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = &path {
+            if value.chars().count() > 1024 {
+                return Err("Project path is too long".into());
+            }
+            if !std::path::Path::new(value).is_dir() {
+                return Err("Project path is not an existing directory".into());
+            }
+        }
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO projects (name, path) VALUES (?1, ?2)",
+                    params![name, path],
+                )
+                .map_err(db_error)?;
+            connection
+                .query_row(
+                    "SELECT id, name, path, (archived_at IS NOT NULL), created_at
+                     FROM projects WHERE id = ?1",
+                    [connection.last_insert_rowid()],
+                    project_row,
+                )
+                .map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn set_project_archived(
+        &self,
+        project_id: i64,
+        archived: bool,
+    ) -> AppResult<ProjectView> {
+        if project_id == DEFAULT_PROJECT_ID && archived {
+            return Err("The default project cannot be archived".into());
+        }
+        self.call(move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE projects SET archived_at = CASE WHEN ?2 THEN unixepoch() ELSE NULL END
+                     WHERE id = ?1",
+                    params![project_id, archived],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Project not found".into());
+            }
+            connection
+                .query_row(
+                    "SELECT id, name, path, (archived_at IS NOT NULL), created_at
+                     FROM projects WHERE id = ?1",
+                    [project_id],
+                    project_row,
+                )
+                .map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn delete_project(&self, project_id: i64) -> AppResult<()> {
+        if project_id == DEFAULT_PROJECT_ID {
+            return Err("The default project cannot be deleted".into());
+        }
+        self.call(move |connection| {
+            let running: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE status = 'running'
+                     AND session_id IN (SELECT id FROM sessions WHERE project_id = ?1))",
+                    [project_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if running {
+                return Err("Cannot delete a project with an active run".into());
+            }
+            let transaction = connection.transaction().map_err(db_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM audit WHERE run_id IN
+                     (SELECT id FROM runs WHERE session_id IN
+                     (SELECT id FROM sessions WHERE project_id = ?1))",
+                    [project_id],
+                )
+                .map_err(db_error)?;
+            for statement in [
+                "DELETE FROM run_metrics WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM plan_cards WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM runs WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM sessions WHERE project_id = ?1",
+            ] {
+                transaction.execute(statement, [project_id]).map_err(db_error)?;
+            }
+            let changed = transaction
+                .execute("DELETE FROM projects WHERE id = ?1", [project_id])
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Project not found".into());
+            }
+            transaction.commit().map_err(db_error)
         })
         .await
     }
@@ -174,10 +377,12 @@ impl Database {
 
     pub async fn list_sessions(&self) -> AppResult<Vec<SessionView>> {
         self.call(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT s.id, s.title, s.updated_at, (SELECT COUNT(*) FROM runs WHERE session_id = s.id)
-                 FROM sessions s ORDER BY s.updated_at DESC, s.id DESC"
-            ).map_err(db_error)?;
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions s
+                     ORDER BY s.updated_at DESC, s.id DESC"
+                ))
+                .map_err(db_error)?;
             let rows = statement.query_map([], session_row).map_err(db_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
         }).await
@@ -192,7 +397,8 @@ impl Database {
             ).map_err(db_error)?;
             let rows = statement.query_map([session_id], plan_row).map_err(db_error)?;
             let plans = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
-            Ok(SessionDetail { session, runs, plans })
+            let metrics = read_metrics(connection, session_id)?;
+            Ok(SessionDetail { session, runs, plans, metrics })
         }).await
     }
 
@@ -266,6 +472,18 @@ impl Database {
         .await
     }
 
+    pub async fn save_metrics(&self, metrics: RunMetrics) -> AppResult<()> {
+        self.call(move |connection| {
+            let input = metrics.input_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
+            let output = metrics.output_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
+            let elapsed = i64::try_from(metrics.elapsed_ms).map_err(|_| "Invalid elapsed time")?;
+            let first = metrics.first_token_ms.map(i64::try_from).transpose().map_err(|_| "Invalid first-token time")?;
+            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, elapsed_ms, first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms",
+                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, elapsed, first]).map_err(db_error)?;
+            Ok(())
+        }).await
+    }
+
     pub async fn shutdown(&self) -> AppResult<()> {
         let worker = self
             .thread
@@ -293,17 +511,65 @@ fn db_error(error: rusqlite::Error) -> String {
     error.to_string()
 }
 
+fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMetrics>> {
+    fn number(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+        row.get::<_, Option<i64>>(index)?
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+            })
+            .transpose()
+    }
+    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, elapsed_ms, first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok(RunMetrics {
+                run_id: row.get(0)?,
+                session_id: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                input_tokens: number(row, 4)?,
+                output_tokens: number(row, 5)?,
+                elapsed_ms: number(row, 6)?.unwrap_or(0),
+                first_token_ms: number(row, 7)?,
+            })
+        })
+        .map_err(db_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+}
+
+const SESSION_COLUMNS: &str = "s.id, s.title, s.updated_at,
+     (SELECT COUNT(*) FROM runs WHERE session_id = s.id), s.project_id, (s.archived_at IS NOT NULL)";
+
 fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionView> {
     Ok(SessionView {
         id: row.get(0)?,
         title: row.get(1)?,
         updated_at: row.get(2)?,
         run_count: row.get(3)?,
+        project_id: row.get(4)?,
+        archived: row.get(5)?,
+    })
+}
+
+fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
+    Ok(ProjectView {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        archived: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
 fn read_session_view(connection: &Connection, id: i64) -> AppResult<SessionView> {
-    connection.query_row("SELECT s.id, s.title, s.updated_at, (SELECT COUNT(*) FROM runs WHERE session_id = s.id) FROM sessions s WHERE s.id = ?1", [id], session_row).map_err(db_error)
+    connection
+        .query_row(
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.id = ?1"),
+            [id],
+            session_row,
+        )
+        .map_err(db_error)
 }
 
 fn read_runs(connection: &Connection, session_id: Option<i64>) -> AppResult<Vec<RunView>> {
@@ -321,10 +587,19 @@ fn read_runs(connection: &Connection, session_id: Option<i64>) -> AppResult<Vec<
                 id: row.get(0)?,
                 session_id: row.get(1)?,
                 prompt: row.get(2)?,
-                mode: if mode == "execute" {
-                    Mode::Execute
-                } else {
-                    Mode::Plan
+                mode: match mode.as_str() {
+                    "plan" => Mode::Plan,
+                    "code" => Mode::Code,
+                    "confirm" => Mode::Confirm,
+                    "auto" => Mode::Auto,
+                    "execute" => Mode::Execute,
+                    _ => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::other("Unknown stored mode")),
+                        ))
+                    }
                 },
                 status: RunStatus::from_db(&status),
                 output: row.get(5)?,
@@ -370,9 +645,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 2 {
+    if version > 4 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 2"
+            "Database schema {version} is newer than supported version 4"
         ));
     }
     connection
@@ -399,6 +674,13 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
              ",
         )
         .map_err(db_error)?;
+    // ALTER TABLE only allows a REFERENCES column with a non-NULL default while
+    // foreign keys are disabled, so the v4 session.project_id migration needs this off.
+    if version < 4 {
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .map_err(db_error)?;
+    }
     let transaction = connection.transaction().map_err(db_error)?;
     if version < 2 {
         transaction.execute_batch(
@@ -420,6 +702,57 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
              PRAGMA user_version = 2;"
         ).map_err(db_error)?;
     }
+    if version < 3 {
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='runs'),0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        transaction.execute_batch("CREATE TABLE runs_v3 (id INTEGER PRIMARY KEY AUTOINCREMENT, prompt TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode IN ('plan','code','confirm','auto','execute')), status TEXT NOT NULL CHECK(status IN ('running','completed','cancelled','failed')), output TEXT NOT NULL DEFAULT '', error TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), finished_at INTEGER, session_id INTEGER REFERENCES sessions(id));
+            INSERT INTO runs_v3 SELECT id,prompt,mode,status,output,error,created_at,finished_at,session_id FROM runs;
+            DROP TABLE runs; ALTER TABLE runs_v3 RENAME TO runs; CREATE INDEX runs_session_id ON runs(session_id);
+            CREATE TABLE run_metrics (run_id INTEGER PRIMARY KEY REFERENCES runs(id), session_id INTEGER NOT NULL REFERENCES sessions(id), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER NOT NULL, first_token_ms INTEGER);
+            PRAGMA user_version=3;").map_err(db_error)?;
+        transaction.execute("INSERT INTO sqlite_sequence(name,seq) SELECT 'runs',?1 WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='runs')", [sequence]).map_err(db_error)?;
+        transaction
+            .execute(
+                "UPDATE sqlite_sequence SET seq=MAX(seq,?1) WHERE name='runs'",
+                [sequence],
+            )
+            .map_err(db_error)?;
+        let mut check = transaction
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(db_error)?;
+        if check
+            .query([])
+            .map_err(db_error)?
+            .next()
+            .map_err(db_error)?
+            .is_some()
+        {
+            return Err("Migration foreign-key integrity check failed".into());
+        }
+    }
+    if version < 4 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    path TEXT,
+                    archived_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 INSERT INTO projects (id, name) VALUES (1, 'Maestro-Agent');
+                 ALTER TABLE sessions ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1 REFERENCES projects(id);
+                 ALTER TABLE sessions ADD COLUMN archived_at INTEGER;
+                 CREATE INDEX sessions_project_id ON sessions(project_id);
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -437,6 +770,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
         )
         .map_err(db_error)?;
     transaction.commit().map_err(db_error)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(db_error)?;
     Ok(connection)
 }
 
@@ -612,7 +948,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 3)
+                    .pragma_update(None, "user_version", 5)
                     .map_err(db_error)
             })
             .await
@@ -726,6 +1062,255 @@ mod tests {
         let detail = database.session_detail(sessions[0].id).await.unwrap();
         assert_eq!(detail.runs[0].output, "old output");
         assert_eq!(detail.session.title, "legacy");
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v3_preserves_v2_modes_foreign_keys_and_autoincrement_high_water() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v2.sqlite3");
+        let copy = path.clone();
+        let worker = thread::spawn(move || {
+            let connection = Connection::open(copy).unwrap();
+            connection.execute_batch("CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,created_at INTEGER DEFAULT (unixepoch()),updated_at INTEGER DEFAULT (unixepoch()));
+                CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT,prompt TEXT NOT NULL,mode TEXT CHECK(mode IN ('plan','execute')),status TEXT,output TEXT,error TEXT,created_at INTEGER,finished_at INTEGER,session_id INTEGER REFERENCES sessions(id));
+                CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id INTEGER REFERENCES runs(id),action TEXT,detail TEXT,created_at INTEGER DEFAULT (unixepoch()));
+                CREATE TABLE plan_cards (id INTEGER PRIMARY KEY,session_id INTEGER REFERENCES sessions(id),run_id INTEGER REFERENCES runs(id),draft TEXT,status TEXT,created_at INTEGER,decided_at INTEGER);
+                INSERT INTO sessions(id,title) VALUES(1,'legacy');
+                INSERT INTO runs VALUES(1,'old','execute','completed','answer',NULL,1,2,1);
+                INSERT INTO runs VALUES(2,'plan','plan','completed','plan answer',NULL,1,2,1);
+                INSERT INTO runs VALUES(99,'deleted','plan','completed','',NULL,1,2,1); DELETE FROM runs WHERE id=99;
+                INSERT INTO audit(run_id,action,detail) VALUES(1,'existing','preserve');
+                INSERT INTO plan_cards VALUES(3,1,1,'{\"title\":\"kept\",\"summary\":\"legacy\",\"steps\":[\"review\"],\"diffs\":[]}','approved',1,2);
+                PRAGMA user_version=2;").unwrap();
+        });
+        tauri::async_runtime::spawn_blocking(move || worker.join())
+            .await
+            .unwrap()
+            .unwrap();
+        let database = Database::open(path.clone()).await.unwrap();
+        let detail = database.session_detail(1).await.unwrap();
+        assert_eq!(detail.runs[0].mode, Mode::Execute);
+        assert_eq!(detail.runs[1].mode, Mode::Plan);
+        assert_eq!(detail.plans[0].status, PlanStatus::Approved);
+        let id = database
+            .create_run_in_session(1, "new code".into(), Mode::Code)
+            .await
+            .unwrap();
+        assert!(id > 99);
+        database
+            .save_metrics(RunMetrics {
+                run_id: id,
+                session_id: 1,
+                provider: "openai".into(),
+                model: "o3-mini".into(),
+                input_tokens: Some(24),
+                output_tokens: Some(10),
+                elapsed_ms: 250,
+                first_token_ms: Some(20),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            database.session_detail(1).await.unwrap().metrics[0].output_tokens,
+            Some(10)
+        );
+        database.shutdown().await.unwrap();
+        let reopened = Database::open(path).await.unwrap();
+        assert_eq!(
+            reopened.session_detail(1).await.unwrap().plans[0].status,
+            PlanStatus::Approved
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v4_projects_archive_sessions_and_cascade_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(":memory:".into()).await.unwrap();
+
+        // The default project is seeded and owns new sessions.
+        let projects = database.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, DEFAULT_PROJECT_ID);
+        let session = database.create_session().await.unwrap();
+        assert_eq!(session.project_id, DEFAULT_PROJECT_ID);
+        assert!(!session.archived);
+
+        // Sessions require an existing, unarchived project.
+        assert!(database.create_session_in_project(999).await.is_err());
+        let project = database
+            .create_project(
+                "  Side  ".into(),
+                Some(directory.path().to_string_lossy().into_owned()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(project.name, "Side");
+        let moved = database
+            .create_session_in_project(project.id)
+            .await
+            .unwrap();
+        assert_eq!(moved.project_id, project.id);
+        assert!(database.create_project("  ".into(), None).await.is_err());
+        assert!(database
+            .create_project(
+                "bad".into(),
+                Some("C:/definitely/missing/path".into())
+            )
+            .await
+            .is_err());
+
+        // Sessions rename and archive.
+        let renamed = database
+            .rename_session(session.id, "  重命名  ".into())
+            .await
+            .unwrap();
+        assert_eq!(renamed.title, "重命名");
+        assert!(database
+            .rename_session(session.id, "   ".into())
+            .await
+            .is_err());
+        assert!(database
+            .set_session_archived(moved.id, true)
+            .await
+            .unwrap()
+            .archived);
+        assert!(!database
+            .set_session_archived(moved.id, false)
+            .await
+            .unwrap()
+            .archived);
+
+        // Archived projects reject new sessions; the default project is pinned.
+        database
+            .set_project_archived(project.id, true)
+            .await
+            .unwrap();
+        assert!(database.list_projects().await.unwrap()[1].archived);
+        assert!(database
+            .create_session_in_project(project.id)
+            .await
+            .is_err());
+        database
+            .set_project_archived(project.id, false)
+            .await
+            .unwrap();
+        assert!(database
+            .set_project_archived(DEFAULT_PROJECT_ID, true)
+            .await
+            .is_err());
+        assert!(database.delete_project(DEFAULT_PROJECT_ID).await.is_err());
+        assert!(database.delete_project(999).await.is_err());
+
+        // A running run blocks archiving and project deletion.
+        let run_id = database
+            .create_run_in_session(moved.id, "work".into(), Mode::Plan)
+            .await
+            .unwrap();
+        assert!(database.delete_project(project.id).await.is_err());
+        assert!(database
+            .set_session_archived(moved.id, true)
+            .await
+            .is_err());
+        database
+            .finish_run(RunView {
+                id: run_id,
+                session_id: moved.id,
+                prompt: "work".into(),
+                mode: Mode::Plan,
+                status: RunStatus::Completed,
+                output: "done".into(),
+                error: None,
+            })
+            .await
+            .unwrap();
+        database
+            .save_metrics(RunMetrics {
+                run_id,
+                session_id: moved.id,
+                provider: "openai".into(),
+                model: "o3-mini".into(),
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+                elapsed_ms: 9,
+                first_token_ms: None,
+            })
+            .await
+            .unwrap();
+
+        // Deletion cascades sessions, runs, plans, metrics and audit rows.
+        database.delete_project(project.id).await.unwrap();
+        assert!(database.session_detail(moved.id).await.is_err());
+        let orphans: i64 = database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM run_metrics WHERE session_id = ?1",
+                        [moved.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        assert_eq!(orphans, 0);
+        let audit_orphans: i64 = database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit WHERE run_id = ?1",
+                        [run_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        assert_eq!(audit_orphans, 0);
+        assert_eq!(
+            database
+                .session_detail(session.id)
+                .await
+                .unwrap()
+                .session
+                .title,
+            "重命名"
+        );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v4_migration_assigns_existing_sessions_to_the_default_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.sqlite3");
+        let copy = path.clone();
+        let worker = thread::spawn(move || {
+            let connection = Connection::open(copy).unwrap();
+            connection.execute_batch("CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,created_at INTEGER DEFAULT (unixepoch()),updated_at INTEGER DEFAULT (unixepoch()));
+                CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT,prompt TEXT NOT NULL,mode TEXT CHECK(mode IN ('plan','code','confirm','auto','execute')),status TEXT,output TEXT,error TEXT,created_at INTEGER,finished_at INTEGER,session_id INTEGER REFERENCES sessions(id));
+                CREATE INDEX runs_session_id ON runs(session_id);
+                CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id INTEGER REFERENCES runs(id),action TEXT,detail TEXT,created_at INTEGER DEFAULT (unixepoch()));
+                CREATE TABLE plan_cards (id INTEGER PRIMARY KEY,session_id INTEGER REFERENCES sessions(id),run_id INTEGER REFERENCES runs(id),draft TEXT,status TEXT,created_at INTEGER,decided_at INTEGER);
+                CREATE TABLE run_metrics (run_id INTEGER PRIMARY KEY REFERENCES runs(id), session_id INTEGER NOT NULL REFERENCES sessions(id), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER NOT NULL, first_token_ms INTEGER);
+                INSERT INTO sessions(id,title) VALUES(1,'legacy'),(2,'second');
+                INSERT INTO runs VALUES(1,'old','code','completed','answer',NULL,1,2,1);
+                PRAGMA user_version=3;").unwrap();
+        });
+        tauri::async_runtime::spawn_blocking(move || worker.join())
+            .await
+            .unwrap()
+            .unwrap();
+        let database = Database::open(path).await.unwrap();
+        let projects = database.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Maestro-Agent");
+        let sessions = database.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|session| session.project_id == DEFAULT_PROJECT_ID && !session.archived));
+        assert_eq!(database.session_detail(1).await.unwrap().runs[0].output, "answer");
         database.shutdown().await.unwrap();
     }
 }

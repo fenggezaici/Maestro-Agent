@@ -16,16 +16,16 @@ describe('IPC state reconciliation', () => {
 
   it('ignores stale events and tokens for another run', () => {
     let state = kernelReducer(initialSnapshot, { type: 'event', event: { type: 'status', run, sequence: 2 } });
-    state = kernelReducer(state, { type: 'event', event: { type: 'mode_changed', mode: 'execute', sequence: 1 } });
+    state = kernelReducer(state, { type: 'event', event: { type: 'mode_changed', mode: 'auto', sequence: 1 } });
     state = kernelReducer(state, { type: 'event', event: { type: 'stream_token', runId: 99, token: 'foreign', sequence: 3 } });
-    expect(state.mode).toBe('plan');
+    expect(state.mode).toBe('code');
     expect(state.activeRun?.output).toBe('');
   });
 
   it('restores a mid-run baseline before replaying buffered tokens', () => {
     const lastRun: RunView = { ...run, id: 99, status: 'completed', output: 'previous' };
     const state = reconcileSnapshot({
-      ready: true, mode: 'execute', activeRun: { ...run, output: 'baseline' },
+      ready: true, mode: 'code', activeRun: { ...run, output: 'baseline' },
       lastRun, sequence: 5,
     }, [
       { type: 'stream_token', runId: 1, token: ' + new', sequence: 6 },
@@ -33,13 +33,13 @@ describe('IPC state reconciliation', () => {
     ]);
     expect(state.activeRun?.output).toBe('baseline + new');
     expect(state.lastRun).toEqual(lastRun);
-    expect(state.mode).toBe('execute');
+    expect(state.mode).toBe('code');
     expect(state.sequence).toBe(6);
   });
 
   it('keeps earlier turns and overlays live output only in the selected session', () => {
     const saved = { ...run, id: 3, status: 'completed' as const, output: 'saved' };
-    const detail = { session: { id: 2, title: 'session', updatedAt: 1, runCount: 2 }, runs: [saved, run], plans: [] };
+    const detail = { session: { id: 2, title: 'session', updatedAt: 1, runCount: 2, projectId: 1, archived: false }, runs: [saved, run], plans: [] };
     const snapshot = { ...initialSnapshot, activeRun: { ...run, output: 'live' }, lastRun: saved };
     expect(conversationRuns(detail, 2, snapshot).map((item) => item.output)).toEqual(['live', 'saved']);
     expect(conversationRuns(detail, 99, snapshot)).toEqual([]);

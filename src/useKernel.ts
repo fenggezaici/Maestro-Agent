@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { backend, type KernelEvent, type Mode, type PlanCard, type PlanDecision, type RunView, type SessionDetail, type SessionView, type Snapshot } from './ipc';
+import { backend, type KernelEvent, type Mode, type PlanCard, type PlanDecision, type ProjectView, type RunView, type SessionDetail, type SessionView, type Snapshot, type RunMetrics } from './ipc';
 import { readLlmSettings, validateLlmSettings } from './settings';
 import type { ChatMessage } from './ipc';
 
 export const initialSnapshot: Snapshot = {
-  ready: false, mode: 'plan', activeRun: null, lastRun: null, sequence: 0,
+  ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0,
 };
 
 type Action = { type: 'snapshot'; snapshot: Snapshot } | { type: 'event'; event: KernelEvent };
@@ -35,6 +35,7 @@ export function kernelReducer(state: Snapshot, action: Action): Snapshot {
     case 'plan_updated':
     case 'sessions_changed':
     case 'tool_blocked': return next;
+    case 'metrics': return next;
   }
 }
 
@@ -70,15 +71,19 @@ export function chatMessages(runs: RunView[], sessionId: number, prompt: string)
 export function useKernel() {
   const [state, dispatch] = useReducer(kernelReducer, initialSnapshot);
   const [sessions, setSessions] = useState<SessionView[]>([]);
+  const [projects, setProjects] = useState<ProjectView[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [loadingSession, setLoadingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
+  const [metrics, setMetrics] = useState<Record<number, RunMetrics>>({});
   const sessionsRevision = useRef(0);
+  const projectsRevision = useRef(0);
   const detailRevision = useRef(0);
   const selectedRef = useRef<number | null>(null);
   const selectionRevision = useRef(0);
+  const activeProjectRef = useRef<number | null>(null);
   const mounted = useRef(false);
 
   const selectSession = useCallback((id: number | null) => {
@@ -96,10 +101,29 @@ export function useKernel() {
     const items = await backend.sessions();
     if (!mounted.current || revision !== sessionsRevision.current) return;
     setSessions(items);
-    if (selectedRef.current === null || !items.some((item) => item.id === selectedRef.current)) {
-      selectSession(items[0]?.id ?? null);
+    const selected = items.find((item) => item.id === selectedRef.current);
+    if (selected) activeProjectRef.current = selected.projectId;
+    if (selectedRef.current === null || !selected) {
+      const fallback = items.find((item) => !item.archived) ?? items[0];
+      activeProjectRef.current = fallback?.projectId ?? null;
+      selectSession(fallback?.id ?? null);
     }
   }, [selectSession]);
+
+  const refreshProjects = useCallback(async () => {
+    const revision = ++projectsRevision.current;
+    const items = await backend.projects();
+    if (!mounted.current || revision !== projectsRevision.current) return;
+    setProjects(items);
+    const active = items.find((item) => item.id === activeProjectRef.current);
+    if (!active || active.archived) {
+      activeProjectRef.current = items.find((item) => !item.archived)?.id ?? null;
+    }
+  }, []);
+
+  const selectProject = useCallback((projectId: number | null) => {
+    activeProjectRef.current = projectId;
+  }, []);
 
   const refreshDetail = useCallback(async (id = selectedRef.current) => {
     if (id === null || id !== selectedRef.current) return;
@@ -107,7 +131,10 @@ export function useKernel() {
     setLoadingSession(true);
     try {
       const result = await backend.session(id);
-      if (mounted.current && revision === detailRevision.current && selectedRef.current === id) setDetail(result);
+      if (mounted.current && revision === detailRevision.current && selectedRef.current === id) {
+        setDetail(result);
+        setMetrics((current) => ({ ...current, ...Object.fromEntries((result.metrics ?? []).map((value) => [value.runId, value])) }));
+      }
     } finally {
       if (mounted.current && revision === detailRevision.current) setLoadingSession(false);
     }
@@ -138,6 +165,7 @@ export function useKernel() {
             lastEventSequence = event.sequence;
           }
           dispatch({ type: 'event', event });
+          if (event.type === 'metrics') setMetrics((current) => ({ ...current, [event.metrics.runId]: event.metrics }));
           if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
           if (event.type === 'backend_error') {
             void backend.snapshot().then((snapshot) => {
@@ -147,6 +175,7 @@ export function useKernel() {
           if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
           if (event.type === 'sessions_changed') {
             void refreshSessions().catch((reason: unknown) => { if (!disposed) setError(errorMessage(reason)); });
+            void refreshProjects().catch(() => { /* Session data still refreshed above. */ });
           }
           if (event.type === 'plan_updated' || (event.type === 'status' && event.run.status !== 'running')) {
             void refreshDetail().catch((reason: unknown) => {
@@ -162,6 +191,7 @@ export function useKernel() {
         lastEventSequence = reconciled.sequence;
         dispatch({ type: 'snapshot', snapshot: reconciled });
         for (const event of buffered ?? []) {
+          if (event.type === 'metrics') setMetrics((current) => ({ ...current, [event.metrics.runId]: event.metrics }));
           if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
           if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
         }
@@ -169,6 +199,7 @@ export function useKernel() {
         if (selectedRef.current === null && reconciled.activeRun) selectSession(reconciled.activeRun.sessionId);
         buffered = null;
         await refreshSessions();
+        await refreshProjects();
       } catch (reason) {
         if (!disposed) setError(`无法连接 Rust 后端，请通过 npm run tauri dev 启动。${errorMessage(reason)}`);
       }
@@ -181,7 +212,7 @@ export function useKernel() {
       detailRevision.current++;
       unlisten?.();
     };
-  }, [refreshSessions, refreshDetail, selectSession]);
+  }, [refreshSessions, refreshDetail, refreshProjects, selectSession]);
 
   const command = useCallback(async <T,>(operation: () => Promise<T>): Promise<T | undefined> => {
     setPendingCount((count) => count + 1);
@@ -200,13 +231,56 @@ export function useKernel() {
   }, []);
 
   return {
-    state, sessions, selectedSessionId, detail, loadingSession, error, pending: pendingCount > 0,
+    state, sessions, projects, selectedSessionId, detail, loadingSession, error, metrics, pending: pendingCount > 0,
     runs: conversationRuns(detail, selectedSessionId, state),
     selectSession,
-    createSession: () => command(async () => {
+    selectProject,
+    createSession: (projectId?: number) => command(async () => {
       const revision = selectionRevision.current;
-      const session = await backend.createSession();
+      const session = await backend.createSession(projectId ?? activeProjectRef.current ?? undefined);
       if (mounted.current && revision === selectionRevision.current) selectSession(session.id);
+      await refreshSessions();
+      return session;
+    }),
+    createProject: async (name: string, path?: string) => {
+      try {
+        const project = await backend.createProject(name, path);
+        await refreshProjects();
+        activeProjectRef.current = project.id;
+        return { project };
+      } catch (reason) {
+        const message = errorMessage(reason);
+        if (mounted.current) setError(message);
+        return { error: message };
+      }
+    },
+    setProjectArchived: (projectId: number, archived: boolean) => command(async () => {
+      const project = await backend.setProjectArchived(projectId, archived);
+      await refreshProjects();
+      return project;
+    }),
+    deleteProject: async (projectId: number) => {
+      try {
+        await backend.deleteProject(projectId);
+        await refreshProjects();
+        await refreshSessions();
+        return {};
+      } catch (reason) {
+        const message = errorMessage(reason);
+        if (mounted.current) setError(message);
+        return { error: message };
+      }
+    },
+    setSessionArchived: (sessionId: number, archived: boolean) => command(async () => {
+      const session = await backend.setSessionArchived(sessionId, archived);
+      await refreshSessions();
+      if (archived && selectedRef.current === sessionId) {
+        selectSession((await backend.sessions()).find((item) => !item.archived)?.id ?? null);
+      }
+      return session;
+    }),
+    renameSession: (sessionId: number, title: string) => command(async () => {
+      const session = await backend.renameSession(sessionId, title);
       await refreshSessions();
       return session;
     }),
@@ -215,7 +289,7 @@ export function useKernel() {
       let id = selectedRef.current;
       if (id === null) {
         const revision = selectionRevision.current;
-        const session = await backend.createSession();
+        const session = await backend.createSession(activeProjectRef.current ?? undefined);
         id = session.id;
         if (mounted.current && revision === selectionRevision.current) selectSession(id);
       }

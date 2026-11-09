@@ -18,7 +18,7 @@ export default function MonacoCode({ file, fontSize, fontFamily }: { file: Explo
       if (disposed || !host.current) return;
       model = monaco.editor.createModel(file.content, language(file.path));
       editorInstance = monaco.editor.create(host.current, {
-        model, theme: 'maestro-dark', readOnly: true, automaticLayout: true, minimap: { enabled: false },
+        model, theme: document.documentElement.dataset.theme === 'light' ? 'maestro-light' : 'maestro-dark', readOnly: true, automaticLayout: true, minimap: { enabled: false },
         fontSize, fontFamily: `"${fontFamily}", Consolas, monospace`, lineHeight: 23, folding: true,
         scrollBeyondLastLine: false, links: false, contextmenu: false, wordWrap: 'off',
         padding: { top: 18, bottom: 20 }, ariaLabel: `只读文件 ${file.path}`, accessibilitySupport: 'on',

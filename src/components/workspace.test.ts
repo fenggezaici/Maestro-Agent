@@ -1,23 +1,15 @@
-import { beforeEach, expect, it, vi } from 'vitest';
-import { readExpandedProjects, saveExpandedProjects, type WorkbenchProject } from './workspace';
+import { expect, it } from 'vitest';
+import { relativeSessionAge } from './workspace';
 
-const projects: WorkbenchProject[] = [{ id: 'one', name: 'One', sessions: [] }, { id: 'two', name: 'Two', sessions: [] }];
-beforeEach(() => localStorage.clear());
-
-it('honors saved all-collapsed state and rejects invalid preference shapes', () => {
-  expect(readExpandedProjects('key', projects)).toEqual(['one', 'two']);
-  localStorage.setItem('key', '[]');
-  expect(readExpandedProjects('key', projects)).toEqual([]);
-  localStorage.setItem('key', '["one","unknown"]');
-  expect(readExpandedProjects('key', projects)).toEqual(['one']);
-  localStorage.setItem('key', '{invalid');
-  expect(readExpandedProjects('key', projects)).toEqual(['one', 'two']);
-});
-
-it('separates live and preview preferences and tolerates unavailable storage', () => {
-  saveExpandedProjects('maestro.projects.v1.preview', ['one']);
-  expect(readExpandedProjects('maestro.projects.v1.live', projects)).toEqual(['one', 'two']);
-  const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('Storage unavailable'); });
-  expect(() => saveExpandedProjects('blocked', ['two'])).not.toThrow();
-  write.mockRestore();
+it('formats relative session ages and keeps preview sessions illustrative', () => {
+  const now = Date.parse('2026-11-09T12:00:00Z');
+  const at = (secondsAgo: number) => Math.floor(now / 1000) - secondsAgo;
+  expect(relativeSessionAge(at(30), 'live', now)).toBe('刚刚');
+  expect(relativeSessionAge(at(300), 'live', now)).toBe('5 分钟前');
+  expect(relativeSessionAge(at(7200), 'live', now)).toBe('2 小时前');
+  expect(relativeSessionAge(at(86400 * 55), 'live', now)).toBe('55 天前');
+  expect(relativeSessionAge(at(86400 * 60), 'live', now)).toBe('60 天前');
+  expect(relativeSessionAge(at(86400 * 400), 'live', now)).toBe('1 年前');
+  expect(relativeSessionAge(1, 'preview', now)).toBe('示例');
+  expect(relativeSessionAge(0, 'live', now)).toBe('示例');
 });

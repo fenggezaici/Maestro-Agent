@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import * as Accordion from '@radix-ui/react-accordion';
-import { ChevronDown, Folder, Plus, Search } from 'lucide-react';
+import { useState } from 'react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import { Archive, ArchiveRestore, ChevronRight, MoreHorizontal, Pencil, Plus, Search } from 'lucide-react';
 import { IconButton } from './ui';
-import { readExpandedProjects, saveExpandedProjects, type WorkbenchProject } from './workspace';
+import { relativeSessionAge, type WorkbenchProject } from './workspace';
+import type { SessionView } from '../ipc';
 
 interface Props {
   projects: WorkbenchProject[];
@@ -13,62 +14,93 @@ interface Props {
   canCreate: boolean;
   onSelect: (id: number) => void;
   onCreate: (projectId: string) => void;
+  onRenameSession?: (sessionId: number, title: string) => void;
+  onArchiveSession?: (sessionId: number, archived: boolean) => void;
+  onArchiveProject?: (projectId: string, archived: boolean) => void;
+  onDeleteProject?: (projectId: string) => void;
 }
 
-export default function ProjectSessions({ projects, currentProjectId, selectedSessionId, activeSessionId, source, canCreate, onSelect, onCreate }: Props) {
-  const key = `maestro.projects.v1.${source}`;
-  const [expanded, setExpanded] = useState(() => readExpandedProjects(key, projects));
+function SessionMenu({ session, onRename, onArchive }: {
+  session: SessionView;
+  onRename?: (session: SessionView) => void;
+  onArchive?: (sessionId: number, archived: boolean) => void;
+}) {
+  if (!onRename && !onArchive) return null;
+  return <DropdownMenu.Root>
+    <DropdownMenu.Trigger className="item-menu" aria-label={`会话 ${session.id} 操作`} onClick={(event) => event.stopPropagation()}><MoreHorizontal size={13} /></DropdownMenu.Trigger>
+    <DropdownMenu.Portal><DropdownMenu.Content sideOffset={4} align="end" className="dropdown-content">
+      {!session.archived && onRename && <DropdownMenu.Item className="dropdown-item" onSelect={() => onRename(session)}><span className="choice-item-main"><Pencil size={13} className="item-menu-icon" />重命名</span></DropdownMenu.Item>}
+      {onArchive && <DropdownMenu.Item className="dropdown-item" onSelect={() => onArchive(session.id, !session.archived)}>
+        <span className="choice-item-main">{session.archived ? <ArchiveRestore size={13} className="item-menu-icon" /> : <Archive size={13} className="item-menu-icon" />}{session.archived ? '恢复' : '归档'}</span>
+      </DropdownMenu.Item>}
+    </DropdownMenu.Content></DropdownMenu.Portal>
+  </DropdownMenu.Root>;
+}
+
+export default function ProjectSessions({ projects, currentProjectId, selectedSessionId, activeSessionId, source, canCreate, onSelect, onCreate, onRenameSession, onArchiveSession }: Props) {
   const [search, setSearch] = useState('');
-  const previousSelection = useRef(selectedSessionId);
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [archivedOpen, setArchivedOpen] = useState(false);
   const query = search.trim().toLowerCase();
-  const filtered = projects.map((project) => ({ ...project,
-    visibleSessions: project.name.toLowerCase().includes(query) ? project.sessions : project.sessions.filter((session) => session.title.toLowerCase().includes(query)),
-  })).filter((project) => !query || project.visibleSessions.length > 0);
   const current = projects.find((project) => project.id === currentProjectId) ?? projects[0];
-
-  function changeExpanded(ids: string[]) {
-    setExpanded(ids);
-    saveExpandedProjects(key, ids);
-  }
-
-  useEffect(() => {
-    if (previousSelection.current === selectedSessionId) return;
-    previousSelection.current = selectedSessionId;
-    const projectId = projects.find((project) => project.sessions.some((session) => session.id === selectedSessionId))?.id;
-    if (projectId) setExpanded((ids) => {
-      const next = ids.includes(projectId) ? ids : [...ids, projectId];
-      saveExpandedProjects(key, next);
-      return next;
-    });
-  }, [selectedSessionId, projects, key]);
+  const visibleSessions = current
+    ? query ? current.sessions.filter((session) => session.title.toLowerCase().includes(query)) : current.sessions
+    : [];
+  const archivedSessions = current?.archivedSessions ?? [];
 
   function create() {
     if (!canCreate || !current) return;
-    changeExpanded(expanded.includes(current.id) ? expanded : [...expanded, current.id]);
     onCreate(current.id);
+  }
+
+  function startRename(session: SessionView) {
+    setRenamingId(session.id);
+    setRenameDraft(session.title);
+  }
+
+  function commitRename() {
+    if (renamingId === null) return;
+    const title = renameDraft.trim();
+    if (title) onRenameSession?.(renamingId, title);
+    setRenamingId(null);
+  }
+
+  function sessionRow(session: SessionView, archived: boolean) {
+    if (renamingId === session.id && !archived) {
+      return <div key={session.id} className="session-row">
+        <input className="session-rename-input" aria-label={`重命名会话 ${session.id}`} autoFocus value={renameDraft}
+          onChange={(event) => setRenameDraft(event.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'Enter') commitRename();
+            if (event.key === 'Escape') setRenamingId(null);
+          }} />
+      </div>;
+    }
+    return <div key={session.id} className="session-row">
+      <button type="button" className={`session-item${archived ? ' archived' : ''}`} aria-pressed={session.id === selectedSessionId} onClick={() => onSelect(session.id)}>
+        <span className={`session-indicator ${activeSessionId === session.id ? 'working' : ''}`} />
+        <span className="session-copy"><span className="session-title">{session.title}</span><span className="session-subtitle">{session.runCount} 轮对话 · {relativeSessionAge(session.updatedAt, source)}<span>#{session.id}</span></span></span>
+      </button>
+      <SessionMenu session={session} onRename={onRenameSession ? startRename : undefined} onArchive={onArchiveSession} />
+    </div>;
   }
 
   return <div className="project-sessions">
     <div className="session-section-heading"><span>WORKSPACES</span><IconButton label="新建会话" disabled={!canCreate} onClick={create}><Plus size={16} /></IconButton></div>
     <label className="session-search"><Search size={13} /><input aria-label="搜索会话" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects & agents…" /></label>
     <nav className="project-tree" aria-label="选择会话">
-      <Accordion.Root type="multiple" value={query ? filtered.map((project) => project.id) : expanded}
-        onValueChange={(ids) => { if (!query) changeExpanded(ids); }}>
-        {filtered.map((project) => <Accordion.Item key={project.id} value={project.id} className="project-group">
-          <Accordion.Header className="project-heading"><Accordion.Trigger className="project-trigger" aria-label={`项目 ${project.name}`}>
-            <ChevronDown size={12} className="project-chevron" /><Folder size={14} strokeWidth={1.5} />
-            <span className="project-name">{project.name}</span><span className="project-count">{project.sessions.length}</span>
-          </Accordion.Trigger></Accordion.Header>
-          <Accordion.Content className="project-content">
-            {project.visibleSessions.map((session) => <button type="button" key={session.id} className="session-item" aria-pressed={session.id === selectedSessionId} onClick={() => onSelect(session.id)}>
-              <span className={`session-indicator ${activeSessionId === session.id ? 'working' : ''}`} />
-              <span className="session-copy"><span className="session-title">{session.title}</span><span className="session-subtitle">{session.runCount} 轮对话<span>#{session.id}</span></span></span>
-            </button>)}
-            {project.visibleSessions.length === 0 && <p className="sidebar-empty">此项目暂无会话</p>}
-          </Accordion.Content>
-        </Accordion.Item>)}
-      </Accordion.Root>
-      {filtered.length === 0 && <p className="sidebar-empty">没有匹配的项目或会话</p>}
+      {visibleSessions.map((session) => sessionRow(session, false))}
+      {visibleSessions.length === 0 && <p className="sidebar-empty">{query ? '没有匹配的会话' : '此项目暂无会话'}</p>}
+      {!query && archivedSessions.length > 0 && <>
+        <button type="button" className="archived-toggle" data-state={archivedOpen ? 'open' : 'closed'} aria-label="已归档会话"
+          onClick={() => setArchivedOpen((open) => !open)}>
+          <ChevronRight size={11} /><Archive size={11} />已归档 ({archivedSessions.length})
+        </button>
+        {archivedOpen && archivedSessions.map((session) => sessionRow(session, true))}
+      </>}
     </nav>
   </div>;
 }
