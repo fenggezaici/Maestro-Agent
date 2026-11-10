@@ -32,6 +32,8 @@ import { useAppearance } from '../useAppearance';
 import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import SessionStats from './SessionStats';
+import ChatStream from './ChatStream';
+import Composer from './Composer';
 import { resolveCapability } from '../modelCatalog';
 import type { ProviderId } from '../modelCapabilities';
 
@@ -296,88 +298,26 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
           <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
-            <div ref={history} className="chat-history" aria-label="对话消息" onScroll={() => { const element = history.current; if (element) { historyScrollTop.current = element.scrollTop; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 96; autoScroll.current = near; setAtBottom(near); } }}>
-              <div className="chat-history-inner">
-                {c.runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>What should we build?</h3><p>描述你的任务。Agent 会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
-                {c.loadingSession && c.runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
-                {c.runs.map((run) => <section key={run.id} className="conversation-turn" aria-label={`对话轮次 ${run.id}`}>
-                  <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><button type="button" className="user-copy-button" aria-label={`复制用户消息 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.prompt); } catch { setToastError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
-                  {(() => { const calls = [...(c.detail?.tools ?? []), ...(c.liveTools?.[run.id] ?? [])].filter((call) => call.runId === run.id);
-                    return calls.length > 0 && <ToolCallBlocks calls={calls} />; })()}
-                  {(() => {
-                    const { reasoning: inlineReasoning, content } = extractReasoning(run.output || '');
-                    const reasoning = (c.liveReasoning?.[run.id] ?? '') + inlineReasoning;
-                    return <>
-                      {reasoning && preferences.reasoningDisplay !== 'hidden' &&
-                        <CollapsibleBlock title="思考过程" icon={<BrainCircuit size={13} />} subtitle="思考" defaultOpen={preferences.reasoningDisplay === 'summary'}
-                          contentClass={`reasoning-content ${preferences.reasoningDisplay === 'summary' ? 'reasoning-clamp' : ''}`}><p>{reasoning}</p></CollapsibleBlock>}
-                      <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={cleanRunOutput(content) || (run.status === 'running' ? '思考中...' : '无输出')} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>
-                    </>;
-                  })()}
-                  <article aria-label={`Agent 回复 ${run.id}`} className="agent-message"><div className="message-meta"><span className="agent-avatar"><Sparkles size={14} strokeWidth={1.5} /></span><strong>Maestro</strong><span className="message-model">Agent</span><button type="button" className="user-copy-button" aria-label={`复制回复 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.output); } catch { setToastError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{statusLabels[run.status]}</span></div>
-                    {run.error && <p className="error-message">{run.error}</p>}
-                    {plans.filter((plan) => plan.runId === run.id).map((plan) => <PlanCard key={plan.id} plan={plan} preview={preview} canDecide={!preview && run.status === 'completed'} pending={c.pending} onReview={reviewPlan} onDecision={(_id, decision) => { if (!preview) void c.decidePlan(plan, decision); }} />)}
-                    <div className="message-footnote"><ShieldCheck size={12} />{preview ? '示例对话 · 不执行任何操作' : '模型回复 · 不执行工具或应用修改'}</div>
-                  </article>
-                </section>)}
-              </div>
-            </div>
-            <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={() => { autoScroll.current = true; setAtBottom(true); history.current?.scrollTo({ top: history.current.scrollHeight, behavior: 'smooth' }); }}><ArrowDown size={16} /></button><form onSubmit={(event) => void submit(event)} className="composer">
-              <LocalAttachments items={attachments} onRemove={(id) => setAttachments((items) => items.filter((item) => { if (item.id === id) { URL.revokeObjectURL(item.url); attachmentUrls.current.delete(item.url); return false; } return true; }))} />
-              <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={(event) => {
-                const files = Array.from(event.target.files ?? []);
-                const added: LocalAttachment[] = [];
-                for (const file of files.slice(0, Math.max(0, 6 - attachments.length))) {
-                  if (file.size > 20 * 1024 * 1024) { setToastError('附件超过 20 MiB 上限'); continue; }
-                  const url = URL.createObjectURL(file); attachmentUrls.current.add(url);
-                  const type: LocalAttachment['type'] = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'text';
-                  const entry: LocalAttachment = { id: crypto.randomUUID(), name: file.name, type, url };
-                  if (type === 'image' && file.size <= 3 * 1024 * 1024) void new Promise<string | undefined>((resolve) => {
-                    const reader = new FileReader(); reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : undefined); reader.onerror = () => resolve(undefined); reader.readAsDataURL(file);
-                  }).then((dataUrl) => { if (dataUrl) setAttachments((items) => items.map((item) => item.id === entry.id ? { ...item, dataUrl } : item)); });
-                  else if (type === 'text' && file.size <= 64 * 1024) void file.text().then((text) => setAttachments((items) => items.map((item) => item.id === entry.id ? { ...item, text } : item))).catch(() => undefined);
-                  added.push(entry);
-                }
-                setAttachments((items) => [...items, ...added]); event.target.value = '';
-              }} />
-              <textarea aria-label="发送消息" rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述你的任务... Ctrl+Enter 发送"
-                disabled={blocked} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-              <div className="composer-toolbar"><IconButton label="添加图片或视频" disabled={!preview && (!!c.state.activeRun || c.pending)} onClick={() => fileInput.current?.click()}><Paperclip size={17} /></IconButton>
-
-                <Choice label="由 Rust 强制执行" value={c.state.mode} disabled={!preview && blocked} onChange={(value) => void c.setMode(value as Mode)} options={[
-                  { value: 'plan', label: <span className="choice-item-stack"><span className="choice-item-main"><ListChecks size={13} />Plan</span><span className="choice-item-desc">只读分析，不修改文件</span></span> },
-                  { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />Code</span><span className="choice-item-desc">每次 Diff 必须批准；未开放写入执行器</span></span> },
-                  { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />Confirm</span><span className="choice-item-desc">每次工具/命令须确认；未开放执行器</span></span> },
-                  { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />Auto</span><span className="choice-item-desc">自动策略仅适用于已实现的能力；当前不执行文件/命令操作</span></span> },
-                ]} />
-                <Popover.Root>
-                  <Popover.Trigger asChild><button type="button" className="composer-project-chip" disabled={!preview && blocked} aria-label="当前项目"><FolderGit2 size={13} />{currentProject.name}{!currentProject.path && !preview && <small className="project-picker-no-path"> 未设目录</small>}<ChevronDown size={11} /></button></Popover.Trigger>
-                  <Popover.Portal><Popover.Content className="model-picker project-picker" side="top" align="start" sideOffset={8}>
-                    <div className="model-picker-header"><FolderGit2 size={14} />项目<small className="model-picker-api">workspace</small></div>
-                    <div className="model-picker-list" role="listbox" aria-label="项目列表">
-                      {projects.map((project) => {
-                        const numeric = Number(project.id);
-                        return <div key={project.id} className="model-picker-row project-picker-row" role="option" aria-selected={currentProject.id === project.id}
-                          onClick={() => { if (!preview && Number.isFinite(numeric)) c.selectProject?.(numeric); }}>
-                          <span className="model-picker-id">{project.name}{!project.path && <small className="project-picker-no-path"> 未设目录</small>}</span>
-                          {!preview && !project.path && Number.isFinite(numeric) && c.updateProjectPath &&
-                            <button type="button" className="project-picker-setpath" aria-label={`设置目录 ${project.name}`} onClick={async (event) => {
-                              event.stopPropagation();
-                              const dir = await pickDirectory();
-                              if (dir) await c.updateProjectPath?.(numeric, dir);
-                            }}>设置目录</button>}
-                          {project.path && <span className="model-picker-context project-picker-path" title={project.path}>{project.path.split(/[\/]/).pop()}</span>}
-                        </div>;
-                      })}
-                    </div>
-                    <button type="button" className="model-picker-level" onClick={() => setNewProjectOpen(true)}>＋ 新建项目</button>
-                  </Popover.Content></Popover.Portal>
-                </Popover.Root>
-                <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked} preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion} onError={setToastError} onCapability={updateCapability} />
-                <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Ctrl ↵'}</span>
-                {c.state.activeRun?.status === 'running' && !preview ? <IconButton label="停止生成" className="stop-button" disabled={c.pending} onClick={() => void c.cancel(c.state.activeRun!.id)}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
-              </div>
-            </form><SessionStats runs={c.runs} metrics={c.metrics} context={capability.context} /><div className="composer-caption"><span><ShieldCheck size={11} />{preview ? '预览不调用模型；媒体仅本地显示' : '图片/文本附件随消息发送（图片需视觉模型）；视频仅本地预览。'}</span><span>{capability.model || 'Maestro Agent'}</span></div></div>
+            <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
+              detailTools={c.detail?.tools} liveTools={c.liveTools} liveReasoning={c.liveReasoning}
+              plans={plans} reasoningDisplay={preferences.reasoningDisplay} theme={theme} preview={preview}
+              messageAttachments={messageAttachments} pending={c.pending}
+              onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
+              onScroll={() => { const element = history.current; if (element) { historyScrollTop.current = element.scrollTop; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 96; autoScroll.current = near; setAtBottom(near); } }} />
+            <Composer atBottom={atBottom} onScrollBottom={() => { autoScroll.current = true; setAtBottom(true); history.current?.scrollTo({ top: history.current.scrollHeight, behavior: 'smooth' }); }}
+              onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
+              blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes}
+              preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
+              currentProject={currentProject} projects={projects}
+              onSelectProject={(id) => c.selectProject?.(id)}
+              onSetProjectPath={c.updateProjectPath ? (id, dir) => c.updateProjectPath!(id, dir) : undefined}
+              onBrowse={preview ? undefined : pickDirectory}
+              onNewProject={() => setNewProjectOpen(true)}
+              preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion}
+              onError={setToastError} onCapability={updateCapability}
+              running={!!c.state.activeRun && c.state.activeRun.status === 'running'} pending={c.pending}
+              onCancel={() => void c.cancel(c.state.activeRun!.id)}
+              runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
       } review={reviewOpen ? <RightPanel tab={rightTab} onTabChange={setRightTab} plans={plans} selectedId={selectedPlanId} onSelect={setSelectedPlanId} diffView={diffView} onDiffViewChange={setDiffView} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} workspaceName={currentProject.name} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />

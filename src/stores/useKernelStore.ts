@@ -47,6 +47,8 @@ export interface KernelStore {
   createSession: (projectId?: number) => Promise<SessionView | undefined>;
   createProject: (name: string, path?: string) => Promise<{ project?: ProjectView; error?: string }>;
   setProjectArchived: (projectId: number, archived: boolean) => Promise<ProjectView | undefined>;
+  updateProjectPath: (projectId: number, path: string) => Promise<void>;
+  renameProject: (projectId: number, name: string) => Promise<void>;
   deleteProject: (projectId: number) => Promise<{ error?: string }>;
   setSessionArchived: (sessionId: number, archived: boolean) => Promise<SessionView | undefined>;
   renameSession: (sessionId: number, title: string) => Promise<SessionView | undefined>;
@@ -171,6 +173,17 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
       if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
       if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
+      if (event.type === 'status' && event.run.status !== 'running') {
+        // Stream ended: drop the ephemeral thinking block and any pending tool rows.
+        set((s) => {
+          const { [event.run.id]: _reasoning, ...liveReasoning } = s.liveReasoning;
+          const calls = s.liveTools[event.run.id];
+          const liveTools = calls?.some((call) => call.pending)
+            ? { ...s.liveTools, [event.run.id]: calls.map((call) => call.pending ? { ...call, pending: undefined } : call) }
+            : s.liveTools;
+          return { liveReasoning, liveTools };
+        });
+      }
     },
 
     selectSession,
@@ -240,6 +253,15 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         return { error: message };
       }
     },
+
+    updateProjectPath: (projectId, path) => command(async () => {
+      await sessionsApi.updateProjectPath(projectId, path);
+      await refreshProjects();
+    }),
+    renameProject: (projectId, name) => command(async () => {
+      await sessionsApi.updateProjectName(projectId, name);
+      await refreshProjects();
+    }),
 
     setProjectArchived: (projectId, archived) => command(async () => {
       const project = await sessionsApi.setProjectArchived(projectId, archived);
