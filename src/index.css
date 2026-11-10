@@ -258,7 +258,7 @@
 .session-context-strip .preview-tag { color: #93869e; margin-left: auto; font-size: 8px; }
 .composer-caption, .editor-status { min-width: 0; flex-wrap: wrap; }
 .chat-history { min-height: 0; flex: 1; overflow: auto; padding: 29px 25px 10px; }
-.chat-history-inner { max-width: 690px; margin: 0 auto; }
+.chat-history-inner { max-width: 1100px; margin: 0 auto; }
 .conversation-turn { margin-bottom: 24px; }
 .user-message { padding: 15px 17px 16px; border-radius: 12px; background: #222; margin-bottom: 26px; }
 .message-meta { display: flex; align-items: center; gap: 8px; color: #777; font-size: 9px; margin-bottom: 13px; }
@@ -297,7 +297,7 @@
 .is-preview .button-approve:disabled { opacity: .8; }
 .is-preview .button-ghost:disabled { opacity: .7; }
 .composer-area { padding: 16px 25px 17px; flex-shrink: 0; background: linear-gradient(transparent, #171717 18%); }
-.composer { padding: 15px 14px 9px; border-radius: 16px; background: #242424; box-shadow: 0 4px 22px #00000013, inset 0 1px #ffffff08; }
+.composer { padding: 15px 14px 9px; border-radius: 16px; background: #242424; box-shadow: 0 4px 22px #00000013, inset 0 1px #ffffff08; max-width: 1100px; margin: 0 auto; width: 100%; }
 .composer textarea { display: block; width: 100%; resize: none; background: transparent; color: #ddd; border: 0; outline: 0; font-size: 12px; line-height: 1.8; min-height: 65px; }
 .composer textarea::placeholder { color: #868686; }
 .composer textarea:disabled { opacity: 1; }

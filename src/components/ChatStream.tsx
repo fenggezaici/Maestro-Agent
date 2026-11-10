@@ -28,7 +28,7 @@ function cleanRunOutput(text: string): string {
   return text.replace(/(^|\n)> (?:调用工具|工具调用（?)：?(?!预算已用尽)[^\n]*/g, '$1').trimStart();
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveReasoning, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveReasoning, liveReasoningMs, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -36,6 +36,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   detailTools: ToolCallView[] | undefined;
   liveTools?: Record<number, ToolCallView[]>;
   liveReasoning?: Record<number, string>;
+  liveReasoningMs?: Record<number, number>;
   plans: Plan[];
   reasoningDisplay: UiPreferences['reasoningDisplay'];
   theme: string;
@@ -57,11 +58,16 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
         {(() => {
           const { reasoning: inlineReasoning, content } = extractReasoning(run.output || '');
           const reasoning = (liveReasoning?.[run.id] ?? '') + inlineReasoning;
+          const body = cleanRunOutput(content);
+          const thinking = run.status === 'running' && body === '';
+          const elapsed = liveReasoningMs?.[run.id];
+          const title = thinking ? '思考过程 · 思考中…' : elapsed !== undefined ? `思考过程 · 耗时 ${Math.max(1, Math.round(elapsed / 1000))} 秒` : '思考过程';
           return <>
             {reasoning && reasoningDisplay !== 'hidden' &&
-              <CollapsibleBlock title="思考过程" icon={<BrainCircuit size={13} />} subtitle="思考" defaultOpen={reasoningDisplay === 'summary'}
+              <CollapsibleBlock title={title} icon={<BrainCircuit size={13} />} open={thinking ? true : undefined} defaultOpen={reasoningDisplay === 'summary'}
                 contentClass={`reasoning-content ${reasoningDisplay === 'summary' ? 'reasoning-clamp' : ''}`}><p>{reasoning}</p></CollapsibleBlock>}
-            <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={cleanRunOutput(content) || (run.status === 'running' ? '思考中...' : '无输出')} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>
+            {(body !== '' || run.status !== 'running') &&
+              <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
           </>;
         })()}
         <article aria-label={`Agent 回复 ${run.id}`} className="agent-message"><div className="message-meta"><span className="agent-avatar"><Sparkles size={14} strokeWidth={1.5} /></span><strong>Maestro</strong><span className="message-model">Agent</span><button type="button" className="user-copy-button" aria-label={`复制回复 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.output); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{statusLabels[run.status]}</span></div>

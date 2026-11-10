@@ -3,12 +3,13 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 
 /// Generic ZCode-style collapsible block: summary row + animated expand
 /// (grid-template-rows 0fr→1fr transition), default collapsed.
-export default function CollapsibleBlock({ title, icon, subtitle, defaultOpen = false, contentClass = '', children }: {
-  title: ReactNode; icon?: ReactNode; subtitle?: ReactNode; defaultOpen?: boolean; contentClass?: string; children: ReactNode;
+export default function CollapsibleBlock({ title, icon, subtitle, defaultOpen = false, open: controlled, contentClass = '', children }: {
+  title: ReactNode; icon?: ReactNode; subtitle?: ReactNode; defaultOpen?: boolean; open?: boolean; contentClass?: string; children: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [internal, setInternal] = useState(defaultOpen);
+  const open = controlled ?? internal;
   return <div className={`collapsible-block ${open ? 'open' : ''} ${contentClass}`}>
-    <button type="button" className="collapsible-summary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button type="button" className="collapsible-summary" aria-expanded={open} onClick={() => setInternal((value) => !value)}>
       {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       {icon}<span className="collapsible-title">{title}</span>{subtitle && <span className="collapsible-subtitle">{subtitle}</span>}
     </button>

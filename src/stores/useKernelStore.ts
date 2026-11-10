@@ -28,6 +28,8 @@ export interface KernelStore {
   metrics: Record<number, RunMetrics>;
   liveTools: Record<number, ToolCallView[]>;
   liveReasoning: Record<number, string>;
+  /** Reasoning phase duration (ms) once the first content token arrives. */
+  liveReasoningMs: Record<number, number>;
   /** true while the agent stream connection is mounted. */
   connected: boolean;
 
@@ -69,6 +71,9 @@ let pendingCount = 0;
 let selectedRef: number | null = null;
 let activeProjectRef: number | null = null;
 let mounted = false;
+// Thinking-phase timing per run: start recorded on the first reasoning event,
+// duration frozen on the first content event. Not reactive state.
+const reasoningStart: Record<number, number> = {};
 
 export const useKernelStore = create<KernelStore>()((set, get) => {
   const setError = (error: string | null) => set({ error });
@@ -157,6 +162,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     metrics: {},
     liveTools: {},
     liveReasoning: {},
+    liveReasoningMs: {},
     connected: false,
 
     dispatch: (action) => set((s) => ({ state: kernelReducer(s.state, action) })),
@@ -169,12 +175,19 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         set((s) => ({ liveTools: applyToolEvent(s.liveTools, event) }));
       }
       if (event.type === 'reasoning') {
+        if (reasoningStart[event.runId] === undefined) reasoningStart[event.runId] = Date.now();
         set((s) => ({ liveReasoning: { ...s.liveReasoning, [event.runId]: (s.liveReasoning[event.runId] ?? '') + event.token } }));
+      }
+      if (event.type === 'content' && reasoningStart[event.runId] !== undefined) {
+        const elapsed = Date.now() - reasoningStart[event.runId];
+        delete reasoningStart[event.runId];
+        set((s) => ({ liveReasoningMs: { ...s.liveReasoningMs, [event.runId]: elapsed } }));
       }
       if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
       if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
       if (event.type === 'status' && event.run.status !== 'running') {
         // Stream ended: drop the ephemeral thinking block and any pending tool rows.
+        delete reasoningStart[event.run.id];
         set((s) => {
           const { [event.run.id]: _reasoning, ...liveReasoning } = s.liveReasoning;
           const calls = s.liveTools[event.run.id];
@@ -229,6 +242,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         metrics: {},
         liveTools: {},
         liveReasoning: {},
+        liveReasoningMs: {},
         connected: false,
       });
     },

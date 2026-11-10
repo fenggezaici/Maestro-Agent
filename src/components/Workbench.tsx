@@ -43,6 +43,7 @@ export interface WorkbenchController {
   state: Snapshot; sessions: SessionView[]; projects?: ProjectView[]; selectedSessionId: number | null;
   liveTools?: Record<number, import('../api/types').ToolCallView[]>;
   liveReasoning?: Record<number, string>;
+  liveReasoningMs?: Record<number, number>;
   detail: SessionDetail | null; runs: RunView[]; loadingSession: boolean; pending: boolean; error: string | null;
   metrics?: Record<number, RunMetrics>;
   selectSession: (id: number | null) => void;
@@ -299,7 +300,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
-              detailTools={c.detail?.tools} liveTools={c.liveTools} liveReasoning={c.liveReasoning}
+              detailTools={c.detail?.tools} liveTools={c.liveTools} liveReasoning={c.liveReasoning} liveReasoningMs={c.liveReasoningMs}
               plans={plans} reasoningDisplay={preferences.reasoningDisplay} theme={theme} preview={preview}
               messageAttachments={messageAttachments} pending={c.pending}
               onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
