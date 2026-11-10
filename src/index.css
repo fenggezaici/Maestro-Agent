@@ -258,7 +258,7 @@
 .session-context-strip .preview-tag { color: #93869e; margin-left: auto; font-size: 8px; }
 .composer-caption, .editor-status { min-width: 0; flex-wrap: wrap; }
 .chat-history { min-height: 0; flex: 1; overflow: auto; padding: 29px 25px 10px; }
-.chat-history-inner { max-width: 920px; margin: 0 auto; width: 100%; }
+.chat-history-inner { max-width: 760px; margin: 0 auto; width: 100%; }
 .conversation-turn { margin-bottom: 24px; }
 .user-message { padding: 15px 17px 16px; border-radius: 12px; background: #222; margin-bottom: 26px; }
 .message-meta { display: flex; align-items: center; gap: 8px; color: #777; font-size: 9px; margin-bottom: 13px; }
