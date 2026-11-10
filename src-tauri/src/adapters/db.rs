@@ -1,10 +1,11 @@
 //! SQLite is confined to one OS thread. Async callers only exchange messages.
 use std::{path::PathBuf, sync::Mutex, thread, time::Duration};
 
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::model::{
+use crate::domain::{
     AppResult, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics,
     RunStatus, RunView, SessionDetail, SessionView,
 };
@@ -250,6 +251,77 @@ impl Database {
         .await
     }
 
+    pub async fn delete_session(&self, session_id: i64) -> AppResult<()> {
+        self.call(move |connection| {
+            let running: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE status = 'running' AND session_id = ?1)",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if running {
+                return Err("Cannot delete a session with an active run".into());
+            }
+            let transaction = connection.transaction().map_err(db_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM audit WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1)",
+                    [session_id],
+                )
+                .map_err(db_error)?;
+            for statement in [
+                "DELETE FROM run_metrics WHERE session_id = ?1",
+                "DELETE FROM plan_cards WHERE session_id = ?1",
+                "DELETE FROM runs WHERE session_id = ?1",
+            ] {
+                transaction.execute(statement, [session_id]).map_err(db_error)?;
+            }
+            let changed = transaction
+                .execute("DELETE FROM sessions WHERE id = ?1", [session_id])
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Session not found".into());
+            }
+            transaction.commit().map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn update_project_name(&self, project_id: i64, name: String) -> AppResult<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() || name.len() > 128 {
+            return Err("项目名称为空或过长".into());
+        }
+        self.call(move |connection| {
+            let changed = connection
+                .execute("UPDATE projects SET name = ?1 WHERE id = ?2", params![name, project_id])
+                .map_err(db_error)?;
+            if changed == 0 {
+                return Err("项目不存在".into());
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn update_project_path(&self, project_id: i64, path: String) -> AppResult<()> {
+        let path = path.trim().to_string();
+        if path.is_empty() || path.len() > 512 {
+            return Err("项目路径为空或过长".into());
+        }
+        self.call(move |connection| {
+            let changed = connection
+                .execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![path, project_id])
+                .map_err(db_error)?;
+            if changed == 0 {
+                return Err("项目不存在".into());
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_project(&self, project_id: i64) -> AppResult<()> {
         if project_id == DEFAULT_PROJECT_ID {
             return Err("The default project cannot be deleted".into());
@@ -388,6 +460,20 @@ impl Database {
         }).await
     }
 
+    pub async fn project_path_for_session(&self, session_id: i64) -> AppResult<Option<String>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT p.path FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)
+        })
+        .await
+    }
+
     pub async fn session_detail(&self, session_id: i64) -> AppResult<SessionDetail> {
         self.call(move |connection| {
             let session = read_session_view(connection, session_id)?;
@@ -398,7 +484,25 @@ impl Database {
             let rows = statement.query_map([session_id], plan_row).map_err(db_error)?;
             let plans = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
             let metrics = read_metrics(connection, session_id)?;
-            Ok(SessionDetail { session, runs, plans, metrics })
+            let mut tool_statement = connection.prepare(
+                "SELECT run_id, action, detail FROM audit WHERE action IN ('tool_allowed','tool_blocked')
+                 AND run_id IN (SELECT id FROM runs WHERE session_id = ?1) ORDER BY id"
+            ).map_err(db_error)?;
+            let tools = tool_statement
+                .query_map([session_id], |row| {
+                    let detail: String = row.get(2)?;
+                    let (tool, reason) = detail.split_once(": ").unwrap_or((detail.as_str(), ""));
+                    Ok(crate::domain::ToolCallView {
+                        run_id: row.get(0)?,
+                        tool: tool.to_string(),
+                        detail: reason.to_string(),
+                        allowed: row.get::<_, String>(1)? == "tool_allowed",
+                    })
+                })
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)?;
+            Ok(SessionDetail { session, runs, plans, metrics, tools })
         }).await
     }
 
@@ -478,8 +582,9 @@ impl Database {
             let output = metrics.output_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
             let elapsed = i64::try_from(metrics.elapsed_ms).map_err(|_| "Invalid elapsed time")?;
             let first = metrics.first_token_ms.map(i64::try_from).transpose().map_err(|_| "Invalid first-token time")?;
-            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, elapsed_ms, first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms",
-                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, elapsed, first]).map_err(db_error)?;
+            let cache_hit = metrics.cache_hit_tokens.map(i64::try_from).transpose().map_err(|_| "Provider cache usage exceeds database range")?;
+            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cache_hit_tokens=excluded.cache_hit_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms",
+                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, cache_hit, elapsed, first]).map_err(db_error)?;
             Ok(())
         }).await
     }
@@ -520,7 +625,7 @@ fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMe
             })
             .transpose()
     }
-    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, elapsed_ms, first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
+    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
     let rows = statement
         .query_map([session_id], |row| {
             Ok(RunMetrics {
@@ -530,8 +635,9 @@ fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMe
                 model: row.get(3)?,
                 input_tokens: number(row, 4)?,
                 output_tokens: number(row, 5)?,
-                elapsed_ms: number(row, 6)?.unwrap_or(0),
-                first_token_ms: number(row, 7)?,
+                cache_hit_tokens: number(row, 6)?,
+                elapsed_ms: number(row, 7)?.unwrap_or(0),
+                first_token_ms: number(row, 8)?,
             })
         })
         .map_err(db_error)?;
@@ -645,9 +751,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 4 {
+    if version > 5 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 4"
+            "Database schema {version} is newer than supported version 5"
         ));
     }
     connection
@@ -750,6 +856,14 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
                  ALTER TABLE sessions ADD COLUMN archived_at INTEGER;
                  CREATE INDEX sessions_project_id ON sessions(project_id);
                  PRAGMA user_version = 4;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 5 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_metrics ADD COLUMN cache_hit_tokens INTEGER;
+                 PRAGMA user_version = 5;",
             )
             .map_err(db_error)?;
     }
@@ -948,7 +1062,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 5)
+                    .pragma_update(None, "user_version", 6)
                     .map_err(db_error)
             })
             .await
@@ -1105,6 +1219,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "o3-mini".into(),
                 input_tokens: Some(24),
+                cache_hit_tokens: None,
                 output_tokens: Some(10),
                 elapsed_ms: 250,
                 first_token_ms: Some(20),
@@ -1232,6 +1347,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "o3-mini".into(),
                 input_tokens: Some(3),
+                cache_hit_tokens: None,
                 output_tokens: Some(4),
                 elapsed_ms: 9,
                 first_token_ms: None,

@@ -6,14 +6,14 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 use crate::{
-    kernel::Kernel,
+    domain::{RunStatus, RunView},
     llm::{self, ChatConfig},
-    model::{RunStatus, RunView},
+    services::kernel::Kernel,
 };
 
 use placeholder::{tokens, PlaceholderModel};
 
-const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
 
 pub(crate) async fn run_model(
@@ -22,7 +22,7 @@ pub(crate) async fn run_model(
     config: ChatConfig,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let result = async {
+    let result: crate::domain::AppResult<bool> = async {
         if *cancel.borrow() {
             return Ok(false);
         }
@@ -54,6 +54,7 @@ pub(crate) async fn run_model(
                 tool_calls: Some(outcome.tool_calls.clone()),
                 tool_call_id: None,
                 name: None,
+                images: None,
             });
             for call in &outcome.tool_calls {
                 kernel
@@ -80,10 +81,23 @@ pub(crate) async fn run_model(
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     tool_calls: None,
+                    images: None,
                 });
             }
         }
-        Err("工具调用轮数超过上限（8 轮）".to_string())
+        // Tool budget exhausted — give the model one final no-tools turn to
+        // summarize what it already gathered instead of failing the run.
+        kernel
+            .token(run.id, "
+
+> 工具调用预算已用尽，总结现有信息…".to_string())
+            .await;
+        messages.push(llm::ChatMessage::text(
+            "user",
+            "工具调用预算已用尽。请基于已收集的信息直接给出最终结论，不要再调用工具。",
+        ));
+        let final_turn = llm::stream(&config, messages, &[], &mut cancel, &kernel, run.id).await?;
+        Ok(final_turn.done)
     }
     .await;
     let (status, error) = match result {

@@ -3,15 +3,15 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{watch, Mutex};
 
 use crate::{
+    adapters::db::{Database, DEFAULT_PROJECT_ID},
     agent,
-    db::{Database, DEFAULT_PROJECT_ID},
-    extensions::ExtensionManager,
-    llm::ChatConfig,
-    model::{
+    domain::{
+        policy::{self, ToolEffect},
         AppResult, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft, ProjectView,
         RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
     },
-    permissions::{self, ToolEffect},
+    llm::ChatConfig,
+    services::extensions::ExtensionManager,
 };
 
 pub const EVENT_NAME: &str = "kernel-event";
@@ -173,6 +173,18 @@ impl Kernel {
             .database
             .create_run_in_session(session_id, prompt.clone(), mode)
             .await?;
+        // Workspace fallback: sessions live inside projects — use the project's
+        // path so read tools work even before the user opens the Explorer.
+        {
+            let mut workspace = self.workspace.lock().await;
+            if workspace.is_none() {
+                if let Ok(Some(path)) = self.database.project_path_for_session(session_id).await {
+                    if !path.trim().is_empty() {
+                        *workspace = Some(std::path::PathBuf::from(path));
+                    }
+                }
+            }
+        }
         let run = RunView {
             id,
             session_id,
@@ -226,7 +238,7 @@ impl Kernel {
     pub async fn authorize_tool(&self, run_id: i64, tool: &str) -> AppResult<ToolEffect> {
         let state = self.state.lock().await;
         let run = Self::active_run_locked(&state, run_id)?;
-        permissions::authorize(run.mode, tool)
+        policy::authorize(run.mode, tool)
     }
 
     fn active_run_locked(state: &RuntimeState, run_id: i64) -> AppResult<RunView> {
@@ -255,7 +267,7 @@ impl Kernel {
     ) -> AppResult<serde_json::Value> {
         let _command = self.commands.lock().await;
         let run = Self::active_run_locked(&*self.state.lock().await, run_id)?;
-        let authorization = permissions::authorize(run.mode, tool).and_then(|effect| {
+        let authorization = policy::authorize(run.mode, tool).and_then(|effect| {
             if effect != ToolEffect::ReadOnly {
                 return Err(
                     "Side-effect execution is not enabled in Phase 1; approval records intent only"
@@ -295,9 +307,44 @@ impl Kernel {
         Ok(result)
     }
 
-    /// Tool definitions offered to the model this run: load_skill + running MCP tools.
+    /// Resolve a workspace-relative path: must canonicalize under the selected root
+    /// (rejects `..`, symlink junction escapes, and absolute paths).
+    fn scoped_path(root: &std::path::Path, rel: &str) -> AppResult<std::path::PathBuf> {
+        let rel_path = std::path::Path::new(rel);
+        if rel_path.is_absolute() || rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("路径必须在工作区内".into());
+        }
+        let base = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+        let full = if rel.is_empty() { base.clone() } else { base.join(rel_path).canonicalize().map_err(|_| "路径不存在".to_string())? };
+        if !full.starts_with(&base) { return Err("路径必须在工作区内".into()); }
+        Ok(full)
+    }
+
+    /// Tool definitions offered to the model this run: workspace reads, load_skill + running MCP tools.
     pub async fn agent_tools(&self) -> Vec<serde_json::Value> {
-        self.extensions.tool_definitions().await
+        let mut tools = self.extensions.tool_definitions().await;
+        let workspace_root = self.workspace.lock().await.clone();
+        if let Some(desc) = tools.iter_mut().find(|t| t.get("name").and_then(|n| n.as_str()) == Some("load_skill")).and_then(|t| t.get_mut("description")) {
+            let names = self.extensions.skills.scan(self.extensions.maestro_dir(), workspace_root.as_deref())
+                .into_iter().map(|s| s.name).collect::<Vec<_>>();
+            if !names.is_empty() {
+                *desc = serde_json::json!(format!("{} 当前可用技能：{}", desc.as_str().unwrap_or_default(), names.join("、")));
+            }
+        }
+        // Read tools are always offered — execution reports "未选择工作区" if unset.
+        {
+            tools.push(serde_json::json!({
+                "name": "list_dir",
+                "description": "列出工作区目录内容（只读）。path 为相对路径，省略表示根目录。",
+                "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } },
+            }));
+            tools.push(serde_json::json!({
+                "name": "read_file",
+                "description": "读取工作区文件内容（只读，限文本）。path 为相对路径。",
+                "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] },
+            }));
+        }
+        tools
     }
 
     /// Execute one model-requested tool call: authorize, route, audit, return
@@ -318,10 +365,10 @@ impl Kernel {
                     ToolEffect::ProcessExecution
                 }
             } else {
-                permissions::authorize(run.mode, tool)?
+                policy::authorize(run.mode, tool)?
             };
             if tool.starts_with("mcp__") {
-                permissions::check_mode(run.mode, effect, tool)?;
+                policy::check_mode(run.mode, effect, tool)?;
             }
         }
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
@@ -341,6 +388,34 @@ impl Kernel {
                     )
                     .map(|body| format!("【技能 {name}】\n\n{body}"))
             }
+            "list_dir" => {
+                let root = self.workspace.lock().await.clone()
+                    .ok_or_else(|| "未选择工作区：当前项目未设置目录，请在输入框下方项目菜单中点击「设置目录」".to_string())?;
+                let rel = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let dir = Self::scoped_path(&root, rel)?;
+                let mut entries = Vec::new();
+                let mut read = std::fs::read_dir(&dir).map_err(|_| "目录不可读".to_string())?;
+                while let Some(Ok(entry)) = read.next() {
+                    entries.push(serde_json::json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "dir": entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                    }));
+                    if entries.len() >= 200 { break; }
+                }
+                Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
+            }
+            "read_file" => {
+                let root = self.workspace.lock().await.clone()
+                    .ok_or_else(|| "未选择工作区：当前项目未设置目录，请在输入框下方项目菜单中点击「设置目录」".to_string())?;
+                let rel = arguments.get("path").and_then(|v| v.as_str())
+                    .ok_or_else(|| "read_file 需要 path 参数".to_string())?;
+                let file = Self::scoped_path(&root, rel)?;
+                let meta = std::fs::metadata(&file).map_err(|_| "文件不可读".to_string())?;
+                if meta.len() > 262144 { return Err("文件超过 256KB 限制".into()); }
+                let bytes = std::fs::read(&file).map_err(|_| "文件不可读".to_string())?;
+                let text = String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本文件".to_string())?;
+                Ok(text.chars().take(65536).collect())
+            }
             _ if tool.starts_with("mcp__") => {
                 self.extensions.mcp.call_tool(tool, arguments).await
             }
@@ -351,6 +426,13 @@ impl Kernel {
                 self.database
                     .record_tool(run_id, tool.into(), "extension".into(), true)
                     .await?;
+                let mut state = self.state.lock().await;
+                if Self::active_run_locked(&state, run_id).is_ok() {
+                    self.emit_locked(
+                        &mut state,
+                        EventData::ToolCalled { run_id, tool: tool.into(), detail: String::new(), allowed: true },
+                    );
+                }
             }
             Err(reason) => {
                 let _ = self
@@ -460,6 +542,33 @@ impl Kernel {
         Ok(project)
     }
 
+    pub async fn delete_session(&self, session_id: i64) -> AppResult<()> {
+        let _command = self.commands.lock().await;
+        {
+            let state = self.state.lock().await;
+            if state.shutting_down || state.storage_failed {
+                return Err("Application is shutting down or storage is unavailable".into());
+            }
+        }
+        self.database.delete_session(session_id).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(())
+    }
+
+    pub async fn update_project_name(&self, project_id: i64, name: String) -> AppResult<()> {
+        let _command = self.commands.lock().await;
+        self.database.update_project_name(project_id, name).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(())
+    }
+
+    pub async fn update_project_path(&self, project_id: i64, path: String) -> AppResult<()> {
+        let _command = self.commands.lock().await;
+        self.database.update_project_path(project_id, path).await?;
+        self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
+        Ok(())
+    }
+
     pub async fn delete_project(&self, project_id: i64) -> AppResult<()> {
         let _command = self.commands.lock().await;
         {
@@ -515,6 +624,25 @@ impl Kernel {
             EventData::PlanUpdated { plan: plan.clone() },
         );
         Ok(plan)
+    }
+
+    pub(crate) async fn reasoning_token(&self, run_id: i64, token: String) {
+        let mut state = self.state.lock().await;
+        if state.shutting_down
+            || state
+                .control
+                .as_ref()
+                .is_none_or(|control| control.finishing || *control.cancel.borrow())
+        {
+            return;
+        }
+        if Self::active_run_locked(&state, run_id).is_err() {
+            return;
+        }
+        self.emit_locked(
+            &mut state,
+            EventData::ReasoningToken { run_id, token },
+        );
     }
 
     pub(crate) async fn token(&self, run_id: i64, token: String) {
@@ -885,7 +1013,7 @@ mod tests {
         kernel.finish(id, RunStatus::Cancelled, None).await;
         assert_eq!(
             kernel.session_detail(card.session_id).await.unwrap().plans[0].status,
-            crate::model::PlanStatus::Invalidated
+            crate::domain::PlanStatus::Invalidated
         );
         assert!(kernel
             .decide_plan(card.session_id, card.id, PlanDecision::Approve)

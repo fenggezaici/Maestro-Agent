@@ -1,12 +1,9 @@
 mod agent;
+pub mod adapters;
 mod commands;
-mod db;
-pub mod extensions;
-pub mod kernel;
+pub mod domain;
 pub mod llm;
-pub mod model;
-pub mod permissions;
-pub mod workspace;
+pub mod services;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -15,8 +12,9 @@ use std::sync::{
 
 use tauri::{Emitter, Manager};
 
-use kernel::{Kernel, EVENT_NAME};
-use model::{EventData, KernelEvent, RunStatus};
+use adapters::fs::workspace::WorkspaceService;
+use domain::{EventData, KernelEvent, RunStatus};
+use services::kernel::{Kernel, EVENT_NAME};
 
 pub fn run() {
     let shutdown_started = Arc::new(AtomicBool::new(false));
@@ -65,47 +63,50 @@ pub fn run() {
             let kernel = tauri::async_runtime::block_on(Kernel::open(path, maestro_dir, sink))
                 .map_err(std::io::Error::other)?;
             app.manage(kernel);
-            app.manage(workspace::WorkspaceService::default());
+            app.manage(WorkspaceService::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_snapshot,
-            commands::set_mode,
-            commands::start_agent,
-            commands::cancel_agent,
-            commands::list_runs,
-            commands::create_session,
-            commands::set_session_archived,
-            commands::rename_session,
-            commands::list_projects,
-            commands::create_project,
-            commands::set_project_archived,
-            commands::delete_project,
-            commands::list_sessions,
-            commands::get_session,
-            commands::decide_plan,
-            commands::pick_directory,
-            commands::pick_file,
-            commands::scan_skills,
-            commands::create_skill,
-            commands::import_skill,
-            commands::import_skill_github,
-            commands::list_mcp_servers,
-            commands::add_mcp_server,
-            commands::import_mcp_json,
-            commands::start_mcp_server,
-            commands::stop_mcp_server,
-            commands::remove_mcp_server,
-            commands::recommended_skills,
-            commands::recommended_mcps,
-            commands::read_mcp_config,
+            commands::kernel::get_snapshot,
+            commands::kernel::set_mode,
+            commands::kernel::start_agent,
+            commands::kernel::cancel_agent,
+            commands::kernel::list_runs,
+            commands::sessions::create_session,
+            commands::sessions::set_session_archived,
+            commands::sessions::rename_session,
+            commands::sessions::delete_session,
+            commands::sessions::list_projects,
+            commands::sessions::create_project,
+            commands::sessions::set_project_archived,
+            commands::sessions::update_project_name,
+            commands::sessions::update_project_path,
+            commands::sessions::delete_project,
+            commands::sessions::list_sessions,
+            commands::sessions::get_session,
+            commands::sessions::decide_plan,
+            commands::workspace::pick_directory,
+            commands::workspace::pick_file,
+            commands::extensions::scan_skills,
+            commands::extensions::create_skill,
+            commands::extensions::import_skill,
+            commands::extensions::import_skill_github,
+            commands::extensions::list_mcp_servers,
+            commands::extensions::add_mcp_server,
+            commands::extensions::import_mcp_json,
+            commands::extensions::start_mcp_server,
+            commands::extensions::stop_mcp_server,
+            commands::extensions::remove_mcp_server,
+            commands::extensions::recommended_skills,
+            commands::extensions::recommended_mcps,
+            commands::extensions::read_mcp_config,
             llm::stream_chat,
-            commands::fetch_models,
-            commands::model_catalog,
-            workspace::get_workspace_info,
-            workspace::select_workspace,
-            workspace::read_directory_tree,
-            workspace::read_workspace_text,
+            commands::models::fetch_models,
+            commands::models::model_catalog,
+            commands::workspace::get_workspace_info,
+            commands::workspace::select_workspace,
+            commands::workspace::read_directory_tree,
+            commands::workspace::read_workspace_text,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

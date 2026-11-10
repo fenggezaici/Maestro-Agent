@@ -1,15 +1,15 @@
-//! Extension subsystem: on-disk Skills plus stdio MCP servers.
-pub mod mcp;
-pub mod skills;
-
+//! Extension subsystem service: on-disk Skills plus stdio MCP servers.
 use std::path::{Path, PathBuf};
 
-use crate::model::AppResult;
+use crate::{
+    adapters::{mcp::McpManager, skills::SkillStore},
+    domain::AppResult,
+};
 
 /// Owns both extension stores; paths are injected at app setup so tests stay hermetic.
 pub struct ExtensionManager {
-    pub skills: skills::SkillStore,
-    pub mcp: mcp::McpManager,
+    pub skills: SkillStore,
+    pub mcp: McpManager,
     maestro_dir: PathBuf,
 }
 
@@ -18,10 +18,10 @@ impl ExtensionManager {
     pub fn new(maestro_dir: PathBuf) -> AppResult<Self> {
         std::fs::create_dir_all(maestro_dir.join("skills"))
             .map_err(|_| "无法创建 ~/.maestro/skills 目录".to_string())?;
-        let mcp = mcp::McpManager::default();
+        let mcp = McpManager::default();
         mcp.set_config_path(maestro_dir.join("mcp.json"));
         Ok(Self {
-            skills: skills::SkillStore::default(),
+            skills: SkillStore::default(),
             mcp,
             maestro_dir,
         })

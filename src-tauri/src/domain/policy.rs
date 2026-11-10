@@ -1,4 +1,4 @@
-use crate::model::{AppResult, Mode};
+use crate::domain::{AppResult, Mode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolEffect {
@@ -15,7 +15,7 @@ pub const PLAN_TOOL_ALLOWLIST: &[&str] = &["read_session", "list_sessions", "loa
 /// server's own readOnlyHint annotation.
 pub fn authorize(mode: Mode, tool: &str) -> AppResult<ToolEffect> {
     let effect = match tool {
-        "read_session" | "list_sessions" | "load_skill" => ToolEffect::ReadOnly,
+        "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
@@ -84,7 +84,7 @@ mod tests {
             for tool in [
                 "READ_SESSION",
                 "read_session;rm",
-                "read_file",
+                "cat_file",
                 "shell",
                 "read_only_write_file",
                 "",

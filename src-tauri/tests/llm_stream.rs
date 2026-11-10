@@ -4,9 +4,9 @@ use std::{
 };
 
 use maestro_lib::{
-    kernel::Kernel,
+    domain::{EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
     llm::{conversation, ChatConfig, ChatMessage, Provider},
-    model::{EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
+    services::kernel::Kernel,
 };
 use serde_json::Value;
 use tokio::{
@@ -72,6 +72,7 @@ fn config(base_url: String) -> ChatConfig {
         model: "local-test-model".into(),
         provider: Provider::Openai,
         reasoning: None,
+        max_output: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
         runs: vec![prior, foreign, current.clone()],
         plans: Vec::new(),
         metrics: Vec::new(),
+        tools: Vec::new(),
     };
     let messages: Vec<ChatMessage> = conversation(&detail, &current);
     assert_eq!(messages.len(), 4);

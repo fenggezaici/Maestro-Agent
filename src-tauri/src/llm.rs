@@ -6,49 +6,17 @@ use std::{
 
 use futures_util::StreamExt;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tokio::sync::watch;
 
 use crate::{
-    kernel::Kernel,
-    model::{AppResult, Mode, RunMetrics, RunStatus, RunView, SessionDetail},
-    workspace::WorkspaceService,
+    adapters::fs::workspace::WorkspaceService,
+    domain::{AppResult, Mode, RunMetrics, RunStatus, RunView, SessionDetail},
+    services::kernel::Kernel,
 };
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-    /// Rust-internal tool plumbing; frontend never sends these fields.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCallSpec>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ToolCallSpec {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-impl ChatMessage {
-    /// Plain text message with no tool plumbing.
-    pub fn text(role: &str, content: impl Into<String>) -> Self {
-        Self {
-            role: role.into(),
-            content: content.into(),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        }
-    }
-}
+pub use crate::domain::message::{ChatMessage, ToolCallSpec};
 
 // Deliberately no Debug/Serialize: credentials must not enter logs/events/database records.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -77,6 +45,7 @@ pub struct ChatConfig {
     pub model: String,
     pub provider: Provider,
     pub reasoning: Option<String>,
+    pub max_output: Option<u64>,
 }
 
 impl ChatConfig {
@@ -156,7 +125,7 @@ pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
 
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
     let policy = match run.mode {
-        Mode::Plan => "你处于只读计划模式。只能分析、说明和提出计划，不得执行工具、修改文件或声称已应用变更。",
+        Mode::Plan => "你处于只读计划模式。可用 list_dir/read_file 读取工作区进行分析；不得执行有副作用的工具、修改文件或声称已应用变更。",
         Mode::Code | Mode::Execute => "你处于 Code 模式。提出代码修改和具体 Diff，每次变更须等待批准。当前未启用执行器，不得声称已应用修改。",
         Mode::Confirm => "你处于 Confirm 模式。每个工具或命令必须逐步确认。当前未启用工具执行器，不得声称已执行操作。",
         Mode::Auto => "你处于 Auto 策略。仅可使用实际开放且授权的能力；当前只有文本聊天，不得声称拥有文件写入或命令执行能力。",
@@ -205,6 +174,7 @@ pub async fn stream_chat(
     session_id: Option<i64>,
     provider: Option<Provider>,
     reasoning_effort: Option<String>,
+    max_output: Option<u64>,
 ) -> AppResult<i64> {
     if window.label() != "main" || app.get_webview_window("main").is_none() {
         return Err("Only the main window may start a chat".into());
@@ -216,6 +186,7 @@ pub async fn stream_chat(
             model,
             provider: provider.unwrap_or_default(),
             reasoning: reasoning_effort,
+            max_output,
         };
         config.validate()?;
         let prompt = validate_messages(&messages)?;
@@ -238,9 +209,13 @@ pub async fn stream_chat(
 #[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Token(String),
+    /// Model reasoning/thinking channel (DeepSeek `reasoning_content`,
+    /// Anthropic `thinking_delta`) — rendered separately from the answer.
+    Reasoning(String),
     Usage {
         input: Option<u64>,
         output: Option<u64>,
+        cache_hit: Option<u64>,
     },
     Done,
 }
@@ -350,6 +325,13 @@ impl SseDecoder {
                     .get("completion_tokens")
                     .or_else(|| usage.get("output_tokens"))
                     .and_then(|value| value.as_u64()),
+                // DeepSeek: prompt_cache_hit_tokens / OpenAI: cached_tokens /
+                // Anthropic: cache_read_input_tokens
+                cache_hit: usage
+                    .get("prompt_cache_hit_tokens")
+                    .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                    .or_else(|| usage.get("cache_read_input_tokens"))
+                    .and_then(|value| value.as_u64()),
             });
         }
         match value.get("type").and_then(|value| value.as_str()) {
@@ -378,6 +360,13 @@ impl SseDecoder {
                 }
                 if let Some(text) = value.pointer("/delta/text").and_then(|text| text.as_str()) {
                     events.push(StreamEvent::Token(text.into()));
+                }
+                if let Some(thinking) = value
+                    .pointer("/delta/thinking")
+                    .and_then(|text| text.as_str())
+                    .filter(|text| !text.is_empty())
+                {
+                    events.push(StreamEvent::Reasoning(thinking.into()));
                 }
                 return Ok(());
             }
@@ -408,6 +397,15 @@ impl SseDecoder {
                 .filter(|content| !content.is_empty())
             {
                 events.push(StreamEvent::Token(content.into()));
+            }
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(text) = choice
+                    .pointer(&format!("/delta/{key}"))
+                    .and_then(|text| text.as_str())
+                    .filter(|text| !text.is_empty())
+                {
+                    events.push(StreamEvent::Reasoning(text.into()));
+                }
             }
             if let Some(calls) = choice
                 .pointer("/delta/tool_calls")
@@ -485,6 +483,14 @@ fn openai_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
                     "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
                     "content": message.content,
                 })
+            } else if message.role == "user" && message.images.as_ref().is_some_and(|v| !v.is_empty()) {
+                let mut content = vec![serde_json::json!({ "type": "text", "text": message.content })];
+                for url in message.images.iter().flatten() {
+                    if url.starts_with("data:") && url.len() < 3_500_000 {
+                        content.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
+                    }
+                }
+                serde_json::json!({ "role": "user", "content": content })
             } else {
                 serde_json::json!({ "role": message.role, "content": message.content })
             }
@@ -528,6 +534,20 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
                     }));
                 }
                 out.push(serde_json::json!({ "role": "assistant", "content": content }));
+            }
+            "user" if message.images.as_ref().is_some_and(|v| !v.is_empty()) => {
+                let mut content = vec![serde_json::json!({ "type": "text", "text": message.content })];
+                for url in message.images.iter().flatten() {
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some((media, data)) = rest.split_once(";base64,") {
+                            content.push(serde_json::json!({
+                                "type": "image",
+                                "source": { "type": "base64", "media_type": media, "data": data },
+                            }));
+                        }
+                    }
+                }
+                out.push(serde_json::json!({ "role": "user", "content": content }));
             }
             role => out.push(serde_json::json!({ "role": role, "content": message.content })),
         }
@@ -719,7 +739,7 @@ pub async fn stream(
             .unwrap_or_default();
         payload["system"] = system.into();
         payload["messages"] = anthropic_messages(&messages).into();
-        payload["max_tokens"] = 4096.into();
+        payload["max_tokens"] = config.max_output.unwrap_or(4096).into();
         if let Some(level) = &config.reasoning {
             if !config.model.contains("3-7") && !config.model.contains("3.7") {
                 return Err("This Anthropic model has no configured thinking budget".into());
@@ -731,7 +751,7 @@ pub async fn stream(
                 _ => return Err("Unsupported Anthropic thinking level".into()),
             };
             payload["thinking"] = serde_json::json!({ "type": "enabled", "budget_tokens": budget });
-            payload["max_tokens"] = (budget + 4096).into();
+            payload["max_tokens"] = (budget + config.max_output.unwrap_or(4096) as u64).into();
         }
     } else {
         payload["messages"] = openai_messages(&messages).into();
@@ -814,6 +834,7 @@ pub async fn stream(
         model: config.model.clone(),
         input_tokens: None,
         output_tokens: None,
+        cache_hit_tokens: None,
         elapsed_ms: 0,
         first_token_ms: None,
     };
@@ -833,6 +854,9 @@ pub async fn stream(
         };
         for event in events {
             match event {
+                StreamEvent::Reasoning(token) => {
+                    kernel.reasoning_token(run_id, token).await;
+                }
                 StreamEvent::Token(token) => {
                     if *cancel.borrow() {
                         return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
@@ -851,9 +875,10 @@ pub async fn stream(
                         reported = Instant::now();
                     }
                 }
-                StreamEvent::Usage { input, output } => {
+                StreamEvent::Usage { input, output, cache_hit } => {
                     metrics.input_tokens = input.or(metrics.input_tokens);
                     metrics.output_tokens = output.or(metrics.output_tokens);
+                    metrics.cache_hit_tokens = cache_hit.or(metrics.cache_hit_tokens);
                 }
                 StreamEvent::Done => {
                     metrics.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -929,6 +954,7 @@ mod tests {
             model: "test-model".into(),
             provider: Provider::Openai,
             reasoning: None,
+            max_output: None,
         };
         assert_eq!(
             config.validate().unwrap().as_str(),

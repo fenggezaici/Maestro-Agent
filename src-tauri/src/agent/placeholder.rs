@@ -1,4 +1,4 @@
-use crate::model::{PlanDraft, ProposedDiff};
+use crate::domain::{PlanDraft, ProposedDiff};
 
 pub struct ModelReply {
     pub text: String,

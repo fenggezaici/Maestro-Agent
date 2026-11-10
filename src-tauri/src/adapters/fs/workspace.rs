@@ -8,7 +8,6 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::{State, WebviewWindow};
 use tokio::sync::Semaphore;
 
 const MAX_ENTRIES: usize = 10000;
@@ -138,54 +137,6 @@ impl WorkspaceService {
         })
         .await
     }
-}
-
-fn require_main(window: &WebviewWindow) -> Result<(), String> {
-    if window.label() == "main" {
-        Ok(())
-    } else {
-        Err("Only the main window may browse a workspace".into())
-    }
-}
-
-#[tauri::command]
-pub async fn get_workspace_info(
-    window: WebviewWindow,
-    service: State<'_, WorkspaceService>,
-) -> Result<WorkspaceInfo, String> {
-    require_main(&window)?;
-    service.info().await
-}
-
-#[tauri::command]
-pub async fn select_workspace(
-    window: WebviewWindow,
-    service: State<'_, WorkspaceService>,
-    workspace_path: String,
-) -> Result<WorkspaceInfo, String> {
-    require_main(&window)?;
-    service.select(workspace_path).await
-}
-
-#[tauri::command]
-pub async fn read_directory_tree(
-    window: WebviewWindow,
-    service: State<'_, WorkspaceService>,
-    workspace_path: String,
-) -> Result<Vec<FileNode>, String> {
-    require_main(&window)?;
-    service.tree(workspace_path).await
-}
-
-#[tauri::command]
-pub async fn read_workspace_text(
-    window: WebviewWindow,
-    service: State<'_, WorkspaceService>,
-    workspace_path: String,
-    path: String,
-) -> Result<String, String> {
-    require_main(&window)?;
-    service.text(workspace_path, path).await
 }
 
 fn display_path(path: &Path) -> String {

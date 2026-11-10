@@ -8,37 +8,14 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
-
-use crate::model::AppResult;
+use crate::domain::{
+    AppResult, RecommendedItem, SkillImportOutcome, SkillSource, SkillView,
+};
 
 const MAX_BODY_BYTES: usize = 131072;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
 const MAX_SKILLS_PER_ROOT: usize = 256;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkillSource {
-    Global,
-    Project,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillView {
-    pub name: String,
-    pub description: String,
-    pub source: SkillSource,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SkillImportOutcome {
-    pub name: String,
-    pub status: String,
-    pub error: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 struct SkillEntry {
@@ -58,17 +35,6 @@ impl SkillEntry {
             path: self.path.to_string_lossy().into_owned(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecommendedItem {
-    pub id: String,
-    pub kind: String,
-    pub name: String,
-    pub description: String,
-    pub source_url: String,
-    pub install_payload: String,
 }
 
 /// A `key: value` name must be a safe kebab-case directory and tool identifier.
