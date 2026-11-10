@@ -9,12 +9,12 @@ pub mod policy;
 pub mod session;
 
 pub use error::AppResult;
-pub use event::{EventData, KernelEvent};
+pub use event::{EventData, KernelEvent, ToolPhase};
 pub use extension::{
     McpConfigFile, McpServerConfig, McpServerView, McpToolView, RecommendedItem,
     SkillImportOutcome, SkillSource, SkillView,
 };
-pub use message::{ChatMessage, ToolCallSpec};
+pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use metrics::RunMetrics;
 pub use plan::{PlanCard, PlanDecision, PlanDraft, PlanStatus, ProposedDiff};
 pub use policy::{authorize, check_mode, ToolEffect, PLAN_TOOL_ALLOWLIST};

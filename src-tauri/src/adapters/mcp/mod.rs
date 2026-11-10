@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::domain::{
-    AppResult, McpConfigFile, McpServerConfig, McpServerView, RecommendedItem,
+    AppResult, McpConfigFile, McpServerConfig, McpServerView, RecommendedItem, ToolSpec,
 };
 
 use config::{
@@ -272,44 +272,19 @@ impl McpManager {
         Ok(())
     }
 
-    /// Every exposed tool across running servers, namespaced `mcp__server__tool`.
-    pub async fn tool_definitions(&self) -> Vec<(String, String, Value, bool)> {
+    /// Every exposed tool across running servers as standard `ToolSpec`s,
+    /// namespaced `mcp__server__tool` and carrying the real `inputSchema`.
+    pub async fn tool_specs(&self) -> Vec<ToolSpec> {
         self.running
             .lock()
             .await
             .iter()
             .flat_map(|(server_name, server)| {
-                server
-                    .tools
-                    .iter()
-                    .map(move |tool| {
-                        (
-                            format!("mcp__{server_name}__{}", tool.name),
-                            tool.description.clone(),
-                            Value::Null,
-                            tool.read_only,
-                        )
-                    })
-            })
-            .collect()
-    }
-
-    pub async fn tool_schemas(&self) -> Vec<Value> {
-        self.running
-            .lock()
-            .await
-            .iter()
-            .flat_map(|(server_name, server)| {
-                server.tools.iter().map(move |tool| {
-                    (
-                        format!("mcp__{server_name}__{}", tool.name),
-                        tool.description.clone(),
-                        tool.read_only,
-                    )
+                server.tools.iter().map(move |tool| ToolSpec {
+                    name: format!("mcp__{server_name}__{}", tool.name),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
                 })
-            })
-            .map(|(name, description, _read_only)| {
-                json!({ "name": name, "description": description })
             })
             .collect()
     }

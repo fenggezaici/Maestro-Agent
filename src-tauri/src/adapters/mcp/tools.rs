@@ -38,6 +38,11 @@ pub fn parse_tools(listed: &Value) -> Vec<McpToolView> {
                             .chars()
                             .take(512)
                             .collect(),
+                        input_schema: tool
+                            .get("inputSchema")
+                            .filter(|schema| schema.is_object())
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
                         read_only: tool
                             .pointer("/annotations/readOnlyHint")
                             .and_then(|v| v.as_bool())

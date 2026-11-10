@@ -110,8 +110,8 @@ describe('desktop IPC interface', () => {
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], api_key: 'test-key', base_url: 'http://localhost:1234/v1', model: 'test-model' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     act(() => {
-      receive({ payload: { type: 'stream_token', runId: 7, token: '演示 token', sequence: 3 } });
-      receive({ payload: { type: 'stream_token', runId: 7, token: '演示 token', sequence: 3 } });
+      receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: '演示 token', sequence: 3 } });
+      receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: '演示 token', sequence: 3 } });
     });
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent(/^演示 token$/);
     expect(screen.getByLabelText('由 Rust 强制执行')).toBeDisabled();
@@ -152,7 +152,7 @@ describe('desktop IPC interface', () => {
     mocks.invoke.mockImplementationOnce(() => pendingSnapshot);
     render(<App />);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('get_snapshot'));
-    act(() => receive({ payload: { type: 'stream_token', runId: 7, token: ' + new', sequence: 6 } }));
+    act(() => receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: ' + new', sequence: 6 } }));
     await act(async () => resolveSnapshot({
       ...snapshot, mode: 'code', sequence: 5,
       activeRun: { id: 7, sessionId: 1, prompt: 'reload', mode: 'execute', status: 'running', output: 'baseline', error: null },
@@ -282,7 +282,7 @@ describe('desktop IPC interface', () => {
     const listeners = mocks.listen.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
-    act(() => receive({ payload: { type: 'stream_token', runId: 7, token: 'arrived while dashboard was open', sequence: 3 } }));
+    act(() => receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'arrived while dashboard was open', sequence: 3 } }));
     fireEvent.click(screen.getByRole('button', { name: 'Back to Chat' }));
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('arrived while dashboard was open');
     expect(mocks.listen.mock.calls.length).toBe(listeners);
@@ -291,12 +291,13 @@ describe('desktop IPC interface', () => {
   it('persists real Settings with a masked key and uses Ctrl+Enter to invoke stream_chat', async () => {
     render(<App />);
     await ready();
+    localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'configured-model', enabled: true }]));
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     fireEvent.click(screen.getByRole('button', { name: 'Models' }));
     expect(screen.getByLabelText('API Key')).toHaveAttribute('type', 'password');
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'new-test-key' } });
     fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://example.test/v1' } });
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'configured-model' } });
+    fireEvent.click(screen.getByRole('button', { name: '设为当前模型 configured-model' }));
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
     expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'new-test-key', model: 'configured-model' });
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'configured request' } });
@@ -312,16 +313,15 @@ describe('desktop IPC interface', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     act(() => {
-      channels.get('chat-token')!({ payload: { sequence: 3, runId: 7, sessionId: 1, token: 'Hello ' } });
-      channels.get('chat-token')!({ payload: { sequence: 4, runId: 7, sessionId: 1, token: 'world' } });
-      channels.get('chat-token')!({ payload: { sequence: 4, runId: 7, sessionId: 1, token: 'world' } });
+      receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'Hello ', sequence: 3 } });
+      receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'world', sequence: 4 } });
+      receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'world', sequence: 4 } });
     });
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('Hello world');
     const failed: RunView = { ...history[0], status: 'failed', output: 'Hello world', error: 'provider failed' };
     history = [failed];
     snapshot = { ...snapshot, activeRun: null, lastRun: failed, sequence: 5 };
     act(() => {
-      channels.get('chat-error')!({ payload: { sequence: 5, run: failed, message: 'provider failed' } });
       receive({ payload: { type: 'status', sequence: 5, run: failed } });
     });
     expect(await screen.findByRole('alert')).toHaveTextContent('provider failed');
@@ -337,7 +337,7 @@ describe('desktop IPC interface', () => {
     mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === 'stream_chat') {
         void original(command, args);
-        channels.get('chat-token')!({ payload: { sequence: 3, runId: 7, sessionId: 1, token: 'early response' } });
+        receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'early response', sequence: 3 } });
         return accepted;
       }
       return original(command, args);
@@ -350,7 +350,7 @@ describe('desktop IPC interface', () => {
     const completed: RunView = { ...history[0], status: 'completed', output: 'early response' };
     history = [completed];
     snapshot = { ...snapshot, activeRun: null, lastRun: completed, sequence: 4 };
-    act(() => channels.get('chat-end')!({ payload: { sequence: 4, run: completed } }));
+    act(() => receive({ payload: { type: 'status', sequence: 4, run: completed } }));
     await act(async () => accept(7));
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent(/^early response$/);
     expect(screen.getByLabelText('回复内容 7')).toHaveAttribute('aria-busy', 'false');

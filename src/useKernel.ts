@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { backend, type KernelEvent, type Mode, type PlanCard, type PlanDecision, type ProjectView, type RunView, type SessionDetail, type SessionView, type Snapshot, type RunMetrics } from './ipc';
 import { readLlmSettings, validateLlmSettings } from './settings';
-import type { ChatMessage } from './ipc';
+import type { ChatMessage, ToolCallView } from './ipc';
 
 export const initialSnapshot: Snapshot = {
   ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0,
@@ -28,13 +28,14 @@ export function kernelReducer(state: Snapshot, action: Action): Snapshot {
       return event.run.status === 'running'
         ? { ...next, activeRun: event.run }
         : { ...next, activeRun: null, lastRun: event.run };
-    case 'stream_token':
-      return state.activeRun?.id === event.runId && (event.sessionId === undefined || event.sessionId === state.activeRun.sessionId)
+    case 'content':
+      return state.activeRun?.id === event.runId && event.sessionId === state.activeRun.sessionId
         ? { ...next, activeRun: { ...state.activeRun, output: state.activeRun.output + event.token } }
         : next;
     case 'plan_updated':
     case 'sessions_changed':
-    case 'tool_blocked': return next;
+    case 'tool_call': return next;
+    case 'reasoning': return next;
     case 'metrics': return next;
   }
 }
@@ -48,6 +49,26 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/// Fold one `tool_call` lifecycle event into the per-run tool list: `started`
+/// appends a pending row, later phases update it in place.
+function applyToolEvent(
+  current: Record<number, ToolCallView[]>,
+  event: Extract<KernelEvent, { type: 'tool_call' }>,
+): Record<number, ToolCallView[]> {
+  const list = [...(current[event.runId] ?? [])];
+  const pendingIndex = list.findIndex((call) => call.tool === event.tool && call.pending);
+  const entry: ToolCallView = {
+    runId: event.runId,
+    tool: event.tool,
+    detail: event.detail,
+    allowed: event.phase !== 'blocked' && event.phase !== 'failed',
+    pending: event.phase === 'started' || undefined,
+  };
+  if (event.phase === 'started' || pendingIndex < 0) list.push(entry);
+  else list[pendingIndex] = entry;
+  return { ...current, [event.runId]: list };
+}
+
 export function conversationRuns(detail: SessionDetail | null, sessionId: number | null, snapshot: Snapshot): RunView[] {
   const runs = new Map((detail?.session.id === sessionId ? detail.runs : []).map((run) => [run.id, run]));
   for (const run of [snapshot.lastRun, snapshot.activeRun]) {
@@ -56,7 +77,7 @@ export function conversationRuns(detail: SessionDetail | null, sessionId: number
   return [...runs.values()].sort((left, right) => left.id - right.id);
 }
 
-export function chatMessages(runs: RunView[], sessionId: number, prompt: string): ChatMessage[] {
+export function chatMessages(runs: RunView[], sessionId: number, prompt: string, images?: string[]): ChatMessage[] {
   let budget = 131072;
   const included: RunView[] = [];
   for (const run of runs.filter((run) => run.sessionId === sessionId && run.status === 'completed' && run.output).slice(-32).reverse()) {
@@ -65,7 +86,7 @@ export function chatMessages(runs: RunView[], sessionId: number, prompt: string)
     budget -= size;
     included.push(run);
   }
-  return [...included.reverse().flatMap((run): ChatMessage[] => [{ role: 'user', content: run.prompt }, { role: 'assistant', content: run.output }]), { role: 'user', content: prompt.trim() }];
+  return [...included.reverse().flatMap((run): ChatMessage[] => [{ role: 'user', content: run.prompt }, { role: 'assistant', content: run.output }]), { role: 'user', content: prompt.trim(), ...(images?.length ? { images } : {}) }];
 }
 
 export function useKernel() {
@@ -78,6 +99,8 @@ export function useKernel() {
   const [error, setError] = useState<string | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
   const [metrics, setMetrics] = useState<Record<number, RunMetrics>>({});
+  const [liveTools, setLiveTools] = useState<Record<number, ToolCallView[]>>({});
+  const [liveReasoning, setLiveReasoning] = useState<Record<number, string>>({});
   const sessionsRevision = useRef(0);
   const projectsRevision = useRef(0);
   const detailRevision = useRef(0);
@@ -123,7 +146,17 @@ export function useKernel() {
 
   const selectProject = useCallback((projectId: number | null) => {
     activeProjectRef.current = projectId;
-  }, []);
+    if (projectId === null) return;
+    const target = sessions.find((session) => session.projectId === projectId);
+    if (target) { selectSession(target.id); return; }
+    // Project has no sessions yet — create one so the workspace switches over.
+    void (async () => {
+      try {
+        const session = await backend.createSession(projectId);
+        if (mounted.current) { await refreshSessions(); selectSession(session.id); }
+      } catch (error) { if (mounted.current) setError(error instanceof Error ? error.message : 'Cannot create session'); }
+    })();
+  }, [sessions, selectSession, refreshSessions]);
 
   const refreshDetail = useCallback(async (id = selectedRef.current) => {
     if (id === null || id !== selectedRef.current) return;
@@ -166,6 +199,8 @@ export function useKernel() {
           }
           dispatch({ type: 'event', event });
           if (event.type === 'metrics') setMetrics((current) => ({ ...current, [event.metrics.runId]: event.metrics }));
+          if (event.type === 'tool_call') setLiveTools((current) => applyToolEvent(current, event));
+          if (event.type === 'reasoning') setLiveReasoning((current) => ({ ...current, [event.runId]: (current[event.runId] ?? '') + event.token }));
           if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
           if (event.type === 'backend_error') {
             void backend.snapshot().then((snapshot) => {
@@ -192,6 +227,8 @@ export function useKernel() {
         dispatch({ type: 'snapshot', snapshot: reconciled });
         for (const event of buffered ?? []) {
           if (event.type === 'metrics') setMetrics((current) => ({ ...current, [event.metrics.runId]: event.metrics }));
+          if (event.type === 'tool_call') setLiveTools((current) => applyToolEvent(current, event));
+          if (event.type === 'reasoning') setLiveReasoning((current) => ({ ...current, [event.runId]: (current[event.runId] ?? '') + event.token }));
           if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
           if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
         }
@@ -231,7 +268,7 @@ export function useKernel() {
   }, []);
 
   return {
-    state, sessions, projects, selectedSessionId, detail, loadingSession, error, metrics, pending: pendingCount > 0,
+    state, sessions, projects, selectedSessionId, detail, loadingSession, error, metrics, liveTools, liveReasoning, pending: pendingCount > 0,
     runs: conversationRuns(detail, selectedSessionId, state),
     selectSession,
     selectProject,
@@ -284,7 +321,14 @@ export function useKernel() {
       await refreshSessions();
       return session;
     }),
-    start: (prompt: string) => command(async () => {
+    deleteSession: (sessionId: number) => command(async () => {
+      await backend.deleteSession(sessionId);
+      await refreshSessions();
+      if (selectedRef.current === sessionId) {
+        selectSession((await backend.sessions()).find((item) => !item.archived)?.id ?? null);
+      }
+    }),
+    start: (prompt: string, images?: string[]) => command(async () => {
       const settings = validateLlmSettings(readLlmSettings());
       let id = selectedRef.current;
       if (id === null) {
@@ -294,7 +338,7 @@ export function useKernel() {
         if (mounted.current && revision === selectionRevision.current) selectSession(id);
       }
       const context = await backend.session(id);
-      const runId = await backend.start(id, chatMessages(context.runs, id, prompt), settings);
+      const runId = await backend.start(id, chatMessages(context.runs, id, prompt, images), settings);
       await refreshSessions();
       await refreshDetail(id);
       return runId;

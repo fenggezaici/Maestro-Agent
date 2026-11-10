@@ -39,3 +39,38 @@ impl ChatMessage {
         }
     }
 }
+
+/// One tool offered to the model: built-in, skill loader, or MCP-backed.
+/// `parameters` is always a standard JSON Schema object; each provider
+/// adapter translates it into its own wire shape (OpenAI `function.parameters`,
+/// Anthropic `input_schema`).
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+use crate::domain::error::AppResult;
+
+/// Boundary validation for messages arriving over IPC.
+pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
+    if messages.is_empty()
+        || messages.len() > 129
+        || messages.iter().any(|message| {
+            !matches!(message.role.as_str(), "user" | "assistant") || message.content.len() > 65536
+        })
+        || messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            > 262144
+    {
+        return Err("聊天消息为空、过大，或包含不支持的 role（仅 user/assistant）".into());
+    }
+    let last = messages.last().ok_or("缺少用户消息")?;
+    if last.role != "user" || last.content.trim().is_empty() || last.content.trim().len() > 8192 {
+        return Err("最后一条必须是 1–8192 UTF-8 bytes 的用户消息".into());
+    }
+    Ok(last.content.trim().to_string())
+}

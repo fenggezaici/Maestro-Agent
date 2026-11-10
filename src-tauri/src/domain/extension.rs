@@ -66,6 +66,8 @@ pub struct McpConfigFile {
 pub struct McpToolView {
     pub name: String,
     pub description: String,
+    /// Standard JSON Schema from the server's `tools/list` `inputSchema`.
+    pub input_schema: serde_json::Value,
     pub read_only: bool,
 }
 

@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use tauri::{State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
+    adapters::{fs::workspace::WorkspaceService, llm::{ChatConfig, Provider}},
     commands::require_main,
-    domain::{AppResult, Mode, RunView, Snapshot},
+    domain::{AppResult, ChatMessage, Mode, RunView, Snapshot},
     services::kernel::Kernel,
 };
 
@@ -27,15 +28,38 @@ pub async fn set_mode(
     kernel.set_mode(mode).await
 }
 
-#[tauri::command]
-pub async fn start_agent(
+#[tauri::command(rename_all = "snake_case")]
+// Tauri injects handles/state in addition to the explicit IPC arguments.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chat(
+    app: AppHandle,
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
-    session_id: i64,
-    prompt: String,
+    workspace: State<'_, WorkspaceService>,
+    messages: Vec<ChatMessage>,
+    api_key: String,
+    base_url: String,
+    model: String,
+    session_id: Option<i64>,
+    provider: Option<Provider>,
+    reasoning_effort: Option<String>,
+    max_output: Option<u64>,
 ) -> AppResult<i64> {
-    require_main(&window)?;
-    kernel.inner().start_in_session(session_id, prompt).await
+    if window.label() != "main" || app.get_webview_window("main").is_none() {
+        return Err("Only the main window may start a chat".into());
+    }
+    let config = ChatConfig {
+        api_key,
+        base_url,
+        model,
+        provider: provider.unwrap_or_default(),
+        reasoning: reasoning_effort,
+        max_output,
+    };
+    kernel
+        .set_workspace_root(workspace.current_root())
+        .await;
+    kernel.inner().start_chat(session_id, messages, config).await
 }
 
 #[tauri::command]

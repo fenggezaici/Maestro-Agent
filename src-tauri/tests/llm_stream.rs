@@ -4,9 +4,9 @@ use std::{
 };
 
 use maestro_lib::{
-    domain::{EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
-    llm::{conversation, ChatConfig, ChatMessage, Provider},
-    services::kernel::Kernel,
+    adapters::llm::{ChatConfig, Provider},
+    domain::{ChatMessage, EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
+    services::{agent_loop::conversation, kernel::Kernel},
 };
 use serde_json::Value;
 use tokio::{

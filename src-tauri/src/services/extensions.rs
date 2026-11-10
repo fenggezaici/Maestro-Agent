@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     adapters::{mcp::McpManager, skills::SkillStore},
-    domain::AppResult,
+    domain::{AppResult, ToolSpec},
 };
 
 /// Owns both extension stores; paths are injected at app setup so tests stay hermetic.
@@ -33,19 +33,19 @@ impl ExtensionManager {
 
     /// Tools offered to the model this turn: the built-in loader plus every
     /// running MCP server's tools namespaced `mcp__<server>__<tool>`.
-    pub async fn tool_definitions(&self) -> Vec<serde_json::Value> {
-        let mut tools = vec![serde_json::json!({
-            "name": "load_skill",
-            "description": "加载指定名称的技能(SKILL.md)完整指令内容。当任务匹配某个已安装技能时调用。",
-            "parameters": {
+    pub async fn tool_specs(&self) -> Vec<ToolSpec> {
+        let mut tools = vec![ToolSpec {
+            name: "load_skill".into(),
+            description: "加载指定名称的技能(SKILL.md)完整指令内容。当任务匹配某个已安装技能时调用。".into(),
+            parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "技能名称（kebab-case）" }
                 },
                 "required": ["name"]
-            }
-        })];
-        tools.extend(self.mcp.tool_schemas().await);
+            }),
+        }];
+        tools.extend(self.mcp.tool_specs().await);
         tools
     }
 }

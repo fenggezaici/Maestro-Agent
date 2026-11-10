@@ -19,7 +19,7 @@ it('shows explicit preview data without making Rust calls or enabling backend mu
   expect(screen.getByText('示例数据 · 无 Rust IPC')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '批准计划' })).toBeDisabled();
-  expect(screen.getByRole('button', { name: '新建会话' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: '在项目 Maestro-Agent 下新建会话' })).toBeEnabled();
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
   expect(screen.getByRole('tab', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('data-state', 'active');
   fireEvent.keyDown(screen.getByRole('tab', { name: 'tests/BridgeSession.test.cpp' }), { key: 'Enter' });
@@ -47,11 +47,11 @@ it('lists the current project sessions flat, switches projects from the switcher
   render(<PreviewApp />);
   expect(screen.getByRole('button', { name: /Refactor session lifecycle/ })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /Review database migrations/ })).not.toBeInTheDocument();
-  fireEvent.keyDown(screen.getByRole('button', { name: /Preview workspace/ }), { key: 'ArrowDown' });
-  fireEvent.click(await screen.findByRole('menuitem', { name: /Agent Tools/ }));
+  // Grouped-by-project tree: every expanded project's sessions are listed.
   expect(screen.getByRole('button', { name: /Review database migrations/ })).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: '新建会话' }));
+  fireEvent.click(screen.getByRole('button', { name: '项目 Agent Tools' }));
+  fireEvent.click(screen.getByRole('button', { name: '在项目 Agent Tools 下新建会话' }));
+  fireEvent.click(screen.getByRole('button', { name: '项目 Agent Tools' }));
   expect(screen.getByRole('button', { name: /新会话/ })).toHaveAttribute('aria-pressed', 'true');
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(ipc.invoke).not.toHaveBeenCalled();
@@ -108,7 +108,7 @@ it('returns to chat through Agents, a session, or new-session creation', async (
   fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   expect(screen.getByLabelText('回复内容 1020')).toBeInTheDocument();
   await openDashboard();
-  fireEvent.click(screen.getByRole('button', { name: '新建会话' }));
+  fireEvent.click(screen.getByRole('button', { name: '在项目 Maestro-Agent 下新建会话' }));
   await waitFor(() => expect(screen.getByRole('button', { name: /新会话/ })).toHaveAttribute('aria-pressed', 'true'));
   expect(screen.getByLabelText('发送消息')).toBeInTheDocument();
   expect(ipc.invoke).not.toHaveBeenCalled();

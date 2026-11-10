@@ -7,7 +7,7 @@ describe('IPC state reconciliation', () => {
 
   it('does not overwrite a new stream with an older snapshot', () => {
     let state = kernelReducer(initialSnapshot, { type: 'event', event: { type: 'status', run, sequence: 2 } });
-    state = kernelReducer(state, { type: 'event', event: { type: 'stream_token', runId: 1, token: 'new', sequence: 3 } });
+    state = kernelReducer(state, { type: 'event', event: { type: 'content', runId: 1, sessionId: 2, token: 'new', sequence: 3 } });
     state = kernelReducer(state, { type: 'snapshot', snapshot: { ...initialSnapshot, ready: true, sequence: 1 } });
     expect(state.ready).toBe(true);
     expect(state.sequence).toBe(3);
@@ -17,7 +17,7 @@ describe('IPC state reconciliation', () => {
   it('ignores stale events and tokens for another run', () => {
     let state = kernelReducer(initialSnapshot, { type: 'event', event: { type: 'status', run, sequence: 2 } });
     state = kernelReducer(state, { type: 'event', event: { type: 'mode_changed', mode: 'auto', sequence: 1 } });
-    state = kernelReducer(state, { type: 'event', event: { type: 'stream_token', runId: 99, token: 'foreign', sequence: 3 } });
+    state = kernelReducer(state, { type: 'event', event: { type: 'content', runId: 99, sessionId: 2, token: 'foreign', sequence: 3 } });
     expect(state.mode).toBe('code');
     expect(state.activeRun?.output).toBe('');
   });
@@ -28,8 +28,8 @@ describe('IPC state reconciliation', () => {
       ready: true, mode: 'code', activeRun: { ...run, output: 'baseline' },
       lastRun, sequence: 5,
     }, [
-      { type: 'stream_token', runId: 1, token: ' + new', sequence: 6 },
-      { type: 'stream_token', runId: 1, token: 'already included', sequence: 5 },
+      { type: 'content', runId: 1, sessionId: 2, token: ' + new', sequence: 6 },
+      { type: 'content', runId: 1, sessionId: 2, token: 'already included', sequence: 5 },
     ]);
     expect(state.activeRun?.output).toBe('baseline + new');
     expect(state.lastRun).toEqual(lastRun);
