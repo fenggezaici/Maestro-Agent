@@ -501,6 +501,7 @@ impl Kernel {
         self.database.session_detail(session_id).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn publish_plan(&self, run_id: i64, draft: PlanDraft) -> AppResult<PlanCard> {
         let _command = self.commands.lock().await;
         let run = Self::active_run_locked(&*self.state.lock().await, run_id)?;
