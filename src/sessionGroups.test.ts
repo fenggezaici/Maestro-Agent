@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { groupSessionsByDate, readPinnedSessions, savePinnedSessions } from './sessionGroups';
-import type { SessionView } from './ipc';
+import type { SessionView } from './api/types';
 
 function session(id: number, updatedAt: number, overrides: Partial<SessionView> = {}): SessionView {
   return { id, title: `会话 ${id}`, updatedAt, runCount: 1, projectId: 1, archived: false, ...overrides };

@@ -1,4 +1,4 @@
-import type { SessionView } from './ipc';
+import type { SessionView } from './api/types';
 
 export interface SessionGroup {
   key: 'pinned' | 'today' | 'yesterday' | 'week' | 'older';

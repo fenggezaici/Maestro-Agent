@@ -2,7 +2,7 @@ import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import type { ChatMessage, KernelEvent, PlanCard, ProposedDiff, RunView, SessionDetail, SessionView, Snapshot } from './ipc';
+import type { ChatMessage, KernelEvent, PlanCard, ProposedDiff, RunView, SessionDetail, SessionView, Snapshot } from './api/types';
 import { LLM_SETTINGS_KEY } from './settings';
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(), stop: vi.fn() }));

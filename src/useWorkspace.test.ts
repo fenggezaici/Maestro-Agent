@@ -1,9 +1,9 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { useWorkspace } from './useWorkspace';
+import { useWorkspace } from './hooks/useWorkspace';
 
 const api = vi.hoisted(() => ({ info: vi.fn(), select: vi.fn(), tree: vi.fn(), text: vi.fn() }));
-vi.mock('./workspaceApi', () => ({ workspaceApi: api }));
+vi.mock('./api/workspace', () => ({ workspaceApi: api }));
 
 beforeEach(() => {
   localStorage.clear();

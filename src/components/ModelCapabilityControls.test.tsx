@@ -3,6 +3,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ComposerControls from './ComposerControls';
 import LlmSettingsForm from './LlmSettingsForm';
+import ModelCapabilityControls from './ModelCapabilityControls';
 import { readLlmSettings, saveLlmSettings } from '../settings';
 import { defaultUiPreferences } from '../uiPreferences';
 
@@ -66,22 +67,15 @@ it('explains Ollama deployment context without losing the R1 thinking indicator'
   expect(screen.getByText('内置推理（模型固定）')).toBeVisible();
 });
 
-it('shows and saves supported thinking strength in Settings, and updates capability when the model changes', () => {
-  saveLlmSettings({ ...config, model: 'gpt-5.2', reasoning: 'low' });
-  const onSaved = vi.fn();
-  render(<Tooltip.Provider><LlmSettingsForm preview={false} onSaved={onSaved} /></Tooltip.Provider>);
-  const summary = screen.getByRole('group', { name: '模型能力' });
-  expect(within(summary).getByLabelText('思考强度')).toHaveTextContent('Low');
-  fireEvent.keyDown(within(summary).getByLabelText('思考强度'), { key: 'ArrowDown' });
+it('shows supported thinking strength in the detailed variant, and updates capability when the model changes', () => {
+  const onReasoning = vi.fn();
+  const { rerender } = render(<Tooltip.Provider><ModelCapabilityControls model="gpt-5.2" provider="openai" reasoning="low" onReasoning={onReasoning} detailed /></Tooltip.Provider>);
+  expect(screen.getByLabelText('思考强度')).toHaveTextContent('Low');
+  fireEvent.keyDown(screen.getByLabelText('思考强度'), { key: 'ArrowDown' });
   fireEvent.click(screen.getByRole('option', { name: 'High' }));
-  fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
-  expect(onSaved).toHaveBeenCalledOnce();
-  expect(readLlmSettings()).toMatchObject({ model: 'gpt-5.2', reasoning: 'high' });
-  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'deepseek-r1' } });
-  expect(within(summary).getByLabelText('上下文长度')).toHaveTextContent('128k context');
-  expect(within(summary).getByLabelText('思考模式：模型内置推理')).toBeVisible();
-  expect(within(summary).queryByLabelText('思考强度')).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
-  expect(readLlmSettings()).toMatchObject({ model: 'deepseek-r1' });
-  expect(readLlmSettings().reasoning).toBeUndefined();
+  expect(onReasoning).toHaveBeenCalledWith('high');
+  rerender(<Tooltip.Provider><ModelCapabilityControls model="deepseek-r1" provider="deepseek" reasoning="low" onReasoning={onReasoning} detailed /></Tooltip.Provider>);
+  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('128k context');
+  expect(screen.getByLabelText('思考模式：模型内置推理')).toBeVisible();
+  expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument();
 });

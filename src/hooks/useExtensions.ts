@@ -4,7 +4,7 @@ import {
   type McpServerView,
   type RecommendedItem,
   type SkillView,
-} from './extensions';
+} from '../api/extensions';
 
 export interface ExtensionsController {
   skills: SkillView[];

@@ -1,4 +1,4 @@
-import type { FileNode } from './workspaceApi';
+import type { FileNode } from './api/workspace';
 
 /// Subsequence match scoring for the command palette. Returns null when the
 /// query is not a subsequence; higher scores mean tighter, earlier matches.

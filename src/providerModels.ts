@@ -13,28 +13,28 @@ export interface ProviderModel {
   enabled: boolean;
 }
 
-const key = (provider: ProviderId) => `maestro.llm.models.${provider}`;
-const removedKey = (provider: ProviderId) => `maestro.llm.models.removed.${provider}`;
+const key = (provider: ProviderId | (string & {})) => `maestro.llm.models.${provider}`;
+const removedKey = (provider: ProviderId | (string & {})) => `maestro.llm.models.removed.${provider}`;
 
-function readRemoved(provider: ProviderId): Set<string> {
+function readRemoved(provider: ProviderId | (string & {})): Set<string> {
   try { const v = JSON.parse(localStorage.getItem(removedKey(provider)) ?? '[]'); return new Set(Array.isArray(v) ? v : []); } catch { return new Set(); }
 }
 
-export function removeProviderModel(provider: ProviderId, id: string) {
+export function removeProviderModel(provider: ProviderId | (string & {}), id: string) {
   saveProviderModels(provider, readProviderModels(provider).filter((item) => item.id !== id));
   const removed = readRemoved(provider); removed.add(id);
   try { localStorage.setItem(removedKey(provider), JSON.stringify([...removed])); } catch { /* quota */ }
 }
 
-export function clearRemoved(provider: ProviderId, id: string) {
+export function clearRemoved(provider: ProviderId | (string & {}), id: string) {
   const removed = readRemoved(provider);
   if (!removed.has(id)) return;
   removed.delete(id);
   try { localStorage.setItem(removedKey(provider), JSON.stringify([...removed])); } catch { /* quota */ }
 }
-const legacyKey = (provider: ProviderId) => `maestro.llm.capability.${provider}`;
+const legacyKey = (provider: ProviderId | (string & {})) => `maestro.llm.capability.${provider}`;
 
-export function readProviderModels(provider: ProviderId): ProviderModel[] {
+export function readProviderModels(provider: ProviderId | (string & {})): ProviderModel[] {
   try {
     const value = JSON.parse(localStorage.getItem(key(provider)) ?? 'null');
     if (!Array.isArray(value)) return migrateLegacy(provider);
@@ -46,7 +46,7 @@ export function readProviderModels(provider: ProviderId): ProviderModel[] {
 
 /// One-time merge of the old `maestro.llm.capability.{provider}` override map
 /// into the list format.
-function migrateLegacy(provider: ProviderId): ProviderModel[] {
+function migrateLegacy(provider: ProviderId | (string & {})): ProviderModel[] {
   try {
     const legacy = JSON.parse(localStorage.getItem(legacyKey(provider)) ?? 'null');
     if (!legacy || typeof legacy !== 'object') return [];
@@ -61,13 +61,13 @@ function migrateLegacy(provider: ProviderId): ProviderModel[] {
   }
 }
 
-export function saveProviderModels(provider: ProviderId, models: ProviderModel[]) {
+export function saveProviderModels(provider: ProviderId | (string & {}), models: ProviderModel[]) {
   try { localStorage.setItem(key(provider), JSON.stringify(models.slice(0, 300))); } catch { /* quota */ }
 }
 
 /// Merge provider-fetched ids into the list: new ids are appended (enabled),
 /// existing rows keep user-edited context/reasoning; fetched context fills gaps.
-export function mergeFetched(provider: ProviderId, fetched: FetchedModel[]): ProviderModel[] {
+export function mergeFetched(provider: ProviderId | (string & {}), fetched: FetchedModel[]): ProviderModel[] {
   const existing = readProviderModels(provider);
   const byId = new Map(existing.map((item) => [item.id, item]));
   const removed = readRemoved(provider);
@@ -80,6 +80,6 @@ export function mergeFetched(provider: ProviderId, fetched: FetchedModel[]): Pro
   return [...byId.values()];
 }
 
-export function providerModel(provider: ProviderId, id: string): ProviderModel | undefined {
+export function providerModel(provider: ProviderId | (string & {}), id: string): ProviderModel | undefined {
   return readProviderModels(provider).find((item) => item.id === id.trim());
 }

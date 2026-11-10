@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { ChevronDown, FileCode2, Folder, FolderOpen, RefreshCw } from 'lucide-react';
-import type { FileNode } from '../workspaceApi';
-import { pickDirectory } from '../dialog';
-import type { WorkspaceController } from '../useWorkspace';
+import type { FileNode } from '../api/workspace';
+import { pickDirectory } from '../api/dialog';
+import type { WorkspaceController } from '../hooks/useWorkspace';
 import type { ExplorerViewState } from './ExplorerPanel';
 import MonacoCode from './MonacoCode';
 

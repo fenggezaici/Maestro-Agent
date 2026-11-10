@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import PreviewApp from './PreviewApp';
-import type { ProposedDiff } from '../ipc';
+import type { ProposedDiff } from '../api/types';
 import type { ExplorerFile } from '../components/workbenchMock';
 import { LLM_SETTINGS_KEY } from '../settings';
 

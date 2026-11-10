@@ -1,6 +1,6 @@
 import * as Tabs from '@radix-ui/react-tabs';
 import { Braces, ChevronRight, FileCode2, GitBranch, GitCompareArrows, LockKeyhole, PanelsTopLeft, Rows3 } from 'lucide-react';
-import type { PlanCard } from '../ipc';
+import type { PlanCard } from '../api/types';
 import { planLabels } from './PlanCard';
 import { Choice } from './ui';
 import MonacoDiff from './MonacoDiff';

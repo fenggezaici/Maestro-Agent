@@ -20,7 +20,7 @@ const catalog: Record<string, ModelCapability> = {
   'claude-3-7-sonnet-latest': { context: 200000, thinking: ['low', 'medium', 'high'], reasoning: 'budget', vision: true },
 };
 
-export function modelCapability(model: string, provider?: ProviderId): ModelCapability {
+export function modelCapability(model: string, provider?: ProviderId | (string & {})): ModelCapability {
   // Metadata aliases only: never rewrite the model ID sent to the provider.
   const name = model.trim().toLowerCase();
   const aliases: Record<string, string> = {

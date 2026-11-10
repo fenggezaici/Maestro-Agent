@@ -1,4 +1,4 @@
-import { useKernel } from './useKernel';
+import { useKernel } from './hooks/useKernel';
 import Workbench from './components/Workbench';
 
 export default function App() {

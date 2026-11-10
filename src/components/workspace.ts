@@ -1,4 +1,4 @@
-import type { SessionView } from '../ipc';
+import type { SessionView } from '../api/types';
 
 export interface ActivityDay {
   date: string;

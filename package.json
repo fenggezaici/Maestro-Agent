@@ -31,12 +31,16 @@
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-markdown": "10.1.0",
-    "react-syntax-highlighter": "16.1.2",
     "react-resizable-panels": "4.19.1",
-    "recharts": "3.10.1"
+    "react-syntax-highlighter": "16.1.2",
+    "recharts": "3.10.1",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.1.0"
   },
   "overrides": {
-    "monaco-editor": { "dompurify": "$dompurify" }
+    "monaco-editor": {
+      "dompurify": "$dompurify"
+    }
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",

@@ -1,5 +1,6 @@
 import { Children, useState, type ReactElement, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Light as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomOneDark, atomOneLight } from 'react-syntax-highlighter/dist/esm/styles/hljs';
 import javascript from 'react-syntax-highlighter/dist/esm/languages/hljs/javascript';
@@ -26,7 +27,7 @@ function CodeBlock({ code, language, light }: { code: string; language: string; 
 }
 
 export default function MarkdownMessage({ content, light }: { content: string; light: boolean }) {
-  return <div className="markdown-message"><ReactMarkdown skipHtml components={{
+  return <div className="markdown-message"><ReactMarkdown skipHtml remarkPlugins={[remarkGfm]} components={{
     img: ({ alt }) => <span className="blocked-remote-media">[远程图片未加载：{alt || 'image'}]</span>,
     a: ({ children, href }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
     pre: ({ children }) => {

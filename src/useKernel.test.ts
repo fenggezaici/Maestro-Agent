@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { conversationRuns, initialSnapshot, kernelReducer, reconcileSnapshot } from './useKernel';
-import type { RunView } from './ipc';
+import { conversationRuns, initialSnapshot, kernelReducer, reconcileSnapshot } from './lib/conversation';
+import type { RunView } from './api/types';
 
 describe('IPC state reconciliation', () => {
   const run: RunView = { id: 1, sessionId: 2, prompt: 'hello', mode: 'plan', status: 'running', output: '', error: null };

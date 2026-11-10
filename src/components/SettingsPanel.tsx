@@ -1,10 +1,11 @@
 import { useRef, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Slider from '@radix-ui/react-slider';
-import { BrainCircuit, Globe2, Keyboard, Palette, RotateCcw, Search, Settings2, X } from 'lucide-react';
+import { BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
 import LlmSettingsForm from './LlmSettingsForm';
 import { Choice } from './ui';
 import { bindShortcut, defaultShortcuts, formatShortcut, labels, shortcutChord, shortcutLabels, type ShortcutAction, type UiPreferences } from '../uiPreferences';
+import { getProvider, readCustomProviders, removeCustomProvider, saveCustomProvider } from '../customProviders';
 import { providers, type ProviderId } from '../modelCapabilities';
 import { hasProviderCredential, readLlmSettings, selectLlmProvider } from '../settings';
 
@@ -15,7 +16,9 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
   preferences: UiPreferences; onPreferences: (value: UiPreferences) => void; onModelsChanged: () => void;
 }) {
   const [section, setSection] = useState<Section>('general');
-  const [modelProvider, setModelProvider] = useState<ProviderId>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
+  const [customs, setCustoms] = useState(readCustomProviders);
+  const [customDraft, setCustomDraft] = useState<{ id?: string; name: string; baseUrl: string } | null>(null);
+  const [modelProvider, setModelProvider] = useState<ProviderId | (string & {})>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
   const [providerError, setProviderError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [capture, setCapture] = useState<ShortcutAction | null>(null);
@@ -49,6 +52,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
         </div>
         <div hidden={section !== 'appearance'}>
           <div className="preference-row"><div><strong>Theme</strong><p>Apply Dark, Light or follow system appearance</p></div><Choice label="主题" value={preferences.theme} onChange={(value) => update({ theme: value as UiPreferences['theme'] })} options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }, { value: 'system', label: 'System' }]} /></div>
+          <div className="preference-row"><div><strong>思考过程显示</strong><p>模型推理内容的展示方式</p></div><Choice label="思考过程显示" value={preferences.reasoningDisplay} onChange={(value) => update({ reasoningDisplay: value as UiPreferences['reasoningDisplay'] })} options={[{ value: 'collapsed', label: '收起' }, { value: 'summary', label: '摘要（前三行）' }, { value: 'hidden', label: '隐藏' }]} /></div>
           <div className="preference-row"><div><strong>界面缩放</strong><p>整体放大工作台 UI（默认 125%）</p></div><Choice label="界面缩放" value={preferences.fontScale} onChange={(value) => update({ fontScale: value as UiPreferences['fontScale'] })} options={[{ value: '100', label: '100%' }, { value: '125', label: '125%' }, { value: '150', label: '150%' }]} /></div>
           <div className="preference-row"><div><strong>Editor font</strong><p>系统等宽字体；不存在时回退到 Consolas</p></div><Choice label="编辑器字体" value={preferences.editorFont} onChange={(value) => update({ editorFont: value })} options={['Cascadia Code', 'Consolas', 'JetBrains Mono'].map((value) => ({ value, label: value }))} /></div>
           <div className="preference-row"><div><strong>Font size</strong><p>{preferences.editorFontSize}px / Monaco</p></div><Slider.Root className="settings-slider font-size-slider" value={[preferences.editorFontSize]} min={10} max={20} step={1} onValueChange={([value]) => update({ editorFontSize: value })}><Slider.Track><Slider.Range /></Slider.Track><Slider.Thumb aria-label="编辑器字号" /></Slider.Root></div>
@@ -57,19 +61,40 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
         <div hidden={section !== 'models'}>
           <div className="models-two-pane" data-tick={credentialsTick}>
             <div className="model-provider-list" role="group" aria-label="Providers">
-              {(Object.keys(providers) as ProviderId[]).map((id) => <button type="button" key={id} className="model-provider-item" aria-label={providers[id].name} aria-current={modelProvider === id ? 'page' : undefined} onClick={() => {
+              {(Object.keys(providers) as ProviderId[]).map((id) => <button type="button" key={id} className="model-provider-item" aria-label={getProvider(id).name} aria-current={modelProvider === id ? 'page' : undefined} onClick={() => {
                 try {
-                  if (preview) update({ provider: id, previewModel: providers[id].model }); else { selectLlmProvider(id); onModelsChanged(); }
+                  if (preview) update({ provider: id, previewModel: getProvider(id).model }); else { selectLlmProvider(id); onModelsChanged(); }
                   setModelProvider(id); setProviderError(null);
                 } catch (error) { setProviderError(error instanceof Error ? error.message : 'Cannot change provider'); }
               }}>
-                <span className="provider-card-icon">{providers[id].name.slice(0, 1)}</span>{providers[id].name}
+                <span className="provider-card-icon">{getProvider(id).name.slice(0, 1)}</span>{getProvider(id).name}
                 <span className={`provider-status-dot ${preview || hasProviderCredential(id) ? 'configured' : ''}`} />
               </button>)}
+              {customs.map((item) => <button type="button" key={item.id} className="model-provider-item" aria-label={item.name} aria-current={modelProvider === item.id ? 'page' : undefined} onClick={() => {
+                try {
+                  if (preview) update({ provider: item.id as ProviderId, previewModel: item.baseUrl ? '' : item.id }); else { selectLlmProvider(item.id); onModelsChanged(); }
+                  setModelProvider(item.id); setProviderError(null);
+                } catch (error) { setProviderError(error instanceof Error ? error.message : 'Cannot change provider'); }
+              }}>
+                <span className="provider-card-icon">{item.name.slice(0, 1)}</span>{item.name}
+                <span className={`provider-status-dot ${preview || hasProviderCredential(item.id) ? 'configured' : ''}`} />
+                <span className="provider-item-actions" onClick={(event) => event.stopPropagation()}>
+                  <button type="button" className="icon-button" aria-label={`编辑供应商 ${item.name}`} disabled={preview} onClick={() => setCustomDraft({ id: item.id, name: item.name, baseUrl: item.baseUrl })}><Pencil size={11} /></button>
+                  <button type="button" className="icon-button" aria-label={`删除供应商 ${item.name}`} disabled={preview} onClick={() => {
+                    if (!window.confirm(`删除自定义供应商「${item.name}」及其本地配置？`)) return;
+                    removeCustomProvider(item.id);
+                    for (const key of [`maestro.llm.models.${item.id}`, `maestro.llm.models.removed.${item.id}`, `maestro.llm.fetched.${item.id}`]) localStorage.removeItem(key);
+                    setCustoms(readCustomProviders());
+                    if (modelProvider === item.id) { setModelProvider('openai'); if (!preview) selectLlmProvider('openai'); }
+                  }}><Trash2 size={11} /></button>
+                </span>
+              </button>)}
+              <button type="button" className="model-provider-item model-provider-add" aria-label="添加自定义供应商" disabled={preview}
+                onClick={() => setCustomDraft({ name: '', baseUrl: '' })}><Plus size={13} />自定义供应商</button>
             </div>
             <div className="model-provider-detail">
-              <div className="provider-panel-heading"><span className="provider-card-icon">{providers[modelProvider].name.slice(0, 1)}</span>
-                <strong>{providers[modelProvider].name}</strong>
+              <div className="provider-panel-heading"><span className="provider-card-icon">{getProvider(modelProvider).name.slice(0, 1)}</span>
+                <strong>{getProvider(modelProvider).name}</strong>
                 <span className={`provider-badge ${preview || hasProviderCredential(modelProvider) ? 'configured' : ''}`}>{preview ? '预览' : hasProviderCredential(modelProvider) ? '已配置' : '未配置'}</span>
               </div>
               <p className="provider-panel-note">独立 Provider 配置，凭据不会在 Provider 之间复制。</p>
@@ -91,6 +116,29 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
         </div>
       </div>
       <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭设置"><X size={16} /></button></Dialog.Close>
+      {customDraft && <div className="custom-provider-dialog" role="dialog" aria-label="自定义供应商">
+        <div className="custom-provider-card">
+          <h4>{customDraft.id ? '编辑供应商' : '添加自定义供应商'}</h4>
+          <label htmlFor="custom-provider-name">名称</label>
+          <input id="custom-provider-name" autoComplete="off" autoFocus value={customDraft.name} maxLength={40}
+            onChange={(event) => setCustomDraft({ ...customDraft, name: event.target.value })} placeholder="如 OpenCode go" />
+          <label htmlFor="custom-provider-url">Base URL（OpenAI-compatible）</label>
+          <input id="custom-provider-url" autoComplete="off" spellCheck={false} value={customDraft.baseUrl}
+            onChange={(event) => setCustomDraft({ ...customDraft, baseUrl: event.target.value })} placeholder="https://gateway.example/v1" />
+          <div className="dialog-actions">
+            <button type="button" className="button-ghost" onClick={() => setCustomDraft(null)}>取消</button>
+            <button type="button" className="button-approve" disabled={!customDraft.name.trim() || !customDraft.baseUrl.trim()} onClick={() => {
+              try {
+                const row = saveCustomProvider(customDraft);
+                setCustoms(readCustomProviders());
+                setModelProvider(row.id);
+                if (!preview) { selectLlmProvider(row.id); onModelsChanged(); }
+                setCustomDraft(null);
+              } catch (error) { setProviderError(error instanceof Error ? error.message : '无法保存供应商'); setCustomDraft(null); }
+            }}>保存</button>
+          </div>
+        </div>
+      </div>}
     </Dialog.Content></Dialog.Portal>
   </Dialog.Root>;
 }

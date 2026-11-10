@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, expect, it, vi } from 'vitest';
 import PreviewApp from '../preview/PreviewApp';
 import MarkdownMessage from './MarkdownMessage';
-import type { ProposedDiff } from '../ipc';
+import type { ProposedDiff } from '../api/types';
 import type { ExplorerFile } from './workbenchMock';
 
 vi.mock('./MonacoDiff', () => ({ default: ({ diff }: { diff: ProposedDiff }) => <section aria-label={`Diff ${diff.path}`} /> }));

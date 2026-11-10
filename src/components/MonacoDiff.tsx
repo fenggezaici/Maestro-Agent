@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ProposedDiff } from '../ipc';
+import type { ProposedDiff } from '../api/types';
 import type { editor } from 'monaco-editor';
 
 function language(path: string) {

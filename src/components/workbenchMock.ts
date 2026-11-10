@@ -32,8 +32,8 @@ export function changeMockExtension(items: MockExtension[], id: string, action: 
 
 // Preview-mode controller: functional local state, zero backend calls.
 import { useState } from 'react';
-import type { ExtensionsController } from '../useExtensions';
-import type { McpServerView, RecommendedItem, SkillView } from '../extensions';
+import type { ExtensionsController } from '../hooks/useExtensions';
+import type { McpServerView, RecommendedItem, SkillView } from '../api/extensions';
 
 const previewRecommended: RecommendedItem[] = [
   { id: 'superpowers', kind: 'skill', name: 'Superpowers', description: '社区热门技能合集：TDD、系统化调试、分支工作流。', sourceUrl: 'https://github.com/obra/superpowers', installPayload: 'https://github.com/obra/superpowers' },

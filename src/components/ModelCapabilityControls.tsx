@@ -5,7 +5,7 @@ import { resolveCapability } from '../modelCatalog';
 import { Choice } from './ui';
 
 export default function ModelCapabilityControls({ model, provider, reasoning, disabled, onReasoning, detailed = false, variant = 'select', context }: {
-  model: string; provider: ProviderId; reasoning?: ThinkingLevel; disabled?: boolean;
+  model: string; provider: ProviderId | (string & {}); reasoning?: ThinkingLevel; disabled?: boolean;
   onReasoning: (value: ThinkingLevel) => void; detailed?: boolean; variant?: 'select' | 'cycle';
   context?: number | null;
 }) {

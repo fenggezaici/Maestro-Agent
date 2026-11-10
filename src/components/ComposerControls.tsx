@@ -3,7 +3,8 @@ import { Gauge } from 'lucide-react';
 import { readLlmSettings, saveLlmSettings } from '../settings';
 import type { UiPreferences } from '../uiPreferences';
 import { contextLabel, type ProviderId, type ThinkingLevel } from '../modelCapabilities';
-import { fetchedStale, fetchModels, saveFetchedModels } from '../modelFetch';
+import { fetchModelsApi } from '../api/models';
+import { fetchedStale, saveFetchedModels } from '../modelFetch';
 import { loadCatalog, resolveCapability } from '../modelCatalog';
 import { mergeFetched, readProviderModels, saveProviderModels } from '../providerModels';
 import ModelPicker, { type ModelPickerRow } from './ModelPicker';
@@ -11,10 +12,10 @@ import ModelPicker, { type ModelPickerRow } from './ModelPicker';
 export default function ComposerControls({ preview, disabled, preferences, onPreferences, settingsVersion, onError, onCapability }: {
   preview: boolean; disabled: boolean; preferences: UiPreferences; onPreferences: (value: UiPreferences) => void;
   settingsVersion: number; onError: (message: string) => void;
-  onCapability: (model: string, provider: ProviderId, context: number | null) => void;
+  onCapability: (model: string, provider: ProviderId | (string & {}), context: number | null) => void;
 }) {
   const [model, setModel] = useState(() => preview ? preferences.previewModel : readLlmSettings().model);
-  const [provider, setProvider] = useState<ProviderId>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
+  const [provider, setProvider] = useState<ProviderId | (string & {})>(() => preview ? preferences.provider : readLlmSettings().provider ?? 'openai');
   const [thinking, setThinking] = useState<ThinkingLevel>('medium');
   const [refresh, setRefresh] = useState(0);
   useEffect(() => {
@@ -59,7 +60,7 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
     const settings = readLlmSettings();
     if (!settings.baseUrl?.trim() || (provider !== 'ollama' && !settings.apiKey?.trim())) return;
     const timer = setTimeout(() => {
-      fetchModels(provider, settings.baseUrl, settings.apiKey ?? '')
+      fetchModelsApi(provider, settings.baseUrl, settings.apiKey ?? '')
         .then((models) => {
           saveFetchedModels(provider, models);
           saveProviderModels(provider, mergeFetched(provider, models));
@@ -102,9 +103,13 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
       disabled={!preview && disabled}
       onModel={choose}
       onThinking={(value) => {
-        if (preview) { setThinking(value); return; }
-        try { const saved = saveLlmSettings({ ...readLlmSettings(), reasoning: value }); setThinking(saved.reasoning ?? 'medium'); }
-        catch (error) { onError(error instanceof Error ? error.message : 'Cannot save thinking mode'); }
+        // Optimistic: move the knob first so the control always responds;
+        // persist afterwards and surface storage errors instead of going dead.
+        const previous = thinking;
+        setThinking(value);
+        if (preview) return;
+        try { saveLlmSettings({ ...readLlmSettings(), reasoning: value }); }
+        catch (error) { setThinking(previous); onError(error instanceof Error ? error.message : 'Cannot save thinking mode'); }
       }} />
     <span tabIndex={0} className="context-limit" aria-label="上下文长度" title={contextNote}><Gauge size={12} /><span>{contextLabel(context)}</span></span>
   </div>;

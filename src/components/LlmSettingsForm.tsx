@@ -3,12 +3,13 @@ import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
 import { Eye, EyeOff, KeyRound, Pencil, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { clearLlmSettings, readLlmSettings, saveLlmSettings, type LlmSettings } from '../settings';
+import { getProvider } from '../customProviders';
 import { contextLabel, providers, type ProviderId } from '../modelCapabilities';
-import { fetchModels, readFetchedModels, saveFetchedModels, type FetchedModel } from '../modelFetch';
+import { fetchModelsApi } from '../api/models';
+import { readFetchedModels, saveFetchedModels, type FetchedModel } from '../modelFetch';
 import { clearRemoved, mergeFetched, readProviderModels, removeProviderModel, saveProviderModels, type ProviderModel } from '../providerModels';
 import type { ReasoningKind } from '../modelCatalog';
 import { Choice } from './ui';
-import ModelCapabilityControls from './ModelCapabilityControls';
 
 const REASONING_OPTIONS: { value: ReasoningKind | 'auto'; label: string }[] = [
   { value: 'auto', label: '跟随自动（目录 / 静态表）' },
@@ -18,8 +19,8 @@ const REASONING_OPTIONS: { value: ReasoningKind | 'auto'; label: string }[] = [
   { value: 'budget', label: '预算式 thinking budget' },
 ];
 
-export default function LlmSettingsForm({ preview, onSaved, onChanged, provider = 'openai' }: { preview: boolean; onSaved: () => void; onChanged?: () => void; provider?: ProviderId }) {
-  const load = (): LlmSettings => preview ? { apiKey: '', baseUrl: providers[provider].baseUrl, model: providers[provider].model, provider } : readLlmSettings();
+export default function LlmSettingsForm({ preview, onSaved, onChanged, provider = 'openai' }: { preview: boolean; onSaved: () => void; onChanged?: () => void; provider?: ProviderId | (string & {}) }) {
+  const load = (): LlmSettings => preview ? { apiKey: '', baseUrl: getProvider(provider).baseUrl, model: getProvider(provider).model, provider } : readLlmSettings();
   const [values, setValues] = useState(load);
   useEffect(() => { setValues(load()); }, [provider, preview]);
   const [showKey, setShowKey] = useState(false);
@@ -35,7 +36,7 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
     if (preview || fetching) return;
     setFetching(true); setError(null);
     try {
-      const list = await fetchModels(provider, values.baseUrl, values.apiKey);
+      const list = await fetchModelsApi(provider, values.baseUrl, values.apiKey);
       saveFetchedModels(provider, list);
       persist(mergeFetched(provider, list));
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法拉取模型列表'); }
@@ -49,14 +50,14 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
   }
 
   return <form className="llm-settings-form" onSubmit={submit}>
-    <div className="settings-section-label"><KeyRound size={13} />{providers[provider].name} / {provider === 'anthropic' ? 'Messages API' : 'OpenAI-compatible API'}</div>
+    <div className="settings-section-label"><KeyRound size={13} />{getProvider(provider).name} / {provider === 'anthropic' ? 'Messages API' : 'OpenAI-compatible API'}</div>
     <label htmlFor="llm-base-url">Base URL</label><input id="llm-base-url" autoComplete="off" spellCheck={false} value={values.baseUrl} disabled={preview}
       onChange={(event) => setValues({ ...values, baseUrl: event.target.value })} placeholder="https://your-provider.example/v1" />
     <label htmlFor="llm-api-key">API Key</label><div className="secret-input"><input id="llm-api-key" type={showKey ? 'text' : 'password'} autoComplete="off" spellCheck={false} value={values.apiKey} disabled={preview}
       onChange={(event) => setValues({ ...values, apiKey: event.target.value })} placeholder="Enter your API key" />
       <button type="button" className="icon-button" aria-label={showKey ? '隐藏 API Key' : '显示 API Key'} disabled={preview} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={14} /> : <Eye size={14} />}</button></div>
 
-    <div className="model-list-heading"><span>模型列表</span>
+    <div className="model-list-heading"><span>模型列表</span><span className="model-list-current">当前：{values.model || '未选择'}</span>
       <button type="button" className="icon-button" aria-label="拉取模型列表" title="从 Provider 拉取真实模型列表" disabled={preview || fetching} onClick={() => void pull()}><RefreshCw size={13} /></button>
       <button type="button" className="button-ghost" disabled={preview} onClick={() => setEditing('new')}><Plus size={12} />添加模型</button>
     </div>
@@ -75,13 +76,7 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
       </div>)}
     </div>
 
-    <label htmlFor="llm-model">Model</label><input id="llm-model" autoComplete="off" spellCheck={false} value={values.model}
-      onChange={(event) => setValues({ ...values, model: event.target.value, reasoning: undefined })} placeholder="model-name" />
-    <div className="model-capability-summary" role="group" aria-label="模型能力">
-      <strong>模型能力 · Context & Thinking</strong>
-      <div className="model-capability-options"><ModelCapabilityControls model={values.model} provider={values.provider ?? provider} reasoning={values.reasoning}
-        onReasoning={(reasoning) => setValues({ ...values, reasoning })} detailed /></div>
-    </div>
+    <p className="settings-note">点击模型行设为当前模型；上下文窗口与思考类型在「编辑」中配置。</p>
     <p className="settings-secret-warning">API Key 按要求保存在 localStorage，属于明文存储，并非安全凭据库。仅在信任的本机使用；发送时通过 IPC 交给 Rust，不写入会话数据库或日志。</p>
     {preview && <p className="settings-note">前端预览不会读取或保存真实连接配置；请在 Tauri 客户端测试模型。</p>}
     {error && <p role="alert" className="settings-form-error">{error}</p>}

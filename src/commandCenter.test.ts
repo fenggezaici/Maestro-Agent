@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { clearPaletteHistory, flattenFileTree, fuzzyScore, pushPaletteHistory, readPaletteHistory } from './commandCenter';
-import type { FileNode } from './workspaceApi';
+import type { FileNode } from './api/workspace';
 
 beforeEach(() => localStorage.clear());
 

@@ -1,4 +1,4 @@
-import type { PlanCard, RunView, SessionDetail, Snapshot } from '../ipc';
+import type { PlanCard, RunView, SessionDetail, Snapshot } from '../api/types';
 import type { ActivityDay, WorkbenchProject } from '../components/workspace';
 
 const before = `#pragma once

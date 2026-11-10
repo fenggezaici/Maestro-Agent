@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { PlanCard as Plan, PlanDecision } from '../ipc';
+import type { PlanCard as Plan, PlanDecision } from '../api/types';
 import { ArrowUpRight, Check, ChevronDown, FileCheck2, ListChecks, X } from 'lucide-react';
 
 export const planLabels = {

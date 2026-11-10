@@ -3,7 +3,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { FileCode2, History, MessageSquare, Search, TerminalSquare } from 'lucide-react';
 import { fuzzyScore, pushPaletteHistory, readPaletteHistory, type FlatFile } from '../commandCenter';
 import { relativeSessionAge, type WorkbenchProject } from './workspace';
-import type { SessionView } from '../ipc';
+import type { SessionView } from '../api/types';
 
 export interface PaletteCommand {
   id: string;

@@ -18,6 +18,7 @@ export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCre
     event.preventDefault();
     if (pending || disabled) return;
     setPending(true);
+    if (!path.trim()) { setError('请为项目选择工作区目录——模型需要它读取文件'); return; }
     const message = await onCreate(name.trim(), path.trim() || undefined);
     setPending(false);
     if (message) { setError(message); return; }
@@ -34,7 +35,7 @@ export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCre
           <label htmlFor="project-name">项目名称</label>
           <input id="project-name" autoComplete="off" spellCheck={false} autoFocus value={name} disabled={disabled || pending}
             onChange={(event) => setName(event.target.value)} placeholder="My Project" maxLength={128} />
-          <label htmlFor="project-path"><FolderOpen size={11} /> 工作区目录（可选）</label>
+          <label htmlFor="project-path"><FolderOpen size={11} /> 工作区目录（必填，模型将读取此目录）</label>
           <div className="field-with-browse">
             <input id="project-path" autoComplete="off" spellCheck={false} value={path} disabled={disabled || pending}
               onChange={(event) => setPath(event.target.value)} placeholder="E:\code\my-project" />

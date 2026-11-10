@@ -3,9 +3,9 @@ import * as Dialog from '@radix-ui/react-dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
 import { ExternalLink, FolderInput, FolderOpen, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
-import type { ExtensionsController } from '../useExtensions';
-import type { McpServerView, RecommendedItem } from '../extensions';
-import { pickDirectory, pickFile } from '../dialog';
+import type { ExtensionsController } from '../hooks/useExtensions';
+import type { McpServerView, RecommendedItem } from '../api/extensions';
+import { pickDirectory, pickFile } from '../api/dialog';
 import { IconButton } from './ui';
 
 function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canBrowse = false, onSubmit }: {

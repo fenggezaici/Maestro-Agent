@@ -4,9 +4,9 @@ import { Files, GitCompareArrows } from 'lucide-react';
 import DiffPanel, { type DiffViewState } from './DiffPanel';
 import ExplorerPanel, { type ExplorerViewState } from './ExplorerPanel';
 import { mockExplorerFiles } from './workbenchMock';
-import type { PlanCard } from '../ipc';
+import type { PlanCard } from '../api/types';
 import LiveExplorerPanel from './LiveExplorerPanel';
-import type { WorkspaceController } from '../useWorkspace';
+import type { WorkspaceController } from '../hooks/useWorkspace';
 
 export default function RightPanel({ tab, onTabChange, plans, selectedId, onSelect, diffView, onDiffViewChange, explorerView, onExplorerViewChange, scope, workspaceName, fontSize, fontFamily, preview, workspace }: {
   tab: 'review' | 'explorer'; onTabChange: (tab: 'review' | 'explorer') => void;
