@@ -23,7 +23,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 
 | 功能 | 当前状态 |
 | --- | --- |
-| Provider 聊天 | OpenAI/DeepSeek/Ollama 兼容接口与 Anthropic Messages SSE，增量回复、取消和错误提示 |
+| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发，真实 abort 即时断流 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览 |
@@ -36,7 +36,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
 | MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`readOnlyHint` 参与模式授权 |
-| 工具循环 | OpenAI/Anthropic 双格式 tool_calls 流式解析，最多 8 轮执行-续流，全程走模式授权与审计 |
+| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计 |
 | Activity | Dashboard 仍为 Mock 演示数据 |
 
 **Project-file writes, patch application, or shell command execution are still disabled.** Plan / Code (default) / Confirm / Auto are real Rust policies; selecting Auto or approving a plan does not create missing executors. MCP tools honor each server's `readOnlyHint` and the active mode; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
@@ -104,26 +104,25 @@ pnpm.cmd tauri dev
 
 ```text
 React 19 + TypeScript + Vite + Tailwind CSS 4
-Radix UI / Lucide / Monaco / react-resizable-panels
-					  │ Tauri IPC: invoke + events
+  components (dumb) ← hooks ← zustand stores ← api/ (唯一 invoke/listen 边界)
+					  │ Tauri IPC: invoke + 单一 kernel-event 通道
 					  ▼
-Rust kernel ── model transport (reqwest / SSE)
-	 │       └─ readonly workspace service (spawn_blocking)
-	 └─ bounded mpsc ── SQLite OS thread
+commands/ (仅透传) → services/ (kernel · agent_loop · tool_router · extensions)
+	→ adapters/ (llm · mcp · fs · skills · db) → domain/ (纯类型与策略)
 ```
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/components/` | 工作台、聊天、设置、Review / Explorer 与 UI 演示 |
-| `src/preview/` | 与真实 IPC/凭据隔离的前端预览数据 |
-| `src/ipc.ts`, `src/useKernel.ts` | 聊天契约、事件缓冲与会话状态 |
-| `src/workspaceApi.ts`, `src/useWorkspace.ts` | 工作区读取与请求竞态保护 |
-| `src-tauri/src/kernel/`, `agent/` | 运行生命周期、模型编排与取消 |
-| `src-tauri/src/llm.rs` | OpenAI 兼容 HTTP/SSE 与 Rust System Prompt |
-| `src-tauri/src/db.rs` | SQLite 线程、迁移、恢复与事务 |
-| `src-tauri/src/workspace.rs` | 受限文件树与文本读取 |
-| `src-tauri/src/extensions/` | Skill 扫描/解析/导入与最小 stdio MCP 客户端 |
-| `src/extensions.ts`, `src/useExtensions.ts` | 扩展 IPC 契约与面板状态 |
+| `src/api/` | 唯一 IPC 边界：types/kernel/sessions/extensions/workspace/dialog/models |
+| `src/stores/` | `useKernelStore`、`useWorkspaceStore`（zustand 全局状态与命令） |
+| `src/hooks/` | `useAgentStream`（事件订阅/重放/对齐）、`useKernel`、`useWorkspace`、`useExtensions` |
+| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、会话拼装 |
+| `src/components/` | Dumb 组件（ChatStream、Composer、Workbench 等），只接 props 不碰 IPC |
+| `src/preview/` | 与真实 IPC/凭据隔离的前端预览数据（不调 invoke/listen） |
+| `src-tauri/src/commands/` | IPC 接口层，仅参数透传与错误包装 |
+| `src-tauri/src/services/` | `kernel`（生命周期/事件/取消）、`agent_loop`（ReAct）、`tool_router`（统一注册/分发）、`extensions` |
+| `src-tauri/src/adapters/` | `llm/`（LlmProvider trait + SSE + OpenAI/Anthropic/catalog）、`mcp/`（config/transport/tools）、`fs/`（受限读）、`skills`、`db`（SQLite 线程/迁移） |
+| `src-tauri/src/domain/` | 纯类型与策略：session/message/plan/metrics/extension/policy/event/error |
 | `src-tauri/capabilities/`, `permissions/` | 本地主窗口的最小命令权限 |
 
 ## 测试与构建
