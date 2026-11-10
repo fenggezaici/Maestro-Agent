@@ -78,7 +78,8 @@ beforeEach(() => {
         receive({ payload: { type: 'status', run, sequence: snapshot.sequence } });
         return 7;
       }
-      case 'cancel_agent': return;
+      case 'cancel_agent':
+      case 'abort_chat': return;
       default: throw new Error(`Unexpected command ${command}`);
     }
   });
@@ -116,7 +117,7 @@ describe('desktop IPC interface', () => {
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent(/^演示 token$/);
     expect(screen.getByLabelText('由 Rust 强制执行')).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '停止生成' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('cancel_agent', { runId: 7 }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('abort_chat', { runId: 7 }));
   });
 
   it('refreshes persisted history after a terminal event', async () => {

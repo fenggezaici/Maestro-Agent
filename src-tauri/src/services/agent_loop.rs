@@ -81,6 +81,7 @@ async fn stream_turn(
     let model_name = config.model.clone();
     let relay = {
         let kernel = kernel.clone();
+        let mut relay_cancel = cancel.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             let mut reported = Instant::now();
@@ -96,7 +97,14 @@ async fn stream_turn(
                 elapsed_ms: 0,
                 first_token_ms: None,
             };
-            while let Some(event) = rx.recv().await {
+            // Drain relay: drop any buffered events the instant the run is
+            // cancelled — this is what makes "stop" actually stop the stream.
+            loop {
+                let event = tokio::select! {
+                    event = rx.recv() => event,
+                    _ = relay_cancel.changed() => break,
+                };
+                let Some(event) = event else { break };
                 match event {
                     StreamEvent::Reasoning(token) => kernel.reasoning_token(run_id, token).await,
                     StreamEvent::Token(token) => {

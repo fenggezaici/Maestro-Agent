@@ -335,7 +335,19 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       return runId;
     }),
 
-    cancel: (runId) => command(() => kernelApi.cancel(runId)).then(() => undefined),
+    cancel: (runId) => {
+      // Stop the UI immediately — drop the thinking block and pending tool
+      // rows before the backend even acknowledges the abort.
+      set((s) => {
+        const { [runId]: _reasoning, ...liveReasoning } = s.liveReasoning;
+        const calls = s.liveTools[runId];
+        const liveTools = calls?.some((call) => call.pending)
+          ? { ...s.liveTools, [runId]: calls.map((call) => call.pending ? { ...call, pending: undefined } : call) }
+          : s.liveTools;
+        return { liveReasoning, liveTools };
+      });
+      return command(() => kernelApi.abort(runId)).then(() => undefined);
+    },
     setMode: (mode) => command(() => kernelApi.setMode(mode)).then(() => undefined),
     decidePlan: (card, decision) => command(async () => {
       const plan = await sessionsApi.decidePlan(card.sessionId, card.id, decision);

@@ -51,6 +51,7 @@ pub fn run() {
             commands::kernel::get_snapshot,
             commands::kernel::set_mode,
             commands::kernel::cancel_agent,
+            commands::kernel::abort_chat,
             commands::kernel::list_runs,
             commands::sessions::create_session,
             commands::sessions::set_session_archived,

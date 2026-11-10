@@ -72,6 +72,17 @@ pub async fn cancel_agent(
     kernel.cancel(run_id).await
 }
 
+/// Hard-stop an in-flight run: cancels the watch channel so the provider's
+/// SSE loop and the event relay both break immediately.
+#[tauri::command]
+pub async fn abort_chat(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+) -> AppResult<()> {
+    cancel_agent(window, kernel, run_id).await
+}
+
 #[tauri::command]
 pub async fn list_runs(
     window: WebviewWindow,

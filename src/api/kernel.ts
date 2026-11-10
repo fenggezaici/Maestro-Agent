@@ -19,6 +19,7 @@ export const kernelApi = {
     ...(providerModel(settings.provider ?? 'openai', settings.model)?.output ? { max_output: providerModel(settings.provider ?? 'openai', settings.model)!.output } : {}),
   }),
   cancel: (runId: number) => invoke<void>('cancel_agent', { runId }),
+  abort: (runId: number) => invoke<void>('abort_chat', { runId }),
   listen: async (receive: (event: KernelEvent) => void) => {
     // Single channel: the backend emits normalized typed events (content,
     // reasoning, tool_call, status…) — no client-side reassembly.
