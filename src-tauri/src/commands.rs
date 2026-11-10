@@ -5,7 +5,7 @@ use tauri::{State, WebviewWindow};
 use crate::{
     extensions::{
         mcp::{McpServerConfig, McpServerView},
-        skills::{RecommendedItem, SkillView},
+        skills::{RecommendedItem, SkillImportOutcome, SkillView},
     },
     kernel::Kernel,
     model::{
@@ -179,6 +179,32 @@ pub async fn decide_plan(
 // ---- Extensions: skills + MCP servers -----------------------------------
 
 #[tauri::command]
+pub async fn fetch_models(
+    window: WebviewWindow,
+    provider: String,
+    base_url: String,
+    api_key: String,
+) -> AppResult<Vec<crate::llm::FetchedModel>> {
+    require_main(&window)?;
+    let provider = serde_json::from_value::<crate::llm::Provider>(serde_json::Value::String(provider))
+        .map_err(|_| "未知 Provider".to_string())?;
+    crate::llm::fetch_models(&crate::llm::ChatConfig {
+        api_key,
+        base_url,
+        model: String::new(),
+        provider,
+        reasoning: None,
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn model_catalog(window: WebviewWindow) -> AppResult<Vec<crate::llm::CatalogModel>> {
+    require_main(&window)?;
+    crate::llm::model_catalog().await
+}
+
+#[tauri::command]
 pub async fn scan_skills(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
@@ -206,11 +232,31 @@ pub async fn create_skill(
 }
 
 #[tauri::command]
+pub async fn pick_directory(window: WebviewWindow) -> AppResult<Option<String>> {
+    require_main(&window)?;
+    Ok(rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub async fn pick_file(window: WebviewWindow, extensions: Vec<String>) -> AppResult<Option<String>> {
+    require_main(&window)?;
+    let mut dialog = rfd::FileDialog::new();
+    if !extensions.is_empty() {
+        dialog = dialog.add_filter("files", &extensions);
+    }
+    Ok(dialog
+        .pick_file()
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
 pub async fn import_skill(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
     path: String,
-) -> AppResult<SkillView> {
+) -> AppResult<Vec<SkillImportOutcome>> {
     require_main(&window)?;
     kernel
         .extensions()

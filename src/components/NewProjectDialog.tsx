@@ -2,9 +2,11 @@ import { useState, type FormEvent } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { FolderGit2, FolderOpen, Trash2, X } from 'lucide-react';
 import type { WorkbenchProject } from './workspace';
+import { IconButton } from './ui';
 
-export function NewProjectDialog({ open, onOpenChange, disabled, onCreate }: {
+export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCreate }: {
   open: boolean; onOpenChange: (open: boolean) => void; disabled?: boolean;
+  onBrowse?: () => Promise<string | null>;
   onCreate: (name: string, path?: string) => Promise<string | null>;
 }) {
   const [name, setName] = useState('');
@@ -33,8 +35,12 @@ export function NewProjectDialog({ open, onOpenChange, disabled, onCreate }: {
           <input id="project-name" autoComplete="off" spellCheck={false} autoFocus value={name} disabled={disabled || pending}
             onChange={(event) => setName(event.target.value)} placeholder="My Project" maxLength={128} />
           <label htmlFor="project-path"><FolderOpen size={11} /> 工作区目录（可选）</label>
-          <input id="project-path" autoComplete="off" spellCheck={false} value={path} disabled={disabled || pending}
-            onChange={(event) => setPath(event.target.value)} placeholder="E:\code\my-project" />
+          <div className="field-with-browse">
+            <input id="project-path" autoComplete="off" spellCheck={false} value={path} disabled={disabled || pending}
+              onChange={(event) => setPath(event.target.value)} placeholder="E:\code\my-project" />
+            {onBrowse && <IconButton label="浏览目录" disabled={disabled || pending}
+              onClick={async () => { const picked = await onBrowse(); if (picked) setPath(picked); }}><FolderOpen size={14} /></IconButton>}
+          </div>
           {error && <p role="alert" className="settings-form-error">{error}</p>}
           <div className="dialog-actions">
             <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>

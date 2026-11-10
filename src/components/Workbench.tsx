@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Archive, ArchiveRestore, ArrowUp, ArrowUpRight, Bot, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Command, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, WandSparkles, Zap } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowUp, ArrowUpRight, Bot, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Command, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
 import type { Mode, PlanCard as Plan, PlanDecision, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../ipc';
 import PlanCard from './PlanCard';
 import type { DiffViewState } from './DiffPanel';
@@ -18,8 +18,13 @@ import RightPanel from './RightPanel';
 import type { ExplorerViewState } from './ExplorerPanel';
 import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../useExtensions';
-import { labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
+import { formatShortcut, labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
 import { useWorkspace } from '../useWorkspace';
+import CommandCenter, { type PaletteCommand } from './CommandCenter';
+import { flattenFileTree } from '../commandCenter';
+import { readPinnedSessions, savePinnedSessions } from '../sessionGroups';
+import { mockExplorerFiles } from './workbenchMock';
+import { pickDirectory } from '../dialog';
 import { useAppearance } from '../useAppearance';
 import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
@@ -81,13 +86,25 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [rightTab, setRightTab] = useState<'review' | 'explorer'>('review');
-  const workspace = useWorkspace(!preview && reviewOpen && rightTab === 'explorer');
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [pinnedIds, setPinnedIds] = useState<number[]>(() => readPinnedSessions(source));
+  const workspace = useWorkspace(!preview && ((reviewOpen && rightTab === 'explorer') || paletteOpen));
   const [explorerView, setExplorerView] = useState<ExplorerViewState>({ selected: null, closedFolders: [] });
   const liveExtensions = useExtensions(!preview && navigation === 'extensions');
   const extensions = suppliedExtensions ?? liveExtensions;
   const [toastError, setToastError] = useState<string | null>(null);
   const dismissToast = useCallback(() => setToastError(null), []);
   const [diffView, setDiffView] = useState<DiffViewState>({ file: null, split: true });
+  const togglePin = useCallback((sessionId: number, pinned: boolean) => {
+    setPinnedIds((current) => {
+      const next = pinned ? [...current, sessionId] : current.filter((id) => id !== sessionId);
+      savePinnedSessions(source, next);
+      return next;
+    });
+  }, [source]);
+  const paletteFiles = useMemo(() => preview
+    ? mockExplorerFiles.map((file) => ({ path: file.path, name: file.path.split('/').pop() ?? file.path }))
+    : flattenFileTree(workspace.tree), [preview, workspace.tree]);
   const history = useRef<HTMLDivElement>(null);
   const historyScrollTop = useRef(0);
   const autoScroll = useRef(true);
@@ -107,6 +124,32 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const blocked = preview || !c.state.ready || c.pending || !!c.state.activeRun;
 
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
+
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const themeIcon = preferences.theme === 'light' ? <Sun size={14} /> : preferences.theme === 'system' ? <Monitor size={14} /> : <Moon size={14} />;
+    const cycleTheme = () => updatePreferences({ ...preferences, theme: preferences.theme === 'dark' ? 'light' : preferences.theme === 'light' ? 'system' : 'dark' });
+    const newSession = () => {
+      setNavigation('agents');
+      const numeric = Number(currentProject.id);
+      if (preview) onCreateProjectSession?.(currentProject.id);
+      else void c.createSession(Number.isFinite(numeric) ? numeric : undefined);
+    };
+    return [
+      { id: 'new-session', label: '新建会话', icon: <Plus size={14} />, disabled: preview ? !onCreateProjectSession : !c.state.ready || c.pending, run: newSession },
+      { id: 'new-project', label: '新建项目…', icon: <FolderGit2 size={14} />, run: () => setNewProjectOpen(true) },
+      { id: 'agents', label: 'Go to Agents', icon: <Bot size={14} />, run: () => setNavigation('agents') },
+      { id: 'activity', label: 'Go to Activity', hint: formatShortcut(preferences.shortcuts.activity), icon: <ChartNoAxesColumnIncreasing size={14} />, run: () => setNavigation('activity') },
+      { id: 'extensions', label: 'Go to Extensions', hint: formatShortcut(preferences.shortcuts.extensions), icon: <Puzzle size={14} />, run: () => setNavigation('extensions') },
+      { id: 'automations', label: 'Go to Automations', icon: <Zap size={14} />, run: () => setNavigation('automations') },
+      { id: 'review', label: 'Toggle Review Panel', hint: formatShortcut(preferences.shortcuts.review), icon: <PanelRightOpen size={14} />, run: () => setReviewOpen((value) => !value) },
+      { id: 'settings', label: 'Open Settings', hint: formatShortcut(preferences.shortcuts.settings), icon: <Settings2 size={14} />, run: () => setSettingsOpen(true) },
+      { id: 'theme', label: `Theme: ${preferences.theme} (cycle)`, icon: themeIcon, run: cycleTheme },
+      { id: 'mode-plan', label: 'Switch to Plan mode', icon: <ListChecks size={14} />, disabled: c.state.mode === 'plan', run: () => void c.setMode('plan') },
+      { id: 'mode-code', label: 'Switch to Code mode', icon: <Code2 size={14} />, disabled: c.state.mode === 'code', run: () => void c.setMode('code') },
+      { id: 'mode-confirm', label: 'Switch to Confirm mode', icon: <ShieldCheck size={14} />, disabled: c.state.mode === 'confirm', run: () => void c.setMode('confirm') },
+      { id: 'mode-auto', label: 'Switch to Auto mode', icon: <Zap size={14} />, disabled: c.state.mode === 'auto', run: () => void c.setMode('auto') },
+    ];
+  }, [preferences, updatePreferences, preview, onCreateProjectSession, currentProject.id, c]);
 
   useEffect(() => {
     if (!preview && currentProject.path) void workspace.selectWorkspace(currentProject.path);
@@ -140,23 +183,26 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing || settingsOpen || (event.target instanceof Element && event.target.closest('input,textarea,[contenteditable="true"],.monaco-editor'))) return;
+      if (event.defaultPrevented || event.isComposing || settingsOpen || paletteOpen) return;
       const chord = shortcutChord(event);
       const action = (Object.keys(preferences.shortcuts) as ShortcutAction[]).find((id) => preferences.shortcuts[id] === chord);
       if (!action) return;
+      // The command palette is a global gesture (works from any input); other
+      // shortcuts stay suspended while typing to avoid background navigation.
+      if (action !== 'search' && event.target instanceof Element && event.target.closest('input,textarea,[contenteditable="true"],.monaco-editor')) return;
       event.preventDefault();
       if (action === 'settings') setSettingsOpen(true);
       if (action === 'activity') setNavigation('activity');
       if (action === 'extensions') setNavigation('extensions');
       if (action === 'review') setReviewOpen((value) => !value);
-      if (action === 'search') document.querySelector<HTMLInputElement>('input[aria-label="搜索会话"]')?.focus();
+      if (action === 'search') setPaletteOpen(true);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [preferences.shortcuts, settingsOpen]);
+  }, [preferences.shortcuts, settingsOpen, paletteOpen]);
 
   return <Tooltip.Provider delayDuration={250}>
-    <div className={`workbench ${preview ? 'is-preview' : ''} ${!reviewOpen ? 'review-hidden' : ''}`}>
+    <div className={`workbench ${preview ? 'is-preview' : ''} ${!reviewOpen ? 'review-hidden' : ''}`} style={{ zoom: `${Number(preferences.fontScale) / 100}` }}>
       <WorkbenchLayout source={source} sidebar={
       <aside aria-label="会话列表" className="sessions-pane">
         <div className="brand"><span className="brand-mark"><Command size={19} strokeWidth={1.5} /></span><h1>Maestro-Agent</h1><span className="brand-version">beta</span></div>
@@ -191,6 +237,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
           <ChartNoAxesColumnIncreasing size={16} strokeWidth={1.5} /><span>Activity</span><span className="activity-navigation-summary">{dashboardData.todayLines} lines today</span>
         </button>
         <ProjectSessions projects={projects} currentProjectId={currentProject.id} source={source} selectedSessionId={c.selectedSessionId} activeSessionId={c.state.activeRun?.sessionId}
+          pinnedIds={pinnedIds} onTogglePin={togglePin}
           canCreate={preview ? !!onCreateProjectSession : c.state.ready && !c.pending}
           onSelect={(id) => { setNavigation('agents'); c.selectSession(id); }}
           onCreate={(projectId) => { setNavigation('agents'); const numeric = Number(projectId); if (preview) onCreateProjectSession?.(projectId); else void c.createSession(Number.isFinite(numeric) ? numeric : undefined); }}
@@ -224,7 +271,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
                 {c.loadingSession && c.runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
                 {c.runs.map((run) => <section key={run.id} className="conversation-turn" aria-label={`对话轮次 ${run.id}`}>
                   <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><button type="button" className="user-copy-button" aria-label={`复制用户消息 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.prompt); } catch { setToastError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
-                  <article aria-label={`Agent 回复 ${run.id}`} className="agent-message"><div className="message-meta"><span className="agent-avatar"><Sparkles size={14} strokeWidth={1.5} /></span><strong>Maestro</strong><span className="message-model">Agent</span><span className="ml-auto">{statusLabels[run.status]}</span></div>
+                  <article aria-label={`Agent 回复 ${run.id}`} className="agent-message"><div className="message-meta"><span className="agent-avatar"><Sparkles size={14} strokeWidth={1.5} /></span><strong>Maestro</strong><span className="message-model">Agent</span><button type="button" className="user-copy-button" aria-label={`复制回复 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.output); } catch { setToastError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{statusLabels[run.status]}</span></div>
                     <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={run.output || (run.status === 'running' ? '思考中...' : '无输出')} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>
                     {run.error && <p className="error-message">{run.error}</p>}
                     {plans.filter((plan) => plan.runId === run.id).map((plan) => <PlanCard key={plan.id} plan={plan} preview={preview} canDecide={!preview && run.status === 'completed'} pending={c.pending} onReview={reviewPlan} onDecision={(_id, decision) => { if (!preview) void c.decidePlan(plan, decision); }} />)}
@@ -255,8 +302,8 @@ export default function Workbench({ controller: c, source = 'live', projects: su
                   { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />Confirm</span><span className="choice-item-desc">每次工具/命令须确认；未开放执行器</span></span> },
                   { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />Auto</span><span className="choice-item-desc">自动策略仅适用于已实现的能力；当前不执行文件/命令操作</span></span> },
                 ]} />
-                <div className="flex-1" /><span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Ctrl ↵'}</span>
-                <ComposerControls preview={preview} disabled={blocked} preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion} onError={setToastError} onCapability={updateCapability} />
+                <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked} preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion} onError={setToastError} onCapability={updateCapability} />
+                <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Ctrl ↵'}</span>
                 {c.state.activeRun?.status === 'running' && !preview ? <IconButton label="停止生成" className="stop-button" disabled={c.pending} onClick={() => void c.cancel(c.state.activeRun!.id)}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
               </div>
             </form><SessionStats runs={c.runs} metrics={c.metrics} context={capability.context} /><div className="composer-caption"><span><ShieldCheck size={11} />{preview ? '预览不调用模型；媒体仅本地显示' : '附件仅本地占位，不上传；工具执行尚未开放。'}</span><span>{capability.model || 'Maestro Agent'}</span></div></div>
@@ -265,7 +312,18 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       } review={reviewOpen ? <RightPanel tab={rightTab} onTabChange={setRightTab} plans={plans} selectedId={selectedPlanId} onSelect={setSelectedPlanId} diffView={diffView} onDiffViewChange={setDiffView} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} workspaceName={currentProject.name} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
+    <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
+      files={paletteFiles} filesLoading={!preview && paletteOpen && workspace.loading}
+      onSelectSession={(id) => { setNavigation('agents'); c.selectSession(id); }}
+      onSelectFile={(path) => {
+        setReviewOpen(true); setRightTab('explorer');
+        if (preview) {
+          const file = mockExplorerFiles.find((item) => item.path === path);
+          if (file) setExplorerView((view) => ({ ...view, selected: `${currentProject.id}:${c.selectedSessionId}:mock:${file.id}` }));
+        } else void workspace.selectFile(path);
+      }} />
     <NewProjectDialog open={newProjectOpen} onOpenChange={setNewProjectOpen} disabled={!preview && (!c.state.ready || c.pending)}
+      onBrowse={preview ? undefined : pickDirectory}
       onCreate={async (name, path) => {
         if (preview) return sessionActions?.createProject ? sessionActions.createProject(name, path) : null;
         if (!c.createProject) return '后端不支持创建项目';

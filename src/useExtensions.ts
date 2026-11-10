@@ -14,6 +14,10 @@ export interface ExtensionsController {
   mcpConfigText: string;
   loading: boolean;
   pending: string | null;
+  importSummary: string | null;
+  real: boolean;
+  installErrors: Record<string, string>;
+  isInstalled: (item: RecommendedItem) => boolean;
   refresh: () => Promise<void>;
   createSkill: (name: string, description: string) => Promise<string | null>;
   importSkill: (path: string) => Promise<string | null>;
@@ -34,6 +38,11 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
   const [recommendedSkills, setRecommendedSkills] = useState<RecommendedItem[]>([]);
   const [recommendedMcps, setRecommendedMcps] = useState<RecommendedItem[]>([]);
   const [mcpConfigText, setMcpConfigText] = useState('');
+  const [importSummary, setImportSummary] = useState<string | null>(null);
+  const [installErrors, setInstallErrors] = useState<Record<string, string>>({});
+  const [installedRepos, setInstalledRepos] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('maestro.extensions.installed') ?? '[]'); } catch { return []; }
+  });
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
 
@@ -77,9 +86,23 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
 
   return {
     skills, servers, recommendedSkills, recommendedMcps, mcpConfigText, loading, pending, refresh,
+    importSummary, real: true, installErrors,
+    isInstalled: (item) => item.kind === 'skill'
+      ? installedRepos.includes(item.id) || skills.some((skill) => skill.name === item.id)
+      : servers.some((server) => server.name === item.id),
     createSkill: (name, description) =>
       action('create', () => extensionsApi.createSkill(name, description), refresh),
-    importSkill: (path) => action('import', () => extensionsApi.importSkill(path), refresh),
+    importSkill: (path) => action('import', async () => {
+      const outcomes = await extensionsApi.importSkill(path);
+      const imported = outcomes.filter((item) => item.status === 'imported');
+      const failed = outcomes.filter((item) => item.status !== 'imported');
+      if (imported.length === 0) {
+        throw new Error(failed.map((item) => `${item.name}: ${item.error ?? '导入失败'}`).join('；') || '未导入任何技能');
+      }
+      setImportSummary(`已导入 ${imported.length} 个技能` +
+        (failed.length ? `；跳过/失败 ${failed.length}：${failed.map((item) => item.name).join('、')}` : ''));
+      return outcomes;
+    }, refresh),
     importSkillGithub: (repoUrl) =>
       action('github', () => extensionsApi.importSkillGithub(repoUrl), refresh),
     addMcpServer: (name, command, args) =>
@@ -97,14 +120,25 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
       }
     },
     removeMcpServer: (name) => action(`mcp-rm-${name}`, () => extensionsApi.removeMcpServer(name), refresh),
-    installRecommended: (item) => action(`install-${item.id}`, async () => {
-      if (item.kind === 'skill') {
-        await extensionsApi.importSkillGithub(item.installPayload);
-      } else {
-        const config = JSON.parse(item.installPayload) as { command: string; args: string[] };
-        await extensionsApi.addMcpServer(item.id, config.command, config.args ?? []);
+    installRecommended: async (item) => {
+      const message = await action(`install-${item.id}`, async () => {
+        if (item.kind === 'skill') {
+          await extensionsApi.importSkillGithub(item.installPayload);
+        } else {
+          const config = JSON.parse(item.installPayload) as { command: string; args: string[] };
+          await extensionsApi.addMcpServer(item.id, config.command, config.args ?? []);
+        }
+        await refresh();
+      });
+      setInstallErrors((errors) => ({ ...errors, [item.id]: message ?? '' }));
+      if (!message && item.kind === 'skill') {
+        setInstalledRepos((ids) => {
+          const next = [...new Set([...ids, item.id])];
+          try { localStorage.setItem('maestro.extensions.installed', JSON.stringify(next)); } catch { /* quota */ }
+          return next;
+        });
       }
-      await refresh();
-    }),
+      return message;
+    },
   };
 }

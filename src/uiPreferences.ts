@@ -3,6 +3,7 @@ export type ShortcutAction = 'settings' | 'activity' | 'extensions' | 'review' |
 export interface UiPreferences {
   language: 'en' | 'zh-CN'; startupView: 'agents' | 'activity' | 'extensions';
   theme: 'dark' | 'light' | 'system'; editorFont: string; editorFontSize: number;
+  fontScale: '100' | '125' | '150';
   contextWindow: 8192 | 32768 | 128000; temperature: number;
   provider: 'openai' | 'deepseek' | 'anthropic' | 'ollama'; previewModel: string;
   shortcuts: Record<ShortcutAction, string>;
@@ -12,10 +13,10 @@ export const defaultShortcuts: Record<ShortcutAction, string> = {
   settings: 'Mod+Comma', activity: 'Mod+Shift+KeyA', extensions: 'Mod+Shift+KeyX', review: 'Mod+Shift+KeyD', search: 'Mod+KeyK',
 };
 export const shortcutLabels: Record<ShortcutAction, string> = {
-  settings: 'Open Settings', activity: 'Open Activity', extensions: 'Open Extensions', review: 'Toggle Review', search: 'Search Sessions',
+  settings: 'Open Settings', activity: 'Open Activity', extensions: 'Open Extensions', review: 'Toggle Review', search: 'Command Center',
 };
 export const defaultUiPreferences: UiPreferences = {
-  language: 'en', startupView: 'agents', theme: 'dark', editorFont: 'Cascadia Code', editorFontSize: 12,
+  language: 'en', startupView: 'agents', theme: 'dark', editorFont: 'Cascadia Code', editorFontSize: 12, fontScale: '100',
   contextWindow: 8192, temperature: 0.7, provider: 'openai', previewModel: 'deepseek-chat', shortcuts: defaultShortcuts,
 };
 
@@ -44,6 +45,7 @@ export function readUiPreferences(source: 'live' | 'preview'): UiPreferences {
     if (['dark', 'light', 'system'].includes(value.theme)) result.theme = value.theme;
     if (['Cascadia Code', 'Consolas', 'JetBrains Mono'].includes(value.editorFont)) result.editorFont = value.editorFont;
     if (Number.isInteger(value.editorFontSize) && value.editorFontSize >= 10 && value.editorFontSize <= 20) result.editorFontSize = value.editorFontSize;
+    if (['100', '125', '150'].includes(value.fontScale)) result.fontScale = value.fontScale;
     if ([8192, 32768, 128000].includes(value.contextWindow)) result.contextWindow = value.contextWindow;
     if (Number.isFinite(value.temperature) && value.temperature >= 0 && value.temperature <= 2) result.temperature = value.temperature;
     if (['openai', 'deepseek', 'anthropic', 'ollama'].includes(value.provider)) result.provider = value.provider;

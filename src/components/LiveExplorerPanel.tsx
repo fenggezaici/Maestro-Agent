@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ChevronDown, FileCode2, Folder, FolderOpen, RefreshCw } from 'lucide-react';
 import type { FileNode } from '../workspaceApi';
+import { pickDirectory } from '../dialog';
 import type { WorkspaceController } from '../useWorkspace';
 import type { ExplorerViewState } from './ExplorerPanel';
 import MonacoCode from './MonacoCode';
@@ -27,7 +28,8 @@ export default function LiveExplorerPanel({ workspace, view, onViewChange, fontS
     <div className="explorer-summary"><strong>{workspace.info?.name ?? 'WORKSPACE'}</strong><span className="mock-badge">Local / Read only</span></div>
     <form className="workspace-path-bar" onSubmit={(event) => { event.preventDefault(); if (path.trim()) void workspace.selectWorkspace(path.trim()); }}>
       <input aria-label="本地工作区路径" value={path} onChange={(event) => setPath(event.target.value)} placeholder="Absolute project folder…" disabled={workspace.loading} />
-      <button type="submit" className="icon-button" aria-label="打开工作区" disabled={workspace.loading || !path.trim()}><FolderOpen size={14} /></button>
+      <button type="button" className="icon-button" aria-label="打开工作区" disabled={workspace.loading}
+        onClick={async () => { const picked = await pickDirectory(); if (picked) { setPath(picked); void workspace.selectWorkspace(picked); } }}><FolderOpen size={14} /></button>
       <button type="button" className="icon-button" aria-label="刷新文件树" disabled={workspace.loading} onClick={() => void workspace.refresh()}><RefreshCw size={13} /></button>
     </form>
     {workspace.loading && <p className="workspace-status" role="status">正在读取本地文件树…</p>}

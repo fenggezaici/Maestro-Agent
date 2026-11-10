@@ -21,23 +21,27 @@ it('shows R1 context and a visible built-in thinking indicator without fake Low/
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-r1');
   expect(screen.getByLabelText('上下文长度')).toHaveTextContent('128k context');
   expect(screen.getByLabelText('上下文长度')).toHaveAttribute('title', expect.stringContaining('128,000 tokens'));
-  expect(screen.getByLabelText('思考模式：模型内置推理')).toBeVisible();
+  fireEvent.click(screen.getByLabelText('选择模型'));
+  expect(screen.getByText('内置推理（模型固定）')).toBeVisible();
   expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument();
   expect(screen.queryByText('Unknown context')).not.toBeInTheDocument();
 });
 
 it('changes from fixed R1 to adjustable gpt-5.2, persisting effort that stays supported on gpt-5', () => {
   saveLlmSettings(config);
+  localStorage.setItem('maestro.llm.models.openai', JSON.stringify([
+    { id: 'deepseek-r1', enabled: true }, { id: 'gpt-5.2', enabled: true }, { id: 'gpt-5', enabled: true },
+  ]));
   composer();
-  fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: /gpt-5\.2/ }));
+  fireEvent.click(screen.getByLabelText('选择模型'));
+  fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
   expect(screen.getByLabelText('上下文长度')).toHaveTextContent('400k context');
-  expect(screen.queryByLabelText('思考模式：模型内置推理')).not.toBeInTheDocument();
-  fireEvent.keyDown(screen.getByLabelText('思考强度'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: 'Extra High' }));
+  expect(screen.queryByText('内置推理（模型固定）')).not.toBeInTheDocument();
+  const slider = screen.getByRole('slider');
+  expect(slider).toHaveAttribute('aria-valuenow', '1');
+  fireEvent.keyDown(slider, { key: 'End' });
   expect(readLlmSettings()).toMatchObject({ model: 'gpt-5.2', reasoning: 'xhigh' });
-  fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: /^gpt-5(?!\.)/ }));
+  fireEvent.click(screen.getByRole('button', { name: /gpt-5(?!\.)/ }));
   expect(readLlmSettings()).toMatchObject({ model: 'gpt-5', reasoning: 'medium' });
 });
 
@@ -46,10 +50,10 @@ it('keeps the previous thinking selection if localStorage rejects a save', () =>
   const onError = vi.fn();
   composer(onError);
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked'); });
-  fireEvent.keyDown(screen.getByLabelText('思考强度'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: 'High' }));
+  fireEvent.click(screen.getByLabelText('选择模型'));
+  fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' });
   expect(onError).toHaveBeenCalledWith(expect.stringContaining('浏览器存储不可用'));
-  expect(screen.getByLabelText('思考强度')).toHaveTextContent('Medium');
+  expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '1');
   expect(readLlmSettings().reasoning).toBe('medium');
 });
 
@@ -58,7 +62,8 @@ it('explains Ollama deployment context without losing the R1 thinking indicator'
   composer();
   expect(screen.getByLabelText('上下文长度')).toHaveTextContent('服务端配置');
   expect(screen.getByLabelText('上下文长度')).toHaveAttribute('title', expect.stringContaining('num_ctx'));
-  expect(screen.getByLabelText('思考模式：模型内置推理')).toBeVisible();
+  fireEvent.click(screen.getByLabelText('选择模型'));
+  expect(screen.getByText('内置推理（模型固定）')).toBeVisible();
 });
 
 it('shows and saves supported thinking strength in Settings, and updates capability when the model changes', () => {

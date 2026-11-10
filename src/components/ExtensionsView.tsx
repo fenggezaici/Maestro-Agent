@@ -2,14 +2,17 @@ import { useState, type FormEvent } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
-import { ExternalLink, FolderInput, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
+import { ExternalLink, FolderInput, FolderOpen, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
 import type { ExtensionsController } from '../useExtensions';
 import type { McpServerView, RecommendedItem } from '../extensions';
+import { pickDirectory, pickFile } from '../dialog';
+import { IconButton } from './ui';
 
-function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, onSubmit }: {
+function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canBrowse = false, onSubmit }: {
   open: boolean; onOpenChange: (open: boolean) => void; title: string; hint?: string;
   submitLabel: string;
-  fields: { id: string; label: string; placeholder?: string; required?: boolean; textarea?: boolean }[];
+  canBrowse?: boolean;
+  fields: { id: string; label: string; placeholder?: string; required?: boolean; textarea?: boolean; browse?: 'directory' | 'file' }[];
   onSubmit: (values: Record<string, string>) => Promise<string | null>;
 }) {
   const [values, setValues] = useState<Record<string, string>>({});
@@ -34,7 +37,14 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, onSu
             <label htmlFor={`ext-${field.id}`}>{field.label}{field.required !== false && ' *'}</label>
             {field.textarea
               ? <textarea id={`ext-${field.id}`} rows={3} value={values[field.id] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />
-              : <input id={`ext-${field.id}`} autoComplete="off" spellCheck={false} value={values[field.id] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />}
+              : <div className="field-with-browse">
+                <input id={`ext-${field.id}`} autoComplete="off" spellCheck={false} value={values[field.id] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />
+                {field.browse && <IconButton label={field.browse === 'directory' ? '浏览目录' : '浏览文件'} disabled={!canBrowse}
+                  onClick={async () => {
+                    const picked = field.browse === 'directory' ? await pickDirectory() : await pickFile(['json']);
+                    if (picked) setValues((v) => ({ ...v, [field.id]: picked }));
+                  }}><FolderOpen size={14} /></IconButton>}
+              </div>}
           </div>)}
           {error && <p role="alert" className="settings-form-error">{error}</p>}
           <div className="dialog-actions">
@@ -60,6 +70,7 @@ function SkillList({ c }: { c: ExtensionsController }) {
       </div>
     </div>
     {c.skills.length === 0 && <p className="sidebar-empty">{c.loading ? '加载中…' : '暂无技能。新建或从发现页安装。'}</p>}
+    {c.importSummary && <p className="import-summary">{c.importSummary}</p>}
     {c.skills.map((skill) => <article className="extension-card" key={skill.name}>
       <span className="extension-icon"><Sparkles size={18} /></span>
       <div className="extension-description"><strong>{skill.name}</strong><p>{skill.description || '（无描述）'}</p>
@@ -70,8 +81,8 @@ function SkillList({ c }: { c: ExtensionsController }) {
       fields={[{ id: 'name', label: '名称（kebab-case）', placeholder: 'my-skill' }, { id: 'description', label: '描述', placeholder: '这个技能做什么？', textarea: true }]}
       onSubmit={(v) => c.createSkill(v.name, v.description)} />
     <FormDialog open={dialog === 'local'} onOpenChange={(o) => !o && setDialog(null)} title="从本地导入技能"
-      hint="选择包含 SKILL.md 的目录或 SKILL.md 文件。" submitLabel="导入"
-      fields={[{ id: 'path', label: '本地路径', placeholder: 'E:\\skills\\my-skill' }]}
+      hint="选择 SKILL.md 文件、单个技能目录，或含多个技能目录的父目录（批量导入）。" submitLabel="导入" canBrowse={!!c.real}
+      fields={[{ id: 'path', label: '本地路径', placeholder: 'E:\\skills\\my-skill', browse: 'directory' }]}
       onSubmit={(v) => c.importSkill(v.path)} />
     <FormDialog open={dialog === 'github'} onOpenChange={(o) => !o && setDialog(null)} title="从 GitHub 导入技能"
       hint="克隆仓库并递归导入其中全部 SKILL.md。" submitLabel="导入"
@@ -97,8 +108,8 @@ function McpList({ c }: { c: ExtensionsController }) {
       fields={[{ id: 'name', label: '名称', placeholder: 'filesystem' }, { id: 'command', label: '启动命令', placeholder: 'npx' }, { id: 'args', label: '参数（空格分隔，可选）', placeholder: '-y @modelcontextprotocol/server-filesystem', required: false }]}
       onSubmit={(v) => c.addMcpServer(v.name, v.command, (v.args ?? '').split(' ').filter(Boolean))} />
     <FormDialog open={dialog === 'import'} onOpenChange={(o) => !o && setDialog(null)} title="导入 MCP JSON"
-      hint="读取一个含 mcpServers 字段的 JSON 文件并合并到 ~/.maestro/mcp.json。" submitLabel="导入"
-      fields={[{ id: 'path', label: 'JSON 文件路径', placeholder: 'E:\\config\\mcp.json' }]}
+      hint="读取一个含 mcpServers 字段的 JSON 文件并合并到 ~/.maestro/mcp.json。" submitLabel="导入" canBrowse={!!c.real}
+      fields={[{ id: 'path', label: 'JSON 文件路径', placeholder: 'E:\\config\\mcp.json', browse: 'file' }]}
       onSubmit={(v) => c.importMcpJson(v.path)} />
   </section>;
 }
@@ -124,28 +135,33 @@ function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: R
   return <section aria-label={title} className="extension-section">
     <div className="extension-section-heading"><h4>{icon}{title}</h4></div>
     {items.length === 0 && <p className="sidebar-empty">{empty}</p>}
-    {items.map((item) => <article className="extension-card discover-card" key={item.id}>
+    {items.map((item) => { const installed = c.isInstalled(item); const failure = c.installErrors[item.id];
+      return <article className="extension-card discover-card" key={item.id}>
       <div className="extension-description">
         <strong>{item.name}</strong>
         <p>{item.description}</p>
         <a className="extension-link" href={item.sourceUrl} target="_blank" rel="noreferrer">{item.sourceUrl}<ExternalLink size={10} /></a>
+        {!!failure && <p className="settings-form-error" role="alert">{failure}</p>}
       </div>
-      <button type="button" className="button-approve" aria-label={`安装 ${item.name}`} disabled={c.pending === `install-${item.id}`}
-        onClick={async () => { await c.installRecommended(item); }}>{c.pending === `install-${item.id}` ? '安装中…' : '一键安装'}</button>
-    </article>)}
+      <button type="button" className="button-approve" aria-label={`安装 ${item.name}`} disabled={installed || c.pending === `install-${item.id}`}
+        onClick={async () => { await c.installRecommended(item); }}>{installed ? '已安装' : c.pending === `install-${item.id}` ? '安装中…' : '一键安装'}</button>
+    </article>; })}
   </section>;
 }
 
 export default function ExtensionsView({ controller: c }: { controller: ExtensionsController }) {
   return <section aria-label="Extensions 工作区" className="extensions-view">
     <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">WORKSPACE CAPABILITIES</p><h3>Extensions</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
-    <Tabs.Root defaultValue="installed" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
-      <Tabs.Trigger value="installed">已安装</Tabs.Trigger>
+    <Tabs.Root defaultValue="skills" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
+      <Tabs.Trigger value="skills">技能</Tabs.Trigger>
+      <Tabs.Trigger value="mcp">MCP 服务</Tabs.Trigger>
       <Tabs.Trigger value="discover">发现</Tabs.Trigger>
       <Tabs.Trigger value="config">配置</Tabs.Trigger>
     </Tabs.List>
-      <Tabs.Content value="installed">
+      <Tabs.Content value="skills">
         <SkillList c={c} />
+      </Tabs.Content>
+      <Tabs.Content value="mcp">
         <McpList c={c} />
       </Tabs.Content>
       <Tabs.Content value="discover">

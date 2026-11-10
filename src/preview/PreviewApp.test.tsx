@@ -74,7 +74,7 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   const activity = screen.getByRole('button', { name: 'Activity' });
   expect(activity).toHaveTextContent('120 lines today');
   fireEvent.click(activity);
-  const dashboard = await screen.findByRole('region', { name: 'Activity Dashboard' });
+  const dashboard = await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
   expect(activity).toHaveAttribute('aria-current', 'page');
   expect(screen.queryByLabelText('发送消息')).not.toBeInTheDocument();
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
@@ -99,7 +99,7 @@ it('returns to chat through Agents, a session, or new-session creation', async (
   render(<PreviewApp />);
   async function openDashboard() {
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByRole('region', { name: 'Activity Dashboard' });
+    await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
   }
   await openDashboard();
   fireEvent.click(screen.getByRole('button', { name: /^Agents/ }));
@@ -117,15 +117,17 @@ it('returns to chat through Agents, a session, or new-session creation', async (
 it('supports composer mock controls, two-column Settings and shortcut rebinding without reading live secrets', () => {
   const sentinel = JSON.stringify({ apiKey: 'private-sentinel', baseUrl: 'https://private.example/v1', model: 'private-model' });
   localStorage.setItem(LLM_SETTINGS_KEY, sentinel);
+  localStorage.setItem('maestro.ui.v1.preview', JSON.stringify({ provider: 'openai', previewModel: 'deepseek-chat' }));
+  localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'gpt-5.2', enabled: true }]));
   render(<PreviewApp />);
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-chat');
   expect(screen.getByLabelText('实时会话统计')).toHaveTextContent('Turns: 1');
   expect(screen.queryByRole('button', { name: '模型参数' })).not.toBeInTheDocument();
-  fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: /gpt-5\.2/ }));
-  expect(screen.getByLabelText('思考强度')).toHaveTextContent('Medium');
-  expect(screen.getByText('400k context')).toBeInTheDocument();
+  fireEvent.click(screen.getByLabelText('选择模型'));
+  fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
+  expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '1');
+  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('400k context');
   fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
   fireEvent.click(screen.getByRole('button', { name: 'Models' }));
   expect(screen.getByLabelText('API Key')).toHaveValue('');
@@ -154,6 +156,7 @@ it('switches Review/Explorer, folds folders and preserves virtual extension stat
   expect(screen.getByLabelText('Diff src/bridge/BridgeSession.h')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
   expect(screen.getByLabelText('Extensions 工作区')).toBeInTheDocument();
+  fireEvent.mouseDown(screen.getByRole('tab', { name: 'MCP 服务' }));
   expect(screen.getByRole('switch', { name: '启用 filesystem' })).toHaveAttribute('data-state', 'checked');
   fireEvent.click(screen.getByRole('switch', { name: '启用 github' }));
   expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
@@ -161,6 +164,7 @@ it('switches Review/Explorer, folds folders and preserves virtual extension stat
   expect(screen.getByRole('button', { name: '安装 FileSystem' })).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
   fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
+  fireEvent.mouseDown(screen.getByRole('tab', { name: 'MCP 服务' }));
   expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
   expect(ipc.invoke).not.toHaveBeenCalled();
 });

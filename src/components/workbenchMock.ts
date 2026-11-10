@@ -57,6 +57,8 @@ export function usePreviewExtensions(): ExtensionsController {
     recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
     mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
     loading: false, pending,
+    importSummary: null, real: false,
+    installErrors: {}, isInstalled: () => false,
     refresh: async () => {},
     createSkill: async (name, description) => { setSkills((items) => [...items, { name, description, source: 'global', path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
     importSkill: noop, importSkillGithub: noop,

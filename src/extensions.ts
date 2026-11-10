@@ -19,6 +19,12 @@ export interface McpServerView {
   error: string | null;
 }
 
+export interface SkillImportOutcome {
+  name: string;
+  status: 'imported' | 'skipped' | 'failed' | string;
+  error: string | null;
+}
+
 export interface RecommendedItem {
   id: string;
   kind: 'skill' | 'mcp' | string;
@@ -32,7 +38,7 @@ export const extensionsApi = {
   scanSkills: () => invoke<SkillView[]>('scan_skills'),
   createSkill: (name: string, description: string) =>
     invoke<SkillView>('create_skill', { name, description }),
-  importSkill: (path: string) => invoke<SkillView>('import_skill', { path }),
+  importSkill: (path: string) => invoke<SkillImportOutcome[]>('import_skill', { path }),
   importSkillGithub: (repoUrl: string) =>
     invoke<SkillView[]>('import_skill_github', { repoUrl }),
   listMcpServers: () => invoke<McpServerView[]>('list_mcp_servers'),

@@ -4,7 +4,7 @@ export interface ModelCapability { context: number | null; referenceContext?: nu
 export const thinkingLabels: Record<ThinkingLevel, string> = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' };
 export const providers = {
   openai: { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', models: ['gpt-5', 'gpt-5.2'] },
-  deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-coder'] },
+  deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'] },
   anthropic: { name: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-7-sonnet-latest', models: ['claude-3-7-sonnet-latest'] },
   ollama: { name: 'Ollama', baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5-coder', models: ['qwen2.5-coder', 'llama3.2', 'deepseek-r1'] },
 } satisfies Record<ProviderId, { name: string; baseUrl: string; model: string; models: string[] }>;
@@ -16,6 +16,7 @@ const catalog: Record<string, ModelCapability> = {
   'deepseek-chat': { context: 128000, thinking: [], reasoning: 'none', vision: false },
   'deepseek-r1': { context: 128000, thinking: [], reasoning: 'fixed', vision: false },
   'deepseek-coder': { context: 64000, thinking: [], reasoning: 'none', vision: false },
+  'deepseek-reasoner': { context: 128000, thinking: [], reasoning: 'fixed', vision: false },
   'claude-3-7-sonnet-latest': { context: 200000, thinking: ['low', 'medium', 'high'], reasoning: 'budget', vision: true },
 };
 

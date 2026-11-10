@@ -33,6 +33,13 @@ pub struct SkillView {
     pub path: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillImportOutcome {
+    pub name: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct SkillEntry {
     name: String,
@@ -234,7 +241,13 @@ impl SkillStore {
 
     /// Copy a directory containing SKILL.md (or a SKILL.md file itself) into the
     /// global skills directory. The frontmatter name decides the target folder.
-    pub fn import_from_path(&self, global_dir: &Path, source_path: &str) -> AppResult<SkillView> {
+    /// A directory without SKILL.md is treated as a batch parent: every direct
+    /// child directory containing SKILL.md is imported independently.
+    pub fn import_from_path(
+        &self,
+        global_dir: &Path,
+        source_path: &str,
+    ) -> AppResult<Vec<SkillImportOutcome>> {
         let source = Path::new(source_path)
             .canonicalize()
             .map_err(|_| "导入路径不存在".to_string())?;
@@ -244,9 +257,51 @@ impl SkillStore {
             source.clone()
         };
         if skill_md.file_name().map(|n| n != "SKILL.md").unwrap_or(true) || !skill_md.is_file() {
-            return Err("导入路径必须是包含 SKILL.md 的目录或 SKILL.md 文件".into());
+            let mut outcomes = self.import_children(global_dir, &source)?;
+            if outcomes.is_empty() {
+                return Err("导入路径必须是包含 SKILL.md 的目录、SKILL.md 文件，或含技能子目录的父目录".into());
+            }
+            outcomes.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(outcomes);
         }
-        let content = fs::read_to_string(&skill_md).map_err(|_| "无法读取 SKILL.md".to_string())?;
+        self.import_single(global_dir, &skill_md, &source)
+            .map(|view| {
+                vec![SkillImportOutcome {
+                    name: view.name,
+                    status: "imported".into(),
+                    error: None,
+                }]
+            })
+    }
+
+    /// Import every direct child directory of `parent` that contains SKILL.md.
+    /// Each child is independent: one bad or duplicate skill does not stop the rest.
+    fn import_children(&self, global_dir: &Path, parent: &Path) -> AppResult<Vec<SkillImportOutcome>> {
+        if !parent.is_dir() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(parent).map_err(|_| "无法读取导入目录".to_string())?;
+        let mut outcomes = Vec::new();
+        for entry in entries.flatten() {
+            let skill_md = entry.path().join("SKILL.md");
+            if !entry.path().is_dir() || !skill_md.is_file() {
+                continue;
+            }
+            let label = entry.file_name().to_string_lossy().into_owned();
+            outcomes.push(match self.import_single(global_dir, &skill_md, &entry.path()) {
+                Ok(view) => SkillImportOutcome { name: view.name, status: "imported".into(), error: None },
+                Err(reason) if reason.starts_with("技能") && reason.contains("已存在") => {
+                    SkillImportOutcome { name: label, status: "skipped".into(), error: Some(reason) }
+                }
+                Err(reason) => SkillImportOutcome { name: label, status: "failed".into(), error: Some(reason) },
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// Copy one SKILL.md into the global skills directory; shared by single and batch imports.
+    fn import_single(&self, global_dir: &Path, skill_md: &Path, source: &Path) -> AppResult<SkillView> {
+        let content = fs::read_to_string(skill_md).map_err(|_| "无法读取 SKILL.md".to_string())?;
         let fallback = source
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -269,7 +324,7 @@ impl SkillStore {
             return Err("该技能已位于全局目录中".into());
         }
         fs::create_dir_all(&target_dir).map_err(|_| "无法创建技能目录".to_string())?;
-        fs::copy(&skill_md, target_dir.join("SKILL.md"))
+        fs::copy(skill_md, target_dir.join("SKILL.md"))
             .map_err(|_| "无法复制 SKILL.md".to_string())?;
         Ok(SkillView {
             name: name.to_string(),
@@ -458,8 +513,34 @@ mod tests {
         let external = base.path().join("external");
         fs::create_dir_all(&external).unwrap();
         fs::write(external.join("SKILL.md"), "---\nname: imported\ndescription: ext\n---\n\nB").unwrap();
-        let view = store.import_from_path(&global, external.to_str().unwrap()).unwrap();
-        assert_eq!(view.name, "imported");
+        let outcomes = store.import_from_path(&global, external.to_str().unwrap()).unwrap();
+        assert_eq!(outcomes[0].name, "imported");
+        assert_eq!(outcomes[0].status, "imported");
         assert!(store.import_from_path(&global, external.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn import_parent_dir_batches_children() {
+        let base = tempfile::tempdir().unwrap();
+        let global = base.path().join("global");
+        let store = SkillStore::default();
+        let parent = base.path().join("skills-pack");
+        for (dir, name, desc) in [("alpha", "alpha-skill", "a"), ("beta", "beta-skill", "b")] {
+            fs::create_dir_all(parent.join(dir)).unwrap();
+            fs::write(parent.join(dir).join("SKILL.md"), format!("---\nname: {name}\ndescription: {desc}\n---\n\nB")).unwrap();
+        }
+        // An existing skill is skipped; a malformed child fails without stopping the rest.
+        fs::create_dir_all(global.join("skills").join("alpha-skill")).unwrap();
+        fs::write(global.join("skills").join("alpha-skill").join("SKILL.md"), "---\nname: alpha-skill\n---\n\nG").unwrap();
+        fs::create_dir_all(parent.join("broken")).unwrap();
+        fs::write(parent.join("broken").join("SKILL.md"), "---\nname: Bad Name!\n---\n\nB").unwrap();
+        fs::create_dir_all(parent.join("not-a-skill")).unwrap();
+
+        let outcomes = store.import_from_path(&global, parent.to_str().unwrap()).unwrap();
+        let by_status = |status: &str| outcomes.iter().filter(|o| o.status == status).count();
+        assert_eq!(by_status("imported"), 1, "{outcomes:?}");
+        assert_eq!(by_status("skipped"), 1, "{outcomes:?}");
+        assert_eq!(by_status("failed"), 1, "{outcomes:?}");
+        assert!(global.join("skills").join("beta-skill").join("SKILL.md").is_file());
     }
 }

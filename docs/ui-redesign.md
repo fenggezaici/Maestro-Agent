@@ -57,6 +57,8 @@ Recharts 按需加载，热力图在窄面板内横向滚动，不挤出工作�
 - `artifacts/ui/maestro-workbench-resized.png`：实际拖拽调整后的布局。
 - `artifacts/ui/maestro-activity.png`：看板热力图的逐日悬浮摘要。
 - `artifacts/ui/maestro-workbench-mobile.png`：640px 单列布局。
+- `artifacts/ui/maestro-command-center.png`：Ctrl+K 快速面板的分组搜索结果。
+- `artifacts/ui/maestro-thinking-cycle.png`：Composer 思考档位循环按钮。
 - `artifacts/ui/maestro-dashboard.png`：1600px 主工作区 Dashboard。
 - `artifacts/ui/maestro-dashboard-1280.png`：1280px 看板。
 - `artifacts/ui/maestro-dashboard-stacked.png`：下方 Diff 布局中的看板。

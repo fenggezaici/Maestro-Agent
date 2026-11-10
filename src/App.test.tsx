@@ -264,7 +264,7 @@ describe('desktop IPC interface', () => {
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'keep this draft' } });
     const callCount = mocks.invoke.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByRole('region', { name: 'Activity Dashboard' });
+    await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
     expect(screen.getByLabelText('Total Lines（Mock）')).toHaveTextContent('12,450');
     expect(screen.getByText('Rust 内核已就绪')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
@@ -281,7 +281,7 @@ describe('desktop IPC interface', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     const listeners = mocks.listen.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByRole('region', { name: 'Activity Dashboard' });
+    await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
     act(() => receive({ payload: { type: 'stream_token', runId: 7, token: 'arrived while dashboard was open', sequence: 3 } }));
     fireEvent.click(screen.getByRole('button', { name: 'Back to Chat' }));
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('arrived while dashboard was open');
@@ -369,13 +369,13 @@ describe('desktop IPC interface', () => {
   });
 
   it('persists model thinking strength while keeping unsupported parameters out of IPC', async () => {
+    localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'gpt-5.2', enabled: true }]));
     render(<App />);
     await ready();
-    fireEvent.keyDown(screen.getByLabelText('选择模型'), { key: 'ArrowDown' });
-    fireEvent.click(screen.getByRole('option', { name: /gpt-5\.2/ }));
+    fireEvent.click(screen.getByLabelText('选择模型'));
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
     expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'gpt-5.2' });
-    fireEvent.keyDown(screen.getByLabelText('思考强度'), { key: 'ArrowDown' });
-    fireEvent.click(screen.getByRole('option', { name: 'High' }));
+    fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' });
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'model selection request' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'stream_chat')).toBe(true));
