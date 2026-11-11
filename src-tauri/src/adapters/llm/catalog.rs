@@ -6,7 +6,7 @@ use reqwest::Url;
 
 use crate::domain::AppResult;
 
-use super::{ChatConfig, Provider};
+use super::{is_opencode_host, ChatConfig, Provider};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FetchedModel {
@@ -27,6 +27,7 @@ pub async fn fetch_models(config: &ChatConfig) -> AppResult<Vec<FetchedModel>> {
     }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("Maestro-Agent/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| "无法初始化模型 HTTP 客户端".to_string())?;
@@ -74,6 +75,9 @@ pub async fn fetch_models(config: &ChatConfig) -> AppResult<Vec<FetchedModel>> {
     }
 
     let mut request = client.get(format!("{root}/models"));
+    if is_opencode_host(&config.base_url) {
+        request = request.header("x-opencode-session", "maestro-model-catalog");
+    }
     if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", config.api_key.trim())) {
         request = request.header(reqwest::header::AUTHORIZATION, value);
     }

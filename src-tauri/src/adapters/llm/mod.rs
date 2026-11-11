@@ -49,6 +49,9 @@ pub struct ChatConfig {
     pub provider: Provider,
     pub reasoning: Option<String>,
     pub max_output: Option<u64>,
+    /// Stable per-conversation id. OpenCode gateways require it as
+    /// `x-opencode-session` so requests can be routed/cached together.
+    pub session: Option<String>,
 }
 
 impl ChatConfig {
@@ -102,6 +105,32 @@ impl ChatConfig {
             .take(700)
             .filter(|character| !character.is_control() || *character == '\n')
             .collect()
+    }
+}
+
+/// OpenCode Go/Zen gateways: their docs require a session header there, while
+/// other providers must not receive it.
+pub(crate) fn is_opencode_host(base_url: &str) -> bool {
+    Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
+}
+
+/// Attach `x-opencode-session` when talking to an OpenCode gateway; every other
+/// provider gets the request untouched. A fixed fallback covers sessionless
+/// utility calls (model listing).
+pub(crate) fn identity_headers(
+    request: reqwest::RequestBuilder,
+    config: &ChatConfig,
+) -> reqwest::RequestBuilder {
+    if is_opencode_host(&config.base_url) {
+        request.header(
+            "x-opencode-session",
+            config.session.as_deref().unwrap_or("maestro-utility"),
+        )
+    } else {
+        request
     }
 }
 
@@ -268,6 +297,14 @@ pub(crate) async fn stream_common(
         let chunk = tokio::select! {
             biased;
             _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+            // Watch notifications can be missed around receiver clones; polling
+            // the value guarantees stop within 250ms regardless.
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if *cancel.borrow() {
+                    return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
+                }
+                continue;
+            }
             chunk = tokio::time::timeout(CHUNK_TIMEOUT, body.next()) => chunk.map_err(|_| "等待模型 token 超时".to_string())?,
         };
         match chunk {
@@ -297,6 +334,8 @@ pub(crate) async fn stream_common(
 pub(crate) fn http_client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // OpenCode (and similar gateways) reject generic SDK/HTTP-library UAs.
+        .user_agent(concat!("Maestro-Agent/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -316,6 +355,7 @@ mod tests {
             provider: Provider::Openai,
             reasoning: None,
             max_output: None,
+            session: None,
         };
         assert_eq!(
             config.validate().unwrap().as_str(),
@@ -331,5 +371,45 @@ mod tests {
             assert!(config.validate().is_err());
         }
         assert!(crate::domain::validate_messages(&[ChatMessage::text("system", "bypass")]).is_err());
+    }
+
+    fn config_for(base_url: &str, session: Option<&str>) -> ChatConfig {
+        ChatConfig {
+            api_key: "test-secret".into(),
+            base_url: base_url.into(),
+            model: "test-model".into(),
+            provider: Provider::Openai,
+            reasoning: None,
+            max_output: None,
+            session: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn opencode_gateway_gets_a_stable_session_header() {
+        assert!(is_opencode_host("https://opencode.ai/zen/go/v1"));
+        assert!(is_opencode_host("https://sub.opencode.ai/v1"));
+        assert!(!is_opencode_host("https://api.openai.com/v1"));
+        assert!(!is_opencode_host("https://notopencode.ai/v1"));
+
+        let client = reqwest::Client::new();
+        let url = "https://opencode.ai/zen/go/v1/chat/completions";
+        let opencode = config_for("https://opencode.ai/zen/go/v1", Some("maestro-7"));
+        let request = identity_headers(client.post(url), &opencode)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("x-opencode-session").unwrap(), "maestro-7");
+
+        let fallback = config_for("https://opencode.ai/zen/go/v1", None);
+        let request = identity_headers(client.post(url), &fallback)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("x-opencode-session").unwrap(), "maestro-utility");
+
+        let other = config_for("https://api.openai.com/v1", Some("maestro-7"));
+        let request = identity_headers(client.post(url), &other)
+            .build()
+            .unwrap();
+        assert!(request.headers().get("x-opencode-session").is_none());
     }
 }

@@ -15,14 +15,15 @@ beforeEach(() => localStorage.clear());
 
 it('shows explicit preview data without making Rust calls or enabling backend mutations', () => {
   render(<PreviewApp />);
+  fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
   expect(screen.getByText('Frontend preview')).toBeInTheDocument();
   expect(screen.getByText('示例数据 · 无 Rust IPC')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '批准计划' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '在项目 Maestro-Agent 下新建会话' })).toBeEnabled();
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
-  expect(screen.getByRole('tab', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('data-state', 'active');
-  fireEvent.keyDown(screen.getByRole('tab', { name: 'tests/BridgeSession.test.cpp' }), { key: 'Enter' });
+  expect(screen.getByRole('button', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('aria-pressed', 'true');
+  fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   expect(screen.getByLabelText('Diff tests/BridgeSession.test.cpp')).toHaveTextContent('stop_is_idempotent');
   fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toHaveAttribute('aria-pressed', 'true');
@@ -69,7 +70,8 @@ it('filters the current project session list by search query', () => {
 
 it('routes Activity to the middle dashboard, keeps Diff state, and restores chat without a modal', async () => {
   render(<PreviewApp />);
-  fireEvent.keyDown(screen.getByRole('tab', { name: 'tests/BridgeSession.test.cpp' }), { key: 'Enter' });
+  fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+  fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   fireEvent.keyDown(screen.getByRole('tab', { name: '行内差异' }), { key: 'Enter' });
   const activity = screen.getByRole('button', { name: 'Activity' });
   expect(activity).toHaveTextContent('120 lines today');
@@ -83,7 +85,7 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   expect(within(dashboard).getByLabelText('Tokens Used（Mock）')).toHaveTextContent('1.2M');
   expect(within(dashboard).getByLabelText('Cost（Mock）')).toHaveTextContent('$3.50');
   expect(screen.getByRole('tab', { name: '行内差异' })).toHaveAttribute('data-state', 'active');
-  expect(screen.getByRole('tab', { name: 'tests/BridgeSession.test.cpp' })).toHaveAttribute('data-state', 'active');
+  expect(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' })).toHaveAttribute('aria-pressed', 'true');
   const today = dashboard.querySelector('[data-heatmap-day="2026-11-08"]')!;
   fireEvent.focus(today);
   expect(await screen.findByRole('tooltip')).toHaveTextContent('修改 120 行代码');
@@ -146,13 +148,17 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
 
 it('switches Review/Explorer, folds folders and preserves virtual extension states', () => {
   render(<PreviewApp />);
-  fireEvent.keyDown(screen.getByRole('tab', { name: 'Explorer' }), { key: 'Enter' });
+  fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+  fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
+  fireEvent.click(screen.getByRole('menuitem', { name: /Explorer/ }));
   expect(screen.getByLabelText('文件浏览器')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /BridgeSession.cpp/ }));
   expect(screen.getByLabelText('文件预览 src/bridge/BridgeSession.cpp')).toHaveTextContent('void BridgeSession::stop');
   fireEvent.click(screen.getByRole('button', { name: '文件夹 bridge' }));
   expect(screen.getByRole('button', { name: '文件夹 bridge' })).toHaveAttribute('aria-expanded', 'false');
-  fireEvent.keyDown(screen.getByRole('tab', { name: 'Review' }), { key: 'Enter' });
+  fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
+  fireEvent.click(screen.getByRole('menuitem', { name: /Changes/ }));
+  fireEvent.click(screen.getByRole('button', { name: 'src/bridge/BridgeSession.h' }));
   expect(screen.getByLabelText('Diff src/bridge/BridgeSession.h')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
   expect(screen.getByLabelText('Extensions 工作区')).toBeInTheDocument();

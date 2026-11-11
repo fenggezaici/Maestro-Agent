@@ -46,7 +46,7 @@ export async function loadCatalog(): Promise<CatalogModel[]> {
 
 /// Exact id, then provider-prefix-stripped match (`deepseek/deepseek-r1` → `deepseek-r1`).
 export function catalogLookup(model: string): CatalogModel | null {
-  const trimmed = model.trim();
+  const trimmed = (model ?? '').trim();
   if (!trimmed) return null;
   const list = readCatalog();
   const exact = list.find((item) => item.id === trimmed);
@@ -95,7 +95,7 @@ const BUDGET_LEVELS: ThinkingLevel[] = ['low', 'medium', 'high'];
 /// models.dev catalog → built-in static table → unknown. Nothing is invented.
 export function resolveCapability(model: string, provider: ProviderId | (string & {})): ModelCapability {
   const base = modelCapability(model, provider);
-  const override = capabilityOverrides(provider)[model.trim()];
+  const override = capabilityOverrides(provider)[(model ?? '').trim()];
   const fetched = fetchedContext(model, provider);
   const catalog = catalogLookup(model);
 

@@ -7,6 +7,7 @@ vi.mock('./api/workspace', () => ({ workspaceApi: api }));
 
 beforeEach(() => {
   localStorage.clear();
+  vi.clearAllMocks();
   api.info.mockResolvedValue({ name: 'A', path: '/project-a' });
   api.select.mockImplementation(async (path: string) => ({ name: path, path }));
   api.tree.mockResolvedValue([{ name: 'file.ts', path: 'file.ts', is_dir: false, children: [] }]);
@@ -39,9 +40,19 @@ it('ignores a delayed file from an old workspace and never falls back to sample 
   expect(hook.result.current.file?.id).toContain('/project-b');
   api.tree.mockRejectedValueOnce(new Error('permission denied'));
   await act(async () => { await hook.result.current.refresh(); });
-  expect(hook.result.current.tree).toEqual([]);
-  expect(hook.result.current.file).toBeNull();
+  expect(hook.result.current.tree).toHaveLength(1);
+  expect(hook.result.current.file?.content).toBe('new content');
   expect(hook.result.current.error).toBe('permission denied');
+});
+
+it('reuses the cached tree instead of rescanning until a forced refresh', async () => {
+  const hook = renderHook(() => useWorkspace(true));
+  await waitFor(() => expect(hook.result.current.tree).toHaveLength(1));
+  expect(api.tree).toHaveBeenCalledTimes(1);
+  await act(async () => { await hook.result.current.load(); });
+  expect(api.tree).toHaveBeenCalledTimes(1);
+  await act(async () => { await hook.result.current.refresh(); });
+  expect(api.tree).toHaveBeenCalledTimes(2);
 });
 
 it('ignores an old file error after a newer selection succeeds', async () => {

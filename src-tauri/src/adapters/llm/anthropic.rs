@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, watch};
 use crate::domain::{AppResult, ChatMessage, ToolCallSpec, ToolSpec};
 
 use super::{
-    http_client, stream_common, wire_tools, ChatConfig, Frame, FrameParser, LlmProvider,
-    StreamEvent, TurnOutcome,
+    http_client, identity_headers, stream_common, wire_tools, ChatConfig, Frame, FrameParser,
+    LlmProvider, StreamEvent, TurnOutcome,
 };
 
 pub struct AnthropicProvider;
@@ -113,12 +113,15 @@ impl LlmProvider for AnthropicProvider {
             let mut key = reqwest::header::HeaderValue::from_str(config.api_key.trim())
                 .map_err(|_| "Invalid Anthropic API key header")?;
             key.set_sensitive(true);
-            let request = client
-                .post(url)
-                .header("Accept", "text/event-stream")
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&payload);
+            let request = identity_headers(
+                client
+                    .post(url)
+                    .header("Accept", "text/event-stream")
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01"),
+                config,
+            )
+            .json(&payload);
             let mut parser = AnthropicParser::default();
             stream_common(config, request, &mut parser, cancel, events).await
         })

@@ -107,20 +107,39 @@ pub fn scoped_write_path(root: &Path, rel: &str) -> AppResult<PathBuf> {
     Ok(full)
 }
 
+/// A completed workspace write: the model-facing summary plus the
+/// before/after contents the UI needs to render a mini diff.
+pub struct WriteReport {
+    pub path: String,
+    pub summary: String,
+    pub before: String,
+    pub after: String,
+}
+
 /// `write_file` tool body: create or overwrite a text file inside the workspace.
-pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<String> {
+pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<WriteReport> {
     if content.len() > MAX_FILE_BYTES as usize {
         return Err("内容超过 256KB 限制".into());
     }
     let file = scoped_write_path(root, rel)?;
+    let before = if file.is_file() {
+        read_file(root, rel).unwrap_or_default()
+    } else {
+        String::new()
+    };
     std::fs::write(&file, content).map_err(|_| "文件写入失败".to_string())?;
-    Ok(format!("已写入 {}（{} bytes）", rel, content.len()))
+    Ok(WriteReport {
+        path: rel.to_string(),
+        summary: format!("已写入 {}（{} bytes）", rel, content.len()),
+        before,
+        after: content.to_string(),
+    })
 }
 
 /// `apply_patch` tool body: exact-match replacement. `before` must occur
 /// exactly once in the file; an empty `before` creates a new file with
 /// `after` as its content (the target must not exist yet).
-pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResult<String> {
+pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResult<WriteReport> {
     if after.len() > MAX_FILE_BYTES as usize {
         return Err("内容超过 256KB 限制".into());
     }
@@ -130,7 +149,12 @@ pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResu
             return Err("目标文件已存在，无法新建".into());
         }
         std::fs::write(&file, after).map_err(|_| "文件写入失败".to_string())?;
-        return Ok(format!("已新建 {}（{} bytes）", rel, after.len()));
+        return Ok(WriteReport {
+            path: rel.to_string(),
+            summary: format!("已新建 {}（{} bytes）", rel, after.len()),
+            before: String::new(),
+            after: after.to_string(),
+        });
     }
     let current = read_file(root, rel)?;
     let matches = current.matches(before).count();
@@ -143,7 +167,12 @@ pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResu
     }
     let file = scoped_write_path(root, rel)?;
     std::fs::write(&file, &updated).map_err(|_| "文件写入失败".to_string())?;
-    Ok(format!("已修改 {}（{} → {} bytes）", rel, current.len(), updated.len()))
+    Ok(WriteReport {
+        path: rel.to_string(),
+        summary: format!("已修改 {}（{} → {} bytes）", rel, current.len(), updated.len()),
+        before: current,
+        after: updated,
+    })
 }
 
 #[cfg(test)]

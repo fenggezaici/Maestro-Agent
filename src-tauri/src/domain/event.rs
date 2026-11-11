@@ -50,6 +50,8 @@ pub enum EventData {
         plan: PlanCard,
     },
     SessionsChanged,
+    /// A side-effecting tool finished — the workspace tree should re-scan.
+    WorkspaceChanged,
     /// Streamed answer text.
     Content {
         #[serde(rename = "runId")]

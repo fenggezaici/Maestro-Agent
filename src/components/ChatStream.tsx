@@ -1,17 +1,16 @@
 /// Dumb chat stream: renders conversation turns, tool-call blocks, reasoning
 /// panes and plan cards. Everything arrives as props — no IPC, no stores.
-import type { RefObject } from 'react';
-import { BrainCircuit, Copy, ShieldCheck, Sparkles, WandSparkles } from 'lucide-react';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
+import { BrainCircuit, Copy, Pencil, WandSparkles } from 'lucide-react';
 
-import type { PlanCard as Plan, PlanDecision, RunStatus, RunView, ToolCallView } from '../api/types';
+import type { PlanCard as Plan, PlanDecision, RunView, ToolCallView } from '../api/types';
+import type { ReasoningSegment, TimelineItem } from '../lib/conversation';
 import type { UiPreferences } from '../uiPreferences';
 import CollapsibleBlock from './CollapsibleBlock';
 import PlanCard from './PlanCard';
-import ToolCallBlocks from './ToolCallBlocks';
+import ToolCallBlocks, { ToolCallRow } from './ToolCallBlocks';
 import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
-
-const statusLabels: Record<RunStatus, string> = { running: '正在生成', completed: '已完成', cancelled: '已停止', failed: '失败' };
 
 /// Models without `reasoning_content` emit inline <think>…</think> blocks —
 /// pull them into the reasoning pane instead of the answer body.
@@ -28,15 +27,40 @@ function cleanRunOutput(text: string): string {
   return text.replace(/(^|\n)> (?:调用工具|工具调用（?)：?(?!预算已用尽)[^\n]*/g, '$1').trimStart();
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveReasoning, liveReasoningMs, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onResolveApproval }: {
+/// Reasoning body: the `<p>` is its own scroll container (max-height 250px).
+/// Follow new tokens while streaming, but stop fighting the user the moment
+/// they scroll up — resuming once they are back at the bottom.
+function ReasoningText({ text, streaming }: { text: string; streaming: boolean }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const stick = useRef(true);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element && streaming && stick.current) element.scrollTop = element.scrollHeight;
+  }, [text, streaming]);
+  return <p ref={ref} onScroll={(event) => {
+    const element = event.currentTarget;
+    stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+  }}>{text}</p>;
+}
+
+/// One thinking burst in the timeline: expanded and auto-following while it is
+/// live, collapsed to a single row (`思考 · 持续了 X 秒`) once it ends.
+function ReasoningNode({ segment, display }: { segment: ReasoningSegment; display: UiPreferences['reasoningDisplay'] }) {
+  if (display === 'hidden') return null;
+  const active = segment.endedAt === undefined;
+  const seconds = active ? 0 : Math.max(1, Math.round((segment.endedAt! - segment.startedAt) / 1000));
+  return <CollapsibleBlock title={active ? '思考 · 进行中…' : `思考 · 持续了 ${seconds} 秒`} icon={<BrainCircuit size={13} />}
+    open={active ? true : undefined} contentClass="reasoning-content"><ReasoningText text={segment.text} streaming={active} /></CollapsibleBlock>;
+}
+
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
   loadingSession: boolean;
   detailTools: ToolCallView[] | undefined;
   liveTools?: Record<number, ToolCallView[]>;
-  liveReasoning?: Record<number, string>;
-  liveReasoningMs?: Record<number, number>;
+  liveTimeline?: Record<number, TimelineItem[]>;
   plans: Plan[];
   reasoningDisplay: UiPreferences['reasoningDisplay'];
   theme: string;
@@ -46,40 +70,105 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onCopyError: (message: string) => void;
   onReviewPlan: (id: number) => void;
   onDecidePlan: (plan: Plan, decision: PlanDecision) => void;
-  onResolveApproval?: (runId: number, approved: boolean) => void;
+  onSelectFile?: (path: string) => void;
+  onEditPrompt?: (text: string) => void;
+  onJumpToTurn?: (runId: number) => void;
 }) {
-  return <div ref={historyRef} className="chat-history" aria-label="对话消息" onScroll={onScroll}>
-    <div className="chat-history-inner">
-      {runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>What should we build?</h3><p>描述你的任务。Agent 会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
-      {loadingSession && runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
-      {runs.map((run) => <section key={run.id} className="conversation-turn" aria-label={`对话轮次 ${run.id}`}>
-        <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><button type="button" className="user-copy-button" aria-label={`复制用户消息 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.prompt); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
-        {(() => { const live = liveTools?.[run.id] ?? [];
-          // Live event rows already cover this run's calls; the DB audit
-          // snapshot would duplicate them, so prefer live whenever present.
-          const calls = live.length ? live : (detailTools ?? []).filter((call) => call.runId === run.id);
-          return calls.length > 0 && <ToolCallBlocks calls={calls} onResolveApproval={preview ? undefined : onResolveApproval} />; })()}
+  const railRef = useRef<HTMLElement>(null);
+  const [activeRunId, setActiveRunId] = useState<number | null>(null);
+  const turnKey = runs.map((run) => run.id).join(',');
+
+  // Current turn = the last one whose top has crossed the viewport top.
+  useEffect(() => {
+    const root = historyRef.current;
+    if (!root || !turnKey) return;
+    let frame = 0;
+    const update = () => {
+      const rootTop = root.getBoundingClientRect().top;
+      const nodes = root.querySelectorAll<HTMLElement>('[data-turn-id]');
+      let active: number | null = null;
+      for (const node of nodes) {
+        if (node.getBoundingClientRect().top <= rootTop + 48) active = Number(node.dataset.turnId);
+        else break;
+      }
+      if (active === null && nodes.length) active = Number(nodes[0].dataset.turnId);
+      setActiveRunId((current) => (current === active ? current : active));
+    };
+    const handleScroll = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; update(); });
+    };
+    update();
+    root.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      root.removeEventListener('scroll', handleScroll);
+    };
+  }, [historyRef, turnKey]);
+
+  // Keep the active tick visible when a long conversation scrolls.
+  useEffect(() => {
+    const rail = railRef.current;
+    const active = rail?.querySelector<HTMLElement>('[aria-current="location"]');
+    if (!rail || !active) return;
+    const top = active.offsetTop;
+    const bottom = top + active.offsetHeight;
+    if (top < rail.scrollTop) rail.scrollTop = top;
+    else if (bottom > rail.scrollTop + rail.clientHeight) rail.scrollTop = bottom - rail.clientHeight;
+  }, [activeRunId]);
+
+  return <div className={`chat-history-shell ${runs.length > 1 ? 'has-rail' : ''}`}>
+    {runs.length > 1 && <nav ref={railRef} className="chat-turn-rail" aria-label="对话轮次导航">
+      {runs.map((run, index) => <button key={run.id} type="button" className="chat-turn-tick"
+        aria-current={activeRunId === run.id ? 'location' : undefined}
+        aria-label={`跳转到第 ${index + 1} 轮：${run.prompt.replace(/\s+/g, ' ').slice(0, 80)}`}
+        title={run.prompt.slice(0, 200)}
+        onClick={() => onJumpToTurn?.(run.id)}><span aria-hidden="true" /></button>)}
+    </nav>}
+    <div ref={historyRef} className="chat-history" aria-label="对话消息" onScroll={onScroll}>
+      <div className="chat-history-inner">
+        {runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>What should we build?</h3><p>描述你的任务。Agent 会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
+        {loadingSession && runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
+        {runs.map((run) => <section key={run.id} className="conversation-turn" data-turn-id={run.id} aria-label={`对话轮次 ${run.id}`}>
+          <div className="user-message-group">
+            <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
+            <div className="user-message-actions">
+              <button type="button" className="message-action" aria-label={`复制用户消息 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.prompt); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button>
+              {onEditPrompt && <button type="button" className="message-action" aria-label={`编辑用户消息 ${run.id}`} onClick={() => onEditPrompt(run.prompt)}><Pencil size={12} /></button>}
+            </div>
+          </div>
         {(() => {
           const { reasoning: inlineReasoning, content } = extractReasoning(run.output || '');
-          const reasoning = (liveReasoning?.[run.id] ?? '') + inlineReasoning;
           const body = cleanRunOutput(content);
-          const thinking = run.status === 'running' && body === '';
-          const elapsed = liveReasoningMs?.[run.id];
-          const title = thinking ? '思考过程 · 思考中…' : elapsed !== undefined ? `思考过程 · 耗时 ${Math.max(1, Math.round(elapsed / 1000))} 秒` : '思考过程';
+          const liveCalls = liveTools?.[run.id] ?? [];
+          const calls = liveCalls.length ? liveCalls : (detailTools ?? []).filter((call) => call.runId === run.id);
+          const timeline = liveTimeline?.[run.id];
+          // Historical runs have no persisted segmentation: fall back to the
+          // audit tool list plus one inline-thinking block.
           return <>
-            {reasoning && reasoningDisplay !== 'hidden' &&
-              <CollapsibleBlock title={title} icon={<BrainCircuit size={13} />} open={thinking ? true : undefined} defaultOpen={reasoningDisplay === 'summary'}
-                contentClass={`reasoning-content ${reasoningDisplay === 'summary' ? 'reasoning-clamp' : ''}`}><p>{reasoning}</p></CollapsibleBlock>}
+            {timeline?.length
+              ? <div className="reasoning-timeline" aria-label={`思考与工具时间线 ${run.id}`}>
+                {timeline.map((item, index) => {
+                  if (item.kind === 'reasoning') return <ReasoningNode key={`r${index}`} segment={item.segment} display={reasoningDisplay} />;
+                  const call = liveCalls[item.index];
+                  return call ? <div key={`t${index}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} /></div> : null;
+                })}
+              </div>
+              : <>
+                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} />}
+                {inlineReasoning && reasoningDisplay !== 'hidden' &&
+                  <CollapsibleBlock title="思考" icon={<BrainCircuit size={13} />} contentClass="reasoning-content"><ReasoningText text={inlineReasoning} streaming={false} /></CollapsibleBlock>}
+              </>}
             {(body !== '' || run.status !== 'running') &&
               <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
           </>;
         })()}
-        <article aria-label={`Agent 回复 ${run.id}`} className="agent-message"><div className="message-meta"><span className="agent-avatar"><Sparkles size={14} strokeWidth={1.5} /></span><strong>Maestro</strong><span className="message-model">Agent</span><button type="button" className="user-copy-button" aria-label={`复制回复 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.output); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{statusLabels[run.status]}</span></div>
+        <article aria-label={`Agent 回复 ${run.id}`} className="agent-message">
           {run.error && <p className="error-message">{run.error}</p>}
           {plans.filter((plan) => plan.runId === run.id).map((plan) => <PlanCard key={plan.id} plan={plan} preview={preview} canDecide={!preview && run.status === 'completed'} pending={pending} onReview={onReviewPlan} onDecision={(_id, decision) => { if (!preview) onDecidePlan(plan, decision); }} />)}
-          <div className="message-footnote"><ShieldCheck size={12} />{preview ? '示例对话 · 不执行任何操作' : '模型回复 · 不执行工具或应用修改'}</div>
         </article>
       </section>)}
+      </div>
     </div>
   </div>;
 }

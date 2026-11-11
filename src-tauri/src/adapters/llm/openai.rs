@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, watch};
 use crate::domain::{AppResult, ChatMessage, ToolCallSpec, ToolSpec};
 
 use super::{
-    http_client, stream_common, wire_tools, ChatConfig, Frame, FrameParser, LlmProvider,
-    StreamEvent, TurnOutcome,
+    http_client, identity_headers, stream_common, wire_tools, ChatConfig, Frame, FrameParser,
+    LlmProvider, StreamEvent, TurnOutcome,
 };
 
 pub struct OpenAiProvider;
@@ -83,9 +83,10 @@ impl LlmProvider for OpenAiProvider {
                 }
                 payload["reasoning_effort"] = level.clone().into();
             }
-            let mut request = client
-                .post(url)
-                .header("Accept", "text/event-stream");
+            let mut request = identity_headers(
+                client.post(url).header("Accept", "text/event-stream"),
+                config,
+            );
             if !config.api_key.is_empty() {
                 request = request.bearer_auth(config.api_key.trim());
             }

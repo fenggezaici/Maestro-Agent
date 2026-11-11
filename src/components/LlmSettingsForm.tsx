@@ -38,7 +38,9 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
     try {
       const list = await fetchModelsApi(provider, values.baseUrl, values.apiKey);
       saveFetchedModels(provider, list);
-      persist(mergeFetched(provider, list));
+      const merged = mergeFetched(provider, list);
+      persist(merged);
+      if (!(values.model ?? '').trim() && merged.length > 0) setValues((current) => ({ ...current, model: merged[0].id }));
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法拉取模型列表'); }
     finally { setFetching(false); }
   }
@@ -46,14 +48,15 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (preview) return;
-    try { saveLlmSettings(values); setError(null); onSaved(); void pull(); } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置'); }
+    const model = (values.model ?? '').trim() || models[0]?.id || '';
+    try { saveLlmSettings({ ...values, model }); setError(null); onSaved(); void pull(); } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置'); }
   }
 
   return <form className="llm-settings-form" onSubmit={submit}>
     <div className="settings-section-label"><KeyRound size={13} />{getProvider(provider).name} / {provider === 'anthropic' ? 'Messages API' : 'OpenAI-compatible API'}</div>
-    <label htmlFor="llm-base-url">Base URL</label><input id="llm-base-url" autoComplete="off" spellCheck={false} value={values.baseUrl} disabled={preview}
+    <label htmlFor="llm-base-url">Base URL</label><input id="llm-base-url" autoComplete="off" spellCheck={false} value={values.baseUrl ?? ''} disabled={preview}
       onChange={(event) => setValues({ ...values, baseUrl: event.target.value })} placeholder="https://your-provider.example/v1" />
-    <label htmlFor="llm-api-key">API Key</label><div className="secret-input"><input id="llm-api-key" type={showKey ? 'text' : 'password'} autoComplete="off" spellCheck={false} value={values.apiKey} disabled={preview}
+    <label htmlFor="llm-api-key">API Key</label><div className="secret-input"><input id="llm-api-key" type={showKey ? 'text' : 'password'} autoComplete="off" spellCheck={false} value={values.apiKey ?? ''} disabled={preview}
       onChange={(event) => setValues({ ...values, apiKey: event.target.value })} placeholder="Enter your API key" />
       <button type="button" className="icon-button" aria-label={showKey ? '隐藏 API Key' : '显示 API Key'} disabled={preview} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={14} /> : <Eye size={14} />}</button></div>
 
@@ -87,6 +90,7 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
       if (!preview) clearRemoved(provider, row.id);
       const exists = models.some((item) => item.id === row.id);
       persist(exists ? models.map((item) => item.id === row.id ? row : item) : [...models, row]);
+      if (!(values.model ?? '').trim()) setValues((current) => ({ ...current, model: row.id }));
       setEditing(null);
     }} />
   </form>;
@@ -106,9 +110,9 @@ function ModelEditDialog({ editing, onClose, onSave }: {
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
       <Dialog.Content className="project-dialog" aria-describedby={undefined}>
         <Dialog.Title asChild><h3>{isNew ? '添加模型' : '编辑模型配置'}</h3></Dialog.Title>
-        <form onSubmit={(event) => { event.preventDefault(); if (draft.id.trim()) onSave({ ...draft, id: draft.id.trim() }); }}>
+        <form onSubmit={(event) => { event.preventDefault(); if ((draft.id ?? '').trim()) onSave({ ...draft, id: (draft.id ?? '').trim() }); }}>
           <label htmlFor="model-edit-id">模型 ID</label>
-          <input id="model-edit-id" autoComplete="off" spellCheck={false} autoFocus value={draft.id} maxLength={128}
+          <input id="model-edit-id" autoComplete="off" spellCheck={false} autoFocus value={draft.id ?? ''} maxLength={128}
             onChange={(event) => setDraft({ ...draft, id: event.target.value })} placeholder="deepseek-v4.1-flash" />
           <label htmlFor="model-edit-context">上下文窗口</label>
           <input id="model-edit-context" autoComplete="off" inputMode="numeric" spellCheck={false}
@@ -121,7 +125,7 @@ function ModelEditDialog({ editing, onClose, onSave }: {
           <Choice label="思考类型" value={draft.reasoning ?? 'auto'} onChange={(value) => setDraft({ ...draft, reasoning: value === 'auto' ? undefined : value as ReasoningKind })} options={REASONING_OPTIONS} />
           <div className="dialog-actions">
             <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
-            <button type="submit" className="button-approve" disabled={!draft.id.trim()}>保存</button>
+            <button type="submit" className="button-approve" disabled={!(draft.id ?? '').trim()}>保存</button>
           </div>
         </form>
         <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>

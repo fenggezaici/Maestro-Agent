@@ -13,13 +13,14 @@ export interface WorkspaceStore {
   info: WorkspaceInfo | null;
   tree: FileNode[];
   loading: boolean;
+  refreshing: boolean;
   error: string | null;
   file: ExplorerFile | null;
   fileLoading: boolean;
   fileError: string | null;
   selectedPath: string | null;
 
-  load: (path?: string) => Promise<void>;
+  load: (path?: string, options?: { force?: boolean }) => Promise<void>;
   selectWorkspace: (path: string) => Promise<void>;
   refresh: () => Promise<void>;
   selectFile: (path: string) => Promise<void>;
@@ -31,40 +32,60 @@ let fileRevision = 0;
 let mounted = false;
 let root: WorkspaceInfo | null = null;
 let initialized = false;
+/// Last successful scan, keyed by resolved workspace path. Re-opening the
+/// Explorer (or remounting the hook) rehydrates from here instead of rescanning.
+let cached: { path: string; tree: FileNode[] } | null = null;
 
 export const useWorkspaceStore = create<WorkspaceStore>()((set, get) => ({
   info: null,
   tree: [],
   loading: false,
+  refreshing: false,
   error: null,
   file: null,
   fileLoading: false,
   fileError: null,
   selectedPath: null,
 
-  load: async (path?: string) => {
+  load: async (path?: string, options?: { force?: boolean }) => {
+    const force = options?.force === true;
+    // Only a genuinely different root invalidates the visible tree; a cached
+    // path keeps it on screen while the (cheap) select round-trip runs.
+    const switching = path !== undefined && path !== cached?.path;
     const revision = ++treeRevision;
-    fileRevision++;
-    root = null;
-    set({ loading: true, error: null, tree: [], file: null, fileError: null, fileLoading: false, selectedPath: null, info: null });
+    // Keep the previous root during a background refresh so an open file
+    // preview keeps working; only a root switch invalidates it.
+    if (switching) { root = null; fileRevision++; }
+    set({
+      loading: switching || !cached,
+      refreshing: !switching && !!cached && force,
+      error: null,
+      ...(switching ? { info: null, tree: [], file: null, fileLoading: false, fileError: null, selectedPath: null } : {}),
+    });
     try {
       const workspace = path ? await workspaceApi.select(path) : await workspaceApi.info();
       if (!mounted || revision !== treeRevision) return;
       root = workspace;
       set({ info: workspace });
       if (path) { try { localStorage.setItem(SAVED_PATH, workspace.path ?? ''); } catch { /* Selection still succeeded in Rust. */ } }
-      if (!workspace.path) return;
+      if (!workspace.path) { cached = null; set({ tree: [] }); return; }
+      if (!force && cached?.path === workspace.path) { set({ tree: cached.tree }); return; }
       const nodes = await workspaceApi.tree(workspace.path);
-      if (mounted && revision === treeRevision) set({ tree: nodes });
+      if (mounted && revision === treeRevision) {
+        cached = { path: workspace.path, tree: nodes };
+        set({ tree: nodes });
+      }
     } catch (reason) {
+      // Keep the last successful tree so a failed background refresh does not
+      // blank the explorer; the error message explains what happened.
       if (mounted && revision === treeRevision) set({ error: errorMessage(reason) });
     } finally {
-      if (mounted && revision === treeRevision) set({ loading: false });
+      if (mounted && revision === treeRevision) set({ loading: false, refreshing: false });
     }
   },
 
   selectWorkspace: (path) => get().load(path),
-  refresh: () => get().load(),
+  refresh: () => get().load(undefined, { force: true }),
 
   selectFile: async (path: string) => {
     const workspace = root;
@@ -89,8 +110,9 @@ export const useWorkspaceStore = create<WorkspaceStore>()((set, get) => ({
     treeRevision++;
     fileRevision++;
     root = null;
+    cached = null;
     set({
-      info: null, tree: [], loading: false, error: null,
+      info: null, tree: [], loading: false, refreshing: false, error: null,
       file: null, fileLoading: false, fileError: null, selectedPath: null,
     });
   },

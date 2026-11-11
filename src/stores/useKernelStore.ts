@@ -11,8 +11,8 @@ import type {
   SessionDetail, SessionView, Snapshot, ToolCallView,
 } from '../api/types';
 import {
-  applyToolEvent, chatMessages, conversationRuns, errorMessage, initialSnapshot,
-  kernelReducer, type KernelAction,
+  appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
+  conversationRuns, errorMessage, initialSnapshot, kernelReducer, type KernelAction, type TimelineItem,
 } from '../lib/conversation';
 import { readLlmSettings, validateLlmSettings } from '../settings';
 
@@ -27,9 +27,13 @@ export interface KernelStore {
   pending: boolean;
   metrics: Record<number, RunMetrics>;
   liveTools: Record<number, ToolCallView[]>;
-  liveReasoning: Record<number, string>;
-  /** Reasoning phase duration (ms) once the first content token arrives. */
-  liveReasoningMs: Record<number, number>;
+  /// Bumped on every `workspace_changed` kernel event — workspace views
+  /// subscribe and refresh their tree/preview without polling.
+  workspaceTick: number;
+  /** Ordered reasoning bursts and tool rows for the live run. */
+  liveTimeline: Record<number, TimelineItem[]>;
+  /** Run whose stop was requested but not yet acknowledged by the backend. */
+  stoppingRunId: number | null;
   /** true while the agent stream connection is mounted. */
   connected: boolean;
 
@@ -72,9 +76,6 @@ let pendingCount = 0;
 let selectedRef: number | null = null;
 let activeProjectRef: number | null = null;
 let mounted = false;
-// Thinking-phase timing per run: start recorded on the first reasoning event,
-// duration frozen on the first content event. Not reactive state.
-const reasoningStart: Record<number, number> = {};
 
 export const useKernelStore = create<KernelStore>()((set, get) => {
   const setError = (error: string | null) => set({ error });
@@ -162,40 +163,60 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     pending: false,
     metrics: {},
     liveTools: {},
-    liveReasoning: {},
-    liveReasoningMs: {},
+    workspaceTick: 0,
+    liveTimeline: {},
+    stoppingRunId: null,
     connected: false,
 
-    dispatch: (action) => set((s) => ({ state: kernelReducer(s.state, action) })),
+    dispatch: (action) => {
+      // Hard stop: once the user pressed stop, ignore that run's answer tokens
+      // immediately instead of waiting for the backend acknowledgement.
+      if (action.type === 'event' && action.event.type === 'content' && get().stoppingRunId === action.event.runId) return;
+      set((s) => ({ state: kernelReducer(s.state, action) }));
+    },
 
     applySideEffects: (event) => {
       if (event.type === 'metrics') {
         set((s) => ({ metrics: { ...s.metrics, [event.metrics.runId]: event.metrics } }));
       }
       if (event.type === 'tool_call') {
-        set((s) => ({ liveTools: applyToolEvent(s.liveTools, event) }));
+        if (get().stoppingRunId === event.runId) return;
+        set((s) => {
+          const { next, index } = applyToolEventIndexed(s.liveTools, event);
+          return {
+            liveTools: next,
+            liveTimeline: { ...s.liveTimeline, [event.runId]: appendTool(s.liveTimeline[event.runId], index, Date.now()) },
+          };
+        });
+      }
+      if (event.type === 'workspace_changed') {
+        set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
       }
       if (event.type === 'reasoning') {
-        if (reasoningStart[event.runId] === undefined) reasoningStart[event.runId] = Date.now();
-        set((s) => ({ liveReasoning: { ...s.liveReasoning, [event.runId]: (s.liveReasoning[event.runId] ?? '') + event.token } }));
+        if (get().stoppingRunId === event.runId) return;
+        set((s) => ({ liveTimeline: { ...s.liveTimeline, [event.runId]: appendReasoning(s.liveTimeline[event.runId], event.token, Date.now()) } }));
       }
-      if (event.type === 'content' && reasoningStart[event.runId] !== undefined) {
-        const elapsed = Date.now() - reasoningStart[event.runId];
-        delete reasoningStart[event.runId];
-        set((s) => ({ liveReasoningMs: { ...s.liveReasoningMs, [event.runId]: elapsed } }));
+      if (event.type === 'content') {
+        // The answer started — the current thinking burst is finished.
+        const closed = closeReasoning(get().liveTimeline[event.runId], Date.now());
+        if (closed && closed !== get().liveTimeline[event.runId]) {
+          set((s) => ({ liveTimeline: { ...s.liveTimeline, [event.runId]: closed } }));
+        }
       }
       if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
       if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
       if (event.type === 'status' && event.run.status !== 'running') {
-        // Stream ended: drop the ephemeral thinking block and any pending tool rows.
-        delete reasoningStart[event.run.id];
+        // Stream ended: seal the open thinking burst and settle pending rows.
         set((s) => {
-          const { [event.run.id]: _reasoning, ...liveReasoning } = s.liveReasoning;
           const calls = s.liveTools[event.run.id];
           const liveTools = calls?.some((call) => call.pending)
             ? { ...s.liveTools, [event.run.id]: calls.map((call) => call.pending ? { ...call, pending: undefined, awaitingApproval: undefined } : call) }
             : s.liveTools;
-          return { liveReasoning, liveTools };
+          const closed = closeReasoning(s.liveTimeline[event.run.id], Date.now());
+          const liveTimeline = closed && closed !== s.liveTimeline[event.run.id]
+            ? { ...s.liveTimeline, [event.run.id]: closed }
+            : s.liveTimeline;
+          return { liveTools, liveTimeline, stoppingRunId: s.stoppingRunId === event.run.id ? null : s.stoppingRunId };
         });
       }
     },
@@ -242,8 +263,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         pending: false,
         metrics: {},
         liveTools: {},
-        liveReasoning: {},
-        liveReasoningMs: {},
+        liveTimeline: {},
+        stoppingRunId: null,
         connected: false,
       });
     },
@@ -337,17 +358,33 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     }),
 
     cancel: (runId) => {
-      // Stop the UI immediately — drop the thinking block and pending tool
-      // rows before the backend even acknowledges the abort.
+      // Stop the UI immediately — seal the open thinking burst and settle
+      // pending tool rows before the backend even acknowledges the abort.
       set((s) => {
-        const { [runId]: _reasoning, ...liveReasoning } = s.liveReasoning;
         const calls = s.liveTools[runId];
         const liveTools = calls?.some((call) => call.pending)
           ? { ...s.liveTools, [runId]: calls.map((call) => call.pending ? { ...call, pending: undefined, awaitingApproval: undefined } : call) }
           : s.liveTools;
-        return { liveReasoning, liveTools };
+        const closed = closeReasoning(s.liveTimeline[runId], Date.now());
+        const liveTimeline = closed && closed !== s.liveTimeline[runId]
+          ? { ...s.liveTimeline, [runId]: closed }
+          : s.liveTimeline;
+        return { liveTools, liveTimeline, stoppingRunId: runId };
       });
-      return command(() => kernelApi.abort(runId)).then(() => undefined);
+      // Send the abort immediately: the generic command wrapper would wait for
+      // a snapshot and can be gated by unrelated in-flight commands, leaving
+      // the stop button feeling dead.
+      const abort = () => kernelApi.abort(runId).catch((reason) => { if (mounted) setError(errorMessage(reason)); });
+      void abort();
+      // Retry once if the run is still alive after 1.2s, then surface the
+      // failure instead of leaving the UI silently streaming.
+      window.setTimeout(() => {
+        if (get().state.activeRun?.id === runId) void abort();
+      }, 1200);
+      window.setTimeout(() => {
+        if (get().state.activeRun?.id === runId && mounted) setError('停止请求未生效，请重试或重启客户端');
+      }, 4000);
+      return Promise.resolve();
     },
     resolveApproval: (runId, approved) => command(() => kernelApi.resolveApproval(runId, approved)).then(() => undefined),
     setMode: (mode) => command(() => kernelApi.setMode(mode)).then(() => undefined),

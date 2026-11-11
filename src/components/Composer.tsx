@@ -1,8 +1,9 @@
 /// Dumb composer: prompt input, attachments, mode/project pickers and the
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
-import { useRef, type ChangeEvent, type FormEvent, type RefObject } from 'react';
+import { useEffect, useRef, type ChangeEvent, type FormEvent, type RefObject } from 'react';
 import * as Popover from '@radix-ui/react-popover';
-import { ArrowDown, ArrowUp, ChevronDown, Code2, FolderGit2, ListChecks, Paperclip, ShieldCheck, Square, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, Brain, Check, ChevronDown, Code2, Cog, FileEdit, FolderGit2, ListChecks, Paperclip, Pencil, ShieldAlert, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
+import type { PendingApprovalView } from '../lib/conversation';
 
 import type { Mode, RunMetrics, RunView } from '../api/types';
 import type { UiPreferences } from '../uiPreferences';
@@ -13,7 +14,7 @@ import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import ComposerControls from './ComposerControls';
 import SessionStats from './SessionStats';
 
-export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel }: {
+export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, focusRequest, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, approval, onResolveApproval, status }: {
   atBottom: boolean;
   onScrollBottom: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -23,6 +24,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
   prompt: string;
   onPromptChange: (value: string) => void;
   promptBytes: number;
+  focusRequest?: number;
   preview: boolean;
   mode: Mode;
   onSetMode: (mode: Mode) => void;
@@ -44,9 +46,23 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
   metrics?: Record<number, RunMetrics>;
   context: number | null;
   modelLabel: string;
+  approval?: PendingApprovalView | null;
+  onResolveApproval?: (runId: number, approved: boolean) => void;
+  status?: 'stopping' | 'approval' | 'tool' | 'thinking' | 'working' | null;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
+  const promptInput = useRef<HTMLTextAreaElement>(null);
   const attachmentUrls = useRef(new Set<string>());
+
+  // Editing a past user message refills the prompt; focus and park the caret
+  // at the end so the user can adjust and resend immediately.
+  useEffect(() => {
+    if (!focusRequest) return;
+    const element = promptInput.current;
+    if (!element) return;
+    element.focus();
+    element.setSelectionRange(element.value.length, element.value.length);
+  }, [focusRequest]);
 
   function removeAttachment(id: string) {
     onAttachmentsChange(attachments.filter((item) => {
@@ -72,10 +88,15 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     onAttachmentsChange([...attachments, ...added]); event.target.value = '';
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner"><form onSubmit={onSubmit} className="composer">
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status">{status === 'stopping' ? <Square size={11} /> : status === 'approval' ? <ShieldAlert size={11} /> : status === 'tool' ? <Cog size={11} /> : status === 'thinking' ? <Brain size={11} /> : <Pencil size={11} />}{status === 'stopping' ? '停止中…' : status === 'approval' ? '等待批准…' : status === 'tool' ? '执行工具中…' : status === 'thinking' ? '思考中…' : '生成中…'}</span>}{approval && onResolveApproval && (() => { const previewData = approval.preview; return <div className="composer-approval" role="alert">
+    {previewData?.kind === 'command' ? <SquareTerminal size={12} /> : <FileEdit size={12} />}
+    <span className="composer-approval-text">{approval.count > 1 ? `Maestro 请求应用 ${approval.count} 处修改` : previewData?.kind === 'command' ? `Maestro 请求执行 ${previewData.command}` : previewData?.kind === 'write' ? `Maestro 请求${previewData.exists ? '修改' : '创建'} ${previewData.path}` : `Maestro 请求使用 ${approval.tool}`}</span>
+    <button type="button" aria-label="拒绝工具调用" className="button-ghost" onClick={() => onResolveApproval(approval.runId, false)}><X size={12} />Reject</button>
+    <button type="button" aria-label="批准工具调用" className="button-approve" onClick={() => onResolveApproval(approval.runId, true)}><Check size={12} />Approve</button>
+  </div>; })()}<form onSubmit={onSubmit} className="composer">
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
     <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
-    <textarea aria-label="发送消息" rows={3} value={prompt} onChange={(event) => onPromptChange(event.target.value)} placeholder="描述你的任务... Ctrl+Enter 发送"
+    <textarea ref={promptInput} aria-label="发送消息" rows={3} value={prompt} onChange={(event) => onPromptChange(event.target.value)} placeholder="描述你的任务... Ctrl+Enter 发送"
       disabled={blocked} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
     <div className="composer-toolbar"><IconButton label="添加图片或视频" disabled={!preview && (running || pending)} onClick={() => fileInput.current?.click()}><Paperclip size={17} /></IconButton>
 
@@ -110,7 +131,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
       </Popover.Root>
       <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked} preferences={preferences} onPreferences={onPreferences} settingsVersion={settingsVersion} onError={onError} onCapability={onCapability} />
       <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Ctrl ↵'}</span>
-      {running && !preview ? <IconButton label="停止生成" className="stop-button" disabled={pending} onClick={onCancel}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
+      {running && !preview ? <IconButton label="停止生成" className="stop-button" onClick={onCancel}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
     </div>
   </form><SessionStats runs={runs} metrics={metrics} context={context} /><div className="composer-caption"><span><ShieldCheck size={11} />{preview ? '预览不调用模型；媒体仅本地显示' : '图片/文本附件随消息发送（图片需视觉模型）；视频仅本地预览。'}</span><span>{modelLabel || 'Maestro Agent'}</span></div></div></div>;
 }

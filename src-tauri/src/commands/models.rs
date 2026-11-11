@@ -23,6 +23,7 @@ pub async fn fetch_models(
         provider,
         reasoning: None,
         max_output: None,
+        session: None,
     })
     .await
 }

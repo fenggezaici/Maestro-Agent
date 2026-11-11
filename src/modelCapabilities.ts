@@ -22,7 +22,7 @@ const catalog: Record<string, ModelCapability> = {
 
 export function modelCapability(model: string, provider?: ProviderId | (string & {})): ModelCapability {
   // Metadata aliases only: never rewrite the model ID sent to the provider.
-  const name = model.trim().toLowerCase();
+  const name = (model ?? '').trim().toLowerCase();
   const aliases: Record<string, string> = {
     'deepseek-ai/deepseek-r1': 'deepseek-r1',
     'deepseek-r1:latest': 'deepseek-r1',

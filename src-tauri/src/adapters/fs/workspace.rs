@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -46,23 +46,26 @@ struct Budget {
 }
 
 pub struct WorkspaceService {
-    root: Arc<Mutex<Option<PathBuf>>>,
+    root: Arc<RwLock<Option<PathBuf>>>,
     gate: Arc<Semaphore>,
 }
 
 impl Default for WorkspaceService {
     fn default() -> Self {
         Self {
-            root: Arc::new(Mutex::new(None)),
+            root: Arc::new(RwLock::new(None)),
             gate: Arc::new(Semaphore::new(1)),
         }
     }
 }
 
 impl WorkspaceService {
-    async fn run<T: Send + 'static>(
+    /// Run a filesystem operation on the blocking pool. The selected root is
+    /// cloned before dispatch, so a long scan never holds the state lock —
+    /// `current_root()` and the async runtime stay responsive.
+    async fn blocking<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&mut Option<PathBuf>) -> Result<T, String> + Send + 'static,
+        operation: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         let permit = self
             .gate
@@ -70,46 +73,54 @@ impl WorkspaceService {
             .acquire_owned()
             .await
             .map_err(|_| "Workspace service is closed".to_string())?;
-        let state = self.root.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let _permit = permit;
-            let mut root = state
-                .lock()
-                .map_err(|_| "Workspace state unavailable".to_string())?;
-            operation(&mut root)
+            operation()
         })
         .await
         .map_err(|_| "Workspace task failed".to_string())?
     }
 
+    fn root(&self) -> Option<PathBuf> {
+        self.root.read().ok().and_then(|root| root.clone())
+    }
+
+    fn set_root(&self, path: PathBuf) -> Result<(), String> {
+        *self
+            .root
+            .write()
+            .map_err(|_| "Workspace state unavailable".to_string())? = Some(path);
+        Ok(())
+    }
+
     /// Synchronous read of the selected root for other services (kernel skills scan).
     pub fn current_root(&self) -> Option<PathBuf> {
-        self.root.lock().ok().and_then(|root| root.clone())
+        self.root()
     }
 
     pub async fn info(&self) -> Result<WorkspaceInfo, String> {
-        self.run(|root| {
-            if root.is_none() && cfg!(debug_assertions) {
-                let project = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .ok_or("Development workspace unavailable")?;
-                *root = Some(select_root(project.to_string_lossy().as_ref())?);
-            }
-            Ok(info(root.as_deref()))
-        })
-        .await
+        if self.root().is_none() && cfg!(debug_assertions) {
+            let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .ok_or("Development workspace unavailable")?
+                .to_path_buf();
+            let selected = self
+                .blocking(move || select_root(project.to_string_lossy().as_ref()))
+                .await?;
+            self.set_root(selected)?;
+        }
+        Ok(info(self.root().as_deref()))
     }
 
     pub async fn select(&self, path: String) -> Result<WorkspaceInfo, String> {
-        self.run(move |root| {
-            *root = Some(select_root(&path)?);
-            Ok(info(root.as_deref()))
-        })
-        .await
+        let selected = self.blocking(move || select_root(&path)).await?;
+        self.set_root(selected)?;
+        Ok(info(self.root().as_deref()))
     }
 
     pub async fn tree(&self, path: String) -> Result<Vec<FileNode>, String> {
-        self.run(move |root| {
+        let root = self.root();
+        self.blocking(move || {
             let approved = authorized(root.as_deref(), &path)?;
             let tree = scan(
                 &approved,
@@ -131,7 +142,8 @@ impl WorkspaceService {
     }
 
     pub async fn text(&self, workspace: String, relative: String) -> Result<String, String> {
-        self.run(move |root| {
+        let root = self.root();
+        self.blocking(move || {
             let approved = authorized(root.as_deref(), &workspace)?;
             read_text(&approved, &relative)
         })

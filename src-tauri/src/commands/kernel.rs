@@ -55,6 +55,8 @@ pub async fn stream_chat(
         provider: provider.unwrap_or_default(),
         reasoning: reasoning_effort,
         max_output,
+        // The kernel stamps a stable per-session id before the run starts.
+        session: None,
     };
     kernel
         .set_workspace_root(workspace.current_root())
@@ -80,7 +82,8 @@ pub async fn abort_chat(
     kernel: State<'_, Arc<Kernel>>,
     run_id: i64,
 ) -> AppResult<()> {
-    cancel_agent(window, kernel, run_id).await
+    require_main(&window)?;
+    kernel.cancel(run_id).await
 }
 
 /// Approve or reject the active run's suspended tool call. The kernel only

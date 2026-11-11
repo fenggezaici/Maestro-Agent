@@ -3,11 +3,11 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Popover from '@radix-ui/react-popover';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Command, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
-import type { Mode, PlanCard as Plan, PlanDecision, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
+import type { Mode, PlanCard as Plan, PlanDecision, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
 import PlanCard from './PlanCard';
 import ToolCallBlocks from './ToolCallBlocks';
-import type { DiffViewState } from './DiffPanel';
+import type { ActiveFile, ListTab } from './RightPanel';
 import { Choice, IconButton } from './ui';
 import WorkbenchLayout from './WorkbenchLayout';
 import ProjectSessions from './ProjectSessions';
@@ -23,12 +23,13 @@ import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../hooks/useExtensions';
 import { formatShortcut, labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
 import { useWorkspace } from '../hooks/useWorkspace';
+import { useStickyScroll } from '../hooks/useStickyScroll';
 import CommandCenter, { type PaletteCommand } from './CommandCenter';
 import { flattenFileTree } from '../commandCenter';
 import { readPinnedSessions, savePinnedSessions } from '../sessionGroups';
 import { mockExplorerFiles } from './workbenchMock';
 import { pickDirectory } from '../api/dialog';
-import { pendingApproval } from '../lib/conversation';
+import { agentStatus, pendingApproval, reviewFiles, type TimelineItem } from '../lib/conversation';
 import { useAppearance } from '../useAppearance';
 import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
@@ -43,8 +44,8 @@ const ActivityDashboard = lazy(() => import('./ActivityDashboard'));
 export interface WorkbenchController {
   state: Snapshot; sessions: SessionView[]; projects?: ProjectView[]; selectedSessionId: number | null;
   liveTools?: Record<number, import('../api/types').ToolCallView[]>;
-  liveReasoning?: Record<number, string>;
-  liveReasoningMs?: Record<number, number>;
+  liveTimeline?: Record<number, TimelineItem[]>;
+  stoppingRunId?: number | null;
   detail: SessionDetail | null; runs: RunView[]; loadingSession: boolean; pending: boolean; error: string | null;
   metrics?: Record<number, RunMetrics>;
   selectSession: (id: number | null) => void;
@@ -64,8 +65,6 @@ export interface WorkbenchController {
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
 }
-
-const statusLabels: Record<RunStatus, string> = { running: '正在生成', completed: '已完成', cancelled: '已停止', failed: '失败' };
 
 export default function Workbench({ controller: c, source = 'live', projects: suppliedProjects, onCreateProjectSession, sessionActions, extensions: suppliedExtensions }: {
   controller: WorkbenchController; source?: 'live' | 'preview'; projects?: WorkbenchProject[];
@@ -93,23 +92,24 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => () => { for (const url of attachmentUrls.current) URL.revokeObjectURL(url); attachmentUrls.current.clear(); }, []);
   const [prompt, setPrompt] = useState('');
+  const [promptFocus, setPromptFocus] = useState(0);
   const [navigation, setNavigation] = useState<UiView>(() => preferences.startupView);
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
-  const [reviewOpen, setReviewOpen] = useState(true);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
-  const [rightTab, setRightTab] = useState<'review' | 'explorer'>('review');
+  const [listTab, setListTab] = useState<ListTab>('changes');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<number[]>(() => readPinnedSessions(source));
-  const workspace = useWorkspace(!preview && ((reviewOpen && rightTab === 'explorer') || paletteOpen));
+  const workspace = useWorkspace(!preview && ((reviewOpen && listTab === 'explorer') || paletteOpen));
   const [explorerView, setExplorerView] = useState<ExplorerViewState>({ selected: null, closedFolders: [] });
   const liveExtensions = useExtensions(!preview && navigation === 'extensions');
   const extensions = suppliedExtensions ?? liveExtensions;
   const [toastError, setToastError] = useState<string | null>(null);
   const dismissToast = useCallback(() => setToastError(null), []);
-  const [diffView, setDiffView] = useState<DiffViewState>({ file: null, split: true });
+  const [activeFile, setActiveFile] = useState<ActiveFile | null>(null);
   const togglePin = useCallback((sessionId: number, pinned: boolean) => {
     setPinnedIds((current) => {
       const next = pinned ? [...current, sessionId] : current.filter((id) => id !== sessionId);
@@ -121,19 +121,27 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     ? mockExplorerFiles.map((file) => ({ path: file.path, name: file.path.split('/').pop() ?? file.path }))
     : flattenFileTree(workspace.tree), [preview, workspace.tree]);
   const history = useRef<HTMLDivElement>(null);
-  const historyScrollTop = useRef(0);
-  const autoScroll = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
+  const scroll = useStickyScroll(history, {
+    onNearBottom: (near) => setAtBottom((current) => (current === near ? current : near)),
+  });
   const [pinnedProjects, setPinnedProjects] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('maestro.ui.pinnedProjects') ?? '[]'); } catch { return []; } });
   useEffect(() => { try { localStorage.setItem('maestro.ui.pinnedProjects', JSON.stringify(pinnedProjects)); } catch { /* quota */ } }, [pinnedProjects]);
   const lastSession = useRef(c.selectedSessionId);
   const promptBytes = new TextEncoder().encode(prompt.trim()).length;
   const plans = c.detail?.plans ?? [];
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
+  const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
+  const status = agentStatus({ running: c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running'), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval), stopping: c.stoppingRunId !== null });
   // Surface suspended tool calls in the Review pane the moment they appear —
   // the diff/command preview is what the user actually approves.
   useEffect(() => {
-    if (approval) { setRightTab('review'); setReviewOpen(true); }
+    if (approval) {
+      setListTab('changes');
+      // Pre-select the pending file without opening the panel — the panel
+      // only slides in on explicit user intent (change/stat clicks).
+      if (approval.preview?.kind === 'write') setActiveFile({ kind: 'change', path: approval.preview.path });
+    }
   }, [approval]);
   const session = c.sessions.find((item) => item.id === c.selectedSessionId);
   const projects: WorkbenchProject[] = suppliedProjects ?? (c.projects ?? []).filter((project) => !project.archived).map((project) => ({
@@ -183,18 +191,20 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   useEffect(() => {
     if (lastSession.current !== c.selectedSessionId) {
       lastSession.current = c.selectedSessionId;
-      autoScroll.current = true;
-      historyScrollTop.current = 0;
+      scroll.reset();
     }
-    if (navigation === 'agents' && history.current) {
-      history.current.scrollTop = !preview && autoScroll.current ? history.current.scrollHeight : historyScrollTop.current;
-    }
-  }, [preview, navigation, c.selectedSessionId, c.runs.at(-1)?.output, plans.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the conversation changes.
+  }, [c.selectedSessionId]);
+
+  useEffect(() => {
+    if (navigation === 'agents') scroll.reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- returning to the chat should follow new output.
+  }, [navigation]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (blocked || promptBytes === 0 || promptBytes > 8192) return;
-    autoScroll.current = true;
+    scroll.reset();
     const submitted = prompt;
     const sentAttachments = attachments;
     const images = sentAttachments.map((item) => item.dataUrl).filter((url): url is string => Boolean(url));
@@ -230,7 +240,8 @@ function cleanRunOutput(text: string): string {
     .replace(/\n{3,}/g, '\n\n');
 }
 
-function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); setReviewOpen(true); }
+function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); setReviewOpen(true); }
+  function selectReviewFile(path: string) { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -295,8 +306,8 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
       } conversation={
       <main aria-label={navigation === 'activity' ? 'Activity 工作区' : 'Agent 对话'} className="conversation-pane">
         <header className="conversation-header">
-          <div className="conversation-title"><span className="eyebrow">{navigation === 'agents' ? 'AGENT SESSION' : 'WORKSPACE'}</span><h2>{navigation === 'agents' ? session?.title ?? 'New agent' : navigation === 'activity' ? 'Workspace overview' : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
-          <div className="header-actions"><IconButton label={reviewOpen ? '隐藏代码审查' : '显示代码审查'} onClick={() => setReviewOpen(!reviewOpen)}>{reviewOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</IconButton>
+          <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← 返回对话</button>}<span className="eyebrow">{navigation === 'agents' ? 'AGENT SESSION' : 'WORKSPACE'}</span><h2>{navigation === 'agents' ? session?.title ?? 'New agent' : navigation === 'activity' ? 'Workspace overview' : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
+          <div className="header-actions"><IconButton label="切换右侧面板" onClick={() => setReviewOpen(!reviewOpen)}>{reviewOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</IconButton>
             <IconButton label="会话信息" onClick={() => setSettingsOpen(true)}><MoreHorizontal size={17} /></IconButton></div>
         </header>
         {navigation === 'activity'
@@ -308,16 +319,26 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
-              detailTools={c.detail?.tools} liveTools={c.liveTools} liveReasoning={c.liveReasoning} liveReasoningMs={c.liveReasoningMs}
+              detailTools={c.detail?.tools} liveTools={c.liveTools} liveTimeline={c.liveTimeline}
               plans={plans} reasoningDisplay={preferences.reasoningDisplay} theme={theme} preview={preview}
               messageAttachments={messageAttachments} pending={c.pending}
               onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
-              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
-              onScroll={() => { const element = history.current; if (element) { historyScrollTop.current = element.scrollTop; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 96; autoScroll.current = near; setAtBottom(near); } }} />
-            <Composer atBottom={atBottom} onScrollBottom={() => { autoScroll.current = true; setAtBottom(true); history.current?.scrollTo({ top: history.current.scrollHeight, behavior: 'smooth' }); }}
+              onSelectFile={selectReviewFile}
+              onEditPrompt={(text) => { setPrompt(text); setPromptFocus((value) => value + 1); }}
+              onJumpToTurn={(runId) => {
+                const root = history.current;
+                const turn = root?.querySelector<HTMLElement>(`[data-turn-id="${runId}"]`);
+                if (!root || !turn) return;
+                const top = root.scrollTop + turn.getBoundingClientRect().top - root.getBoundingClientRect().top - 12;
+                scroll.scrollToTop(top);
+              }}
+              onScroll={scroll.onScroll} />
+            <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
-              blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes}
+              blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}
               preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
+              approval={approval} onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
+              status={status}
               currentProject={currentProject} projects={projects}
               onSelectProject={(id) => c.selectProject?.(id)}
               onSetProjectPath={c.updateProjectPath ? (id, dir) => c.updateProjectPath!(id, dir) : undefined}
@@ -326,18 +347,18 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
               preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion}
               onError={setToastError} onCapability={updateCapability}
               running={!!c.state.activeRun && c.state.activeRun.status === 'running'} pending={c.pending}
-              onCancel={() => void c.cancel(c.state.activeRun!.id)}
+              onCancel={() => { const run = c.state.activeRun; if (run) void c.cancel(run.id); }}
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel tab={rightTab} onTabChange={setRightTab} plans={plans} selectedId={selectedPlanId} onSelect={setSelectedPlanId} diffView={diffView} onDiffViewChange={setDiffView} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} workspaceName={currentProject.name} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} pending={approval} onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
       files={paletteFiles} filesLoading={!preview && paletteOpen && workspace.loading}
       onSelectSession={(id) => { setNavigation('agents'); c.selectSession(id); }}
       onSelectFile={(path) => {
-        setReviewOpen(true); setRightTab('explorer');
+        setReviewOpen(true); setListTab('explorer'); setActiveFile({ kind: 'workspace', path });
         if (preview) {
           const file = mockExplorerFiles.find((item) => item.path === path);
           if (file) setExplorerView((view) => ({ ...view, selected: `${currentProject.id}:${c.selectedSessionId}:mock:${file.id}` }));

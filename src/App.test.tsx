@@ -94,10 +94,11 @@ describe('desktop IPC interface', () => {
   it('renders the product and subscribes before querying the snapshot', async () => {
     render(<App />);
     await ready();
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     expect(screen.getByRole('heading', { name: 'Maestro-Agent' })).toBeInTheDocument();
     expect(screen.getByLabelText('会话列表')).toBeInTheDocument();
     expect(screen.getByLabelText('Agent 对话')).toBeInTheDocument();
-    expect(screen.getByLabelText('Diff 审查面板')).toBeInTheDocument();
+    expect(screen.getByLabelText('右侧工作区')).toBeInTheDocument();
     expect(screen.queryByText('架构边界')).not.toBeInTheDocument();
     expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Plan');
     expect(mocks.listen.mock.invocationCallOrder[0]).toBeLessThan(mocks.invoke.mock.invocationCallOrder[0]);
@@ -189,6 +190,7 @@ describe('desktop IPC interface', () => {
     } }];
     render(<App />);
     await ready();
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     const approve = await screen.findByRole('button', { name: '批准计划' });
     expect(screen.getByLabelText('Diff docs/plan.md')).toHaveTextContent('new line');
     expect(screen.getByLabelText('Diff docs/plan.md')).toHaveTextContent('old line');
@@ -208,6 +210,7 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     expect(await screen.findByRole('button', { name: '批准计划' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     history = [{ ...run, status: 'completed' }];
     snapshot = { ...snapshot, activeRun: null, lastRun: history[0], sequence: 2 };
     act(() => receive({ payload: { type: 'status', run: history[0], sequence: 2 } }));
@@ -390,9 +393,11 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     expect(mocks.invoke.mock.calls.some(([name]) => name === 'read_directory_tree')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     const footer = document.querySelector('.sidebar-bottom')!;
     expect(footer.contains(screen.getByRole('button', { name: 'Settings' }))).toBe(true);
-    fireEvent.keyDown(screen.getByRole('tab', { name: 'Explorer' }), { key: 'Enter' });
+    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Explorer/ }));
     const file = await screen.findByRole('button', { name: '文件 src/unique.rs' });
     expect(mocks.invoke).toHaveBeenCalledWith('read_directory_tree', { workspacePath: 'E:/actual-project' });
     expect(screen.queryByRole('button', { name: /BridgeSession.cpp/ })).not.toBeInTheDocument();
@@ -400,8 +405,10 @@ describe('desktop IPC interface', () => {
     fireEvent.click(file);
     expect(await screen.findByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
     expect(mocks.invoke).toHaveBeenCalledWith('read_workspace_text', { workspacePath: 'E:/actual-project', path: 'src/unique.rs' });
-    fireEvent.keyDown(screen.getByRole('tab', { name: 'Review' }), { key: 'Enter' });
-    fireEvent.keyDown(screen.getByRole('tab', { name: 'Explorer' }), { key: 'Enter' });
+    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Changes/ }));
+    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Explorer/ }));
     expect(screen.getByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
   });
 

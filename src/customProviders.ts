@@ -21,8 +21,8 @@ export function readCustomProviders(): CustomProvider[] {
 }
 
 export function saveCustomProvider(entry: { name: string; baseUrl: string; id?: string }): CustomProvider {
-  const name = entry.name.trim().slice(0, 60);
-  const baseUrl = entry.baseUrl.trim().replace(/\/+$/, '');
+  const name = (entry.name ?? '').trim().slice(0, 60);
+  const baseUrl = (entry.baseUrl ?? '').trim().replace(/\/+$/, '');
   if (!name) throw new Error('供应商名称不能为空');
   if (!/^https?:\/\//i.test(baseUrl)) throw new Error('Base URL 需要以 http(s):// 开头');
   const list = readCustomProviders();

@@ -117,7 +117,7 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
           <span className="project-name">{project.name}</span>
           <span className="project-count">{project.sessions.length}</span>
         </button>
-        {canCreate && <button type="button" className="project-add-btn" aria-label={`在项目 ${project.name} 下新建会话`} onClick={(event) => { event.stopPropagation(); onCreate(project.id); }}><Plus size={12} /></button>}
+        <button type="button" className="project-add-btn" aria-label={`在项目 ${project.name} 下新建会话`} disabled={!canCreate} onClick={(event) => { event.stopPropagation(); onCreate(project.id); }}><Plus size={12} /></button>
         <DropdownMenu.Root>
           <DropdownMenu.Trigger className="project-menu-btn" aria-label={`项目 ${project.name} 操作`} onClick={(event) => event.stopPropagation()}><MoreHorizontal size={13} /></DropdownMenu.Trigger>
           <DropdownMenu.Portal><DropdownMenu.Content sideOffset={4} align="end" className="dropdown-content">

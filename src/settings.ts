@@ -54,7 +54,7 @@ export function readLlmSettings(): LlmSettings {
 }
 
 export function validateLlmSettings(settings: LlmSettings): LlmSettings {
-  const value = { ...settings, apiKey: settings.apiKey.trim(), baseUrl: settings.baseUrl.trim(), model: settings.model.trim() };
+  const value = { ...settings, apiKey: (settings.apiKey ?? '').trim(), baseUrl: (settings.baseUrl ?? '').trim(), model: (settings.model ?? '').trim() };
   const strengths = modelCapability(value.model, value.provider ?? 'openai').thinking;
   if (strengths.length) value.reasoning = value.reasoning && strengths.includes(value.reasoning) ? value.reasoning : strengths.includes('medium') ? 'medium' : strengths[0];
   else delete value.reasoning;

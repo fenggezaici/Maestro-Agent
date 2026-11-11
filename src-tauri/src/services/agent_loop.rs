@@ -19,6 +19,10 @@ const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Scoped reads only reach the selected workspace. Tell the model up front so
+/// it explains the boundary instead of burning turns probing outside paths.
+const SANDBOX_HINT: &str = "如果任务需要工作区之外的文件（例如用户提到的其他仓库路径），不要尝试绕过沙盒读取；请明确告知用户该路径不在工作区，并请用户将其复制或移动到工作区内后再继续。";
+
 /// Conversation assembly: system policy for the run's mode plus prior
 /// completed turns of the same session within a byte budget.
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
@@ -29,7 +33,7 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
         Mode::Execute => "你处于历史 execute 模式（遗留记录）。仅可使用实际开放且授权的能力。",
         Mode::Auto => "你处于 Auto 策略。已开放的工具调用会直接执行；以工具结果为准，不得声称拥有未提供的能力。",
     };
-    let mut messages = vec![ChatMessage::text("system", policy)];
+    let mut messages = vec![ChatMessage::text("system", format!("{policy}\n{SANDBOX_HINT}"))];
     let prior: Vec<_> = detail
         .runs
         .iter()
@@ -145,7 +149,7 @@ pub(crate) async fn run(
     mut cancel: watch::Receiver<bool>,
 ) {
     let result: AppResult<bool> = async {
-        if *cancel.borrow() {
+        if kernel.is_cancelled(run.id).await {
             return Ok(false);
         }
         let detail = kernel.session_detail(run.session_id).await?;
@@ -153,19 +157,25 @@ pub(crate) async fn run(
         let tools = kernel.agent_tools(run.mode).await;
         let provider = kernel.llm_provider(&config);
         for _round in 0..MAX_TOOL_ROUNDS {
-            if *cancel.borrow() {
+            if kernel.is_cancelled(run.id).await {
                 return Ok(false);
             }
-            let outcome = stream_turn(
-                &kernel,
-                &provider,
-                &config,
-                &messages,
-                &tools,
-                &mut cancel,
-                run.id,
-            )
-            .await?;
+            // Watch the cancel signal outside the provider: "stop" must work
+            // even if a provider ignores the receiver while awaiting bytes.
+            let mut turn_cancel = cancel.clone();
+            let outcome = tokio::select! {
+                biased;
+                _ = turn_cancel.changed() => return Ok(false),
+                outcome = stream_turn(
+                    &kernel,
+                    &provider,
+                    &config,
+                    &messages,
+                    &tools,
+                    &mut cancel,
+                    run.id,
+                ) => outcome?,
+            };
             if !outcome.done {
                 return Ok(false);
             }
@@ -180,12 +190,15 @@ pub(crate) async fn run(
                 name: None,
                 images: None,
             });
-            for call in &outcome.tool_calls {
-                // Authorization, audit and tool_call events all happen inside
-                // the kernel; the result text goes back to the model only.
-                let result = kernel
-                    .execute_model_tool(run.id, &call.name, &call.arguments)
-                    .await;
+            // Authorization, audit and tool_call events all happen inside the
+            // kernel; suspended calls share ONE approval for the whole turn.
+            let calls: Vec<(String, String)> = outcome
+                .tool_calls
+                .iter()
+                .map(|call| (call.name.clone(), call.arguments.clone()))
+                .collect();
+            let results = kernel.execute_tool_calls(run.id, &calls).await;
+            for (call, result) in outcome.tool_calls.iter().zip(results) {
                 let text = match result {
                     Ok(text) => text,
                     Err(error) => format!("工具调用失败：{error}"),
@@ -206,16 +219,20 @@ pub(crate) async fn run(
             "user",
             "工具调用预算已用尽。请基于已收集的信息直接给出最终结论，不要再调用工具。",
         ));
-        let final_turn = stream_turn(
-            &kernel,
-            &provider,
-            &config,
-            &messages,
-            &[],
-            &mut cancel,
-            run.id,
-        )
-        .await?;
+        let mut final_cancel = cancel.clone();
+        let final_turn = tokio::select! {
+            biased;
+            _ = final_cancel.changed() => return Ok(false),
+            outcome = stream_turn(
+                &kernel,
+                &provider,
+                &config,
+                &messages,
+                &[],
+                &mut cancel,
+                run.id,
+            ) => outcome?,
+        };
         Ok(final_turn.done)
     }
     .await;

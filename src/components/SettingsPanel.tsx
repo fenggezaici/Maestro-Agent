@@ -70,7 +70,9 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
                 <span className="provider-card-icon">{getProvider(id).name.slice(0, 1)}</span>{getProvider(id).name}
                 <span className={`provider-status-dot ${preview || hasProviderCredential(id) ? 'configured' : ''}`} />
               </button>)}
-              {customs.map((item) => <button type="button" key={item.id} className="model-provider-item" aria-label={item.name} aria-current={modelProvider === item.id ? 'page' : undefined} onClick={() => {
+              {customs.map((item) => <div role="button" tabIndex={0} key={item.id} className="model-provider-item" aria-label={item.name} aria-current={modelProvider === item.id ? 'page' : undefined} aria-disabled={preview || undefined}
+                onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.click(); }}
+                onClick={() => {
                 try {
                   if (preview) update({ provider: item.id as ProviderId, previewModel: item.baseUrl ? '' : item.id }); else { selectLlmProvider(item.id); onModelsChanged(); }
                   setModelProvider(item.id); setProviderError(null);
@@ -79,7 +81,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
                 <span className="provider-card-icon">{item.name.slice(0, 1)}</span>{item.name}
                 <span className={`provider-status-dot ${preview || hasProviderCredential(item.id) ? 'configured' : ''}`} />
                 <span className="provider-item-actions" onClick={(event) => event.stopPropagation()}>
-                  <button type="button" className="icon-button" aria-label={`编辑供应商 ${item.name}`} disabled={preview} onClick={() => setCustomDraft({ id: item.id, name: item.name, baseUrl: item.baseUrl })}><Pencil size={11} /></button>
+                  <button type="button" className="icon-button" aria-label={`编辑供应商 ${item.name}`} disabled={preview} onClick={() => setCustomDraft({ id: item.id, name: item.name ?? '', baseUrl: item.baseUrl ?? '' })}><Pencil size={11} /></button>
                   <button type="button" className="icon-button" aria-label={`删除供应商 ${item.name}`} disabled={preview} onClick={() => {
                     if (!window.confirm(`删除自定义供应商「${item.name}」及其本地配置？`)) return;
                     removeCustomProvider(item.id);
@@ -88,7 +90,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
                     if (modelProvider === item.id) { setModelProvider('openai'); if (!preview) selectLlmProvider('openai'); }
                   }}><Trash2 size={11} /></button>
                 </span>
-              </button>)}
+              </div>)}
               <button type="button" className="model-provider-item model-provider-add" aria-label="添加自定义供应商" disabled={preview}
                 onClick={() => setCustomDraft({ name: '', baseUrl: '' })}><Plus size={13} />自定义供应商</button>
             </div>
@@ -116,18 +118,23 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
         </div>
       </div>
       <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭设置"><X size={16} /></button></Dialog.Close>
-      {customDraft && <div className="custom-provider-dialog" role="dialog" aria-label="自定义供应商">
+      {customDraft && <div className="custom-provider-dialog" role="dialog" aria-label="自定义供应商"
+        onClick={(event) => { if (event.target === event.currentTarget) setCustomDraft(null); }}>
         <div className="custom-provider-card">
           <h4>{customDraft.id ? '编辑供应商' : '添加自定义供应商'}</h4>
-          <label htmlFor="custom-provider-name">名称</label>
-          <input id="custom-provider-name" autoComplete="off" autoFocus value={customDraft.name} maxLength={40}
-            onChange={(event) => setCustomDraft({ ...customDraft, name: event.target.value })} placeholder="如 OpenCode go" />
-          <label htmlFor="custom-provider-url">Base URL（OpenAI-compatible）</label>
-          <input id="custom-provider-url" autoComplete="off" spellCheck={false} value={customDraft.baseUrl}
-            onChange={(event) => setCustomDraft({ ...customDraft, baseUrl: event.target.value })} placeholder="https://gateway.example/v1" />
+          <div className="modal-field">
+            <label htmlFor="custom-provider-name">名称</label>
+            <input id="custom-provider-name" autoComplete="off" autoFocus value={customDraft.name} maxLength={40}
+              onChange={(event) => setCustomDraft({ ...customDraft, name: event.target.value })} placeholder="如 OpenCode go" />
+          </div>
+          <div className="modal-field">
+            <label htmlFor="custom-provider-url">Base URL（OpenAI-compatible）</label>
+            <input id="custom-provider-url" autoComplete="off" spellCheck={false} value={customDraft.baseUrl}
+              onChange={(event) => setCustomDraft({ ...customDraft, baseUrl: event.target.value })} placeholder="https://gateway.example/v1" />
+          </div>
           <div className="dialog-actions">
             <button type="button" className="button-ghost" onClick={() => setCustomDraft(null)}>取消</button>
-            <button type="button" className="button-approve" disabled={!customDraft.name.trim() || !customDraft.baseUrl.trim()} onClick={() => {
+            <button type="button" className="button-approve" disabled={!(customDraft.name ?? '').trim() || !(customDraft.baseUrl ?? '').trim()} onClick={() => {
               try {
                 const row = saveCustomProvider(customDraft);
                 setCustoms(readCustomProviders());

@@ -47,7 +47,7 @@ export default function WorkbenchLayout({ sidebar, conversation, review, source 
   if (mode === 'mobile') return <div className="workbench-mobile" data-layout="mobile">{sidebar}{conversation}{review}</div>;
   if (mode === 'stacked') return <div className="workbench-layout" data-layout="stacked">
     <SavedGroup key={`stacked-${!!review}`} name={`stacked-${!!review}`} source={source} ids={['sidebar', 'main']} orientation="horizontal">
-      <Panel id="sidebar" defaultSize={240} minSize={180} maxSize="40%" groupResizeBehavior="preserve-pixel-size" className="panel-content">{sidebar}</Panel>
+      <Panel id="sidebar" defaultSize={320} minSize={180} maxSize="40%" groupResizeBehavior="preserve-pixel-size" className="panel-content">{sidebar}</Panel>
       <Handle id="resize-sidebar-stacked" label="调整侧栏宽度" />
       <Panel id="main" minSize={260} className="panel-content">
         <SavedGroup key={`rows-${!!review}`} name={`rows-${!!review}`} source={source} ids={review ? ['chat', 'review'] : ['chat']} orientation="vertical">

@@ -53,7 +53,7 @@ export interface PlanCard {
   status: PlanStatus;
   draft: PlanDraft;
 }
-export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean }
+export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string }
 
 /// Payload carried in an `awaiting_approval` tool_call detail: the kernel's
 /// bounded preview of what would run. `write` diffs render in the Monaco
@@ -77,6 +77,7 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'content'; runId: number; sessionId: number; token: string }
   | { type: 'plan_updated'; plan: PlanCard }
   | { type: 'sessions_changed' }
+  | { type: 'workspace_changed' }
   | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }
   | { type: 'reasoning'; runId: number; token: string }
 );

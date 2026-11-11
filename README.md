@@ -23,20 +23,24 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 
 | 功能 | 当前状态 |
 | --- | --- |
-| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发，真实 abort 即时断流 |
+| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
+| 思考时间线 | reasoning 流按 `tool_call` / 正文时机切分为独立段，与工具调用按真实顺序交错渲染为单行折叠节点；活动段展开并自动贴底，结束后折叠为「思考 · 持续了 X 秒」 |
+| 停止生成 | 前端立即封存当前段并忽略该轮后续 token；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
-| 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览 |
+| 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
 | Review / 审批 | 提议 Diff 与单次计划决定；批准不应用修改，真实模型暂不自动生成审批卡片 |
-| IDE 工作台 | 可拖拽分栏、会话搜索与项目分组、Settings、应用内快捷键 |
+| IDE 工作台 | 可拖拽分栏、会话搜索与项目分组、Settings、应用内快捷键；对话左侧可点击轮次导航条 |
 | Command Center | `Ctrl/Cmd+K` 顶部快速面板：命令 / 会话 / 文件模糊搜索、方向键导航、本地搜索历史 |
 | 会话列表 | 本地置顶与本日分组（今天 / 昨天 / 7 天内 / 更早）；置顶仅存 localStorage，不同步后端 |
 | 计划卡片 | 待审批默认展开、已结案折叠为摘要行；审批仍只记录决定 |
+| 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
 | 模型能力 / 会话统计 | 动态思考选项与目录上下文上限，Provider usage/计时；缺失用量明确标为估算 |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
 | MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`readOnlyHint` 参与模式授权 |
 | 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计 |
+| 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
 | Activity | Dashboard 仍为 Mock 演示数据 |
 
 **Project-file writes, patch application, or shell command execution are still disabled.** Plan / Code (default) / Confirm / Auto are real Rust policies; selecting Auto or approving a plan does not create missing executors. MCP tools honor each server's `readOnlyHint` and the active mode; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
@@ -94,7 +98,8 @@ pnpm.cmd tauri dev
 - 会话数据库包含用户消息与模型回复，请视为私人数据。位置为 Tauri `app_data_dir()/maestro.sqlite3`。
 - 所有 SQLite 操作由 `maestro-sqlite` 专用 OS 线程独占，通过有界 `mpsc` 与异步调用者通信；不会在异步线程直接执行阻塞 SQL。
 - Rust 持有模式与运行授权；Plan Mode 拒绝副作用工具和未知名称，但允许应用内部会话/审计落库。
-- Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules` and `target`, and enforce path, link, scan-budget and file-size limits.
+- Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules` and `target`, and enforce path, link, scan-budget and file-size limits. The selected root is cloned before scanning, so long scans never hold the state lock; the Explorer caches the last tree and refreshes on debounced `workspace_changed`.
+- System prompt tells the model that paths outside the selected workspace cannot be read: it must ask the user to copy/move the file into the workspace instead of probing the sandbox.
 - 文件浏览不会自动把内容发送给模型。只读检查不是完整 OS 沙箱；并发恶意文件系统下的残余 TOCTOU 风险见[工作区文档](docs/workspace-filesystem.md)。
 - 扩展数据存放于 `~/.maestro/`（`skills/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，30s 调用超时，应用退出时统一回收；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
 
@@ -115,8 +120,8 @@ commands/ (仅透传) → services/ (kernel · agent_loop · tool_router · exte
 | --- | --- |
 | `src/api/` | 唯一 IPC 边界：types/kernel/sessions/extensions/workspace/dialog/models |
 | `src/stores/` | `useKernelStore`、`useWorkspaceStore`（zustand 全局状态与命令） |
-| `src/hooks/` | `useAgentStream`（事件订阅/重放/对齐）、`useKernel`、`useWorkspace`、`useExtensions` |
-| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、会话拼装 |
+| `src/hooks/` | `useAgentStream`（事件订阅/重放/对齐）、`useKernel`、`useWorkspace`、`useExtensions`、`useStickyScroll`（rAF/ResizeObserver 贴底与用户上滑暂停） |
+| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、reasoning/tool 时间线切分、会话拼装 |
 | `src/components/` | Dumb 组件（ChatStream、Composer、Workbench 等），只接 props 不碰 IPC |
 | `src/preview/` | 与真实 IPC/凭据隔离的前端预览数据（不调 invoke/listen） |
 | `src-tauri/src/commands/` | IPC 接口层，仅参数透传与错误包装 |

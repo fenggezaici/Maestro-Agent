@@ -73,6 +73,7 @@ fn config(base_url: String) -> ChatConfig {
         provider: Provider::Openai,
         reasoning: None,
         max_output: None,
+        session: None,
     }
 }
 
@@ -127,6 +128,10 @@ async fn real_http_sse_streams_before_completion_and_persists_with_rust_plan_pro
         .as_str()
         .unwrap()
         .contains("你处于只读计划模式"));
+    assert!(body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("工作区之外"));
     assert!(!body.to_string().contains("test-secret"));
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

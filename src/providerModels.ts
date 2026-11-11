@@ -81,5 +81,5 @@ export function mergeFetched(provider: ProviderId | (string & {}), fetched: Fetc
 }
 
 export function providerModel(provider: ProviderId | (string & {}), id: string): ProviderModel | undefined {
-  return readProviderModels(provider).find((item) => item.id === id.trim());
+  return readProviderModels(provider).find((item) => item.id === (id ?? '').trim());
 }

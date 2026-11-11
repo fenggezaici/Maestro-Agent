@@ -64,7 +64,7 @@ try {
   await page.locator('[data-editor-ready="true"]').waitFor({ timeout: 30_000 });
   await page.evaluate(() => document.fonts.ready);
   assert(await page.getByText('Frontend preview', { exact: true }).isVisible());
-  assert(await page.getByRole('button', { name: '新建会话', exact: true }).isEnabled());
+  assert(await page.getByRole('button', { name: '新建会话' }).first().isEnabled());
   assert(await page.getByRole('button', { name: '批准计划' }).isDisabled());
   assert(await page.getByRole('button', { name: '发送', exact: true }).isDisabled());
   const layout = await page.evaluate(() => ({
@@ -273,11 +273,8 @@ try {
   assert((await page.getByLabel('实时会话统计', { exact: true }).textContent()).includes('400.0k'));
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: '模型', exact: true }).click();
-  const capabilities = page.getByRole('group', { name: '模型能力', exact: true });
-  await page.locator('#llm-model').fill('gpt-5.2');
-  await capabilities.getByLabel('思考强度', { exact: true }).click();
-  await page.getByRole('option', { name: 'High', exact: true }).click();
-  await capabilities.getByText('400k context', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '设为当前模型 gpt-5.2', exact: true }).click();
+  await page.getByText('400k context', { exact: true }).waitFor();
   await page.screenshot({ path: path.join(output, 'maestro-model-capabilities.png'), animations: 'disabled' });
   await page.getByRole('button', { name: 'Ollama', exact: true }).click();
   await page.getByRole('button', { name: '关闭设置', exact: true }).click();

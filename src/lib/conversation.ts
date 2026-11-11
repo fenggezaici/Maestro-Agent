@@ -37,6 +37,7 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
         : next;
     case 'plan_updated':
     case 'sessions_changed':
+    case 'workspace_changed':
     case 'tool_call': return next;
     case 'reasoning': return next;
     case 'metrics': return next;
@@ -53,13 +54,15 @@ export function errorMessage(error: unknown): string {
 }
 
 /// Fold one `tool_call` lifecycle event into the per-run tool list: `started`
-/// appends a pending row, later phases update it in place.
-export function applyToolEvent(
+/// appends a pending row, later phases update it in place. Returns the touched
+/// row index so the reasoning timeline can keep the same ordering.
+export function applyToolEventIndexed(
   current: Record<number, ToolCallView[]>,
   event: Extract<KernelEvent, { type: 'tool_call' }>,
-): Record<number, ToolCallView[]> {
+): { next: Record<number, ToolCallView[]>; index: number } {
   const list = [...(current[event.runId] ?? [])];
   const pendingIndex = list.findIndex((call) => call.tool === event.tool && call.pending);
+  const prev = pendingIndex >= 0 ? list[pendingIndex] : undefined;
   const entry: ToolCallView = {
     runId: event.runId,
     tool: event.tool,
@@ -67,10 +70,60 @@ export function applyToolEvent(
     allowed: event.phase !== 'blocked' && event.phase !== 'failed',
     pending: event.phase === 'started' || event.phase === 'awaiting_approval' || undefined,
     awaitingApproval: event.phase === 'awaiting_approval' || undefined,
+    // `started` carries the extracted target; later phases keep it while
+    // `detail` rotates to preview JSON, result text, or the failure reason.
+    target: event.phase === 'started' ? event.detail : prev?.target,
   };
-  if (event.phase === 'started' || pendingIndex < 0) list.push(entry);
-  else list[pendingIndex] = entry;
-  return { ...current, [event.runId]: list };
+  const index = event.phase === 'started' || pendingIndex < 0 ? list.length : pendingIndex;
+  if (index === list.length) list.push(entry);
+  else list[index] = entry;
+  return { next: { ...current, [event.runId]: list }, index };
+}
+
+export function applyToolEvent(
+  current: Record<number, ToolCallView[]>,
+  event: Extract<KernelEvent, { type: 'tool_call' }>,
+): Record<number, ToolCallView[]> {
+  return applyToolEventIndexed(current, event).next;
+}
+
+/// One reasoning burst between tool calls / the final answer.
+export interface ReasoningSegment { text: string; startedAt: number; endedAt?: number }
+
+/// Ordered live timeline: reasoning bursts and tool rows exactly as they
+/// happened. Tool items point at the row index in `liveTools`.
+export type TimelineItem =
+  | { kind: 'reasoning'; segment: ReasoningSegment }
+  | { kind: 'tool'; index: number };
+
+export function appendReasoning(items: TimelineItem[] | undefined, token: string, now: number): TimelineItem[] {
+  const list = [...(items ?? [])];
+  const last = list[list.length - 1];
+  if (last?.kind === 'reasoning' && last.segment.endedAt === undefined) {
+    list[list.length - 1] = { kind: 'reasoning', segment: { ...last.segment, text: last.segment.text + token } };
+  } else {
+    list.push({ kind: 'reasoning', segment: { text: token, startedAt: now } });
+  }
+  return list;
+}
+
+/// Seal the open reasoning burst; returns the same reference when nothing is open.
+export function closeReasoning(items: TimelineItem[] | undefined, now: number): TimelineItem[] | undefined {
+  const last = items?.[items.length - 1];
+  if (!items || last?.kind !== 'reasoning' || last.segment.endedAt !== undefined) return items;
+  const list = [...items];
+  list[list.length - 1] = { kind: 'reasoning', segment: { ...last.segment, endedAt: now } };
+  return list;
+}
+
+/// Seal the open reasoning burst and append the tool row once.
+export function appendTool(items: TimelineItem[] | undefined, index: number, now: number): TimelineItem[] {
+  const sealed = closeReasoning(items, now);
+  const list = [...(sealed ?? [])];
+  if (!list.some((item) => item.kind === 'tool' && item.index === index)) {
+    list.push({ kind: 'tool', index });
+  }
+  return list;
 }
 
 /// Decode the kernel's approval-preview JSON carried in an `awaiting_approval`
@@ -106,14 +159,93 @@ export interface PendingApprovalView {
   runId: number;
   tool: string;
   preview: ApprovalPreview | null;
+  count: number;
+}
+
+/// One entry in the Review Hub file list — pending write, applied write, or
+/// plan proposal, all reduced to a before/after diff of one path.
+export interface ReviewFile {
+  path: string;
+  before: string;
+  after: string;
+  status: 'pending' | 'applied' | 'proposal';
+  runId?: number;
+  exists?: boolean;
+  tool?: string;
+}
+
+function writeResult(detail: string): { path: string; before: string; after: string } | null {
+  try {
+    const value = JSON.parse(detail) as { kind?: string; path?: string; before?: string; after?: string };
+    return value.kind === 'write_result' && typeof value.before === 'string' && typeof value.after === 'string'
+      ? { path: value.path ?? '', before: value.before, after: value.after }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Flatten every diff-shaped thing the run produced into one ordered list —
+/// pending write beats applied beats proposal for the same path.
+export function reviewFiles(input: {
+  liveTools: Record<number, ToolCallView[]> | undefined;
+  pending: PendingApprovalView | null;
+  plans: { id: number; draft: { diffs: { path: string; before: string; after: string }[] } }[];
+}): ReviewFile[] {
+  const files: ReviewFile[] = [];
+  const seen = new Set<string>();
+  const push = (file: ReviewFile) => {
+    if (file.path && !seen.has(file.path)) { seen.add(file.path); files.push(file); }
+  };
+  if (input.pending?.preview?.kind === 'write') {
+    const preview = input.pending.preview;
+    push({ path: preview.path, before: preview.old, after: preview.new, status: 'pending', runId: input.pending.runId, exists: preview.exists, tool: input.pending.tool });
+  }
+  const appliedByPath = new Map<string, number>();
+  for (const calls of Object.values(input.liveTools ?? {})) {
+    for (const call of calls) {
+      if (!call.allowed || call.pending || call.awaitingApproval) continue;
+      const result = writeResult(call.detail);
+      if (!result) continue;
+      // Same path written repeatedly → merge into a cumulative diff
+      // (first before → latest after) so the panel never goes stale.
+      const previous = appliedByPath.get(result.path);
+      if (previous !== undefined) {
+        files[previous] = { ...files[previous], after: result.after, runId: call.runId };
+      } else if (!seen.has(result.path)) {
+        seen.add(result.path);
+        appliedByPath.set(result.path, files.length);
+        files.push({ path: result.path, before: result.before, after: result.after, status: 'applied', runId: call.runId, tool: call.tool });
+      }
+    }
+  }
+  for (const plan of input.plans) {
+    for (const diff of plan.draft.diffs) {
+      push({ path: diff.path, before: diff.before, after: diff.after, status: 'proposal', tool: 'plan' });
+    }
+  }
+  return files;
 }
 
 /// The one call currently suspended on a user decision, if any — the agent
 /// loop is serial so at most one `awaitingApproval` row exists across runs.
+export type AgentStatus = 'stopping' | 'approval' | 'tool' | 'thinking' | 'working';
+
+/// Devin-style bottom status pill: the first matching live state wins —
+/// stopping > waiting for approval > tool executing > reasoning > working.
+export function agentStatus(input: { running: boolean; liveCalls?: ToolCallView[]; reasoning?: string; hasApproval?: boolean; stopping?: boolean }): AgentStatus | null {
+  if (!input.running) return null;
+  if (input.stopping) return 'stopping';
+  if (input.hasApproval) return 'approval';
+  if (input.liveCalls?.some((call) => call.pending)) return 'tool';
+  if (input.reasoning) return 'thinking';
+  return 'working';
+}
+
 export function pendingApproval(liveTools: Record<number, ToolCallView[]> | undefined): PendingApprovalView | null {
   for (const calls of Object.values(liveTools ?? {})) {
     const call = calls.find((item) => item.awaitingApproval);
-    if (call) return { runId: call.runId, tool: call.tool, preview: parseApprovalPreview(call.detail) };
+    if (call) return { runId: call.runId, tool: call.tool, preview: parseApprovalPreview(call.detail), count: calls.filter((item) => item.awaitingApproval).length };
   }
   return null;
 }

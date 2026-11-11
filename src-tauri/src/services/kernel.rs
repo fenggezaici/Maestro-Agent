@@ -40,6 +40,9 @@ struct RuntimeState {
     active_run: Option<RunView>,
     last_run: Option<RunView>,
     control: Option<Control>,
+    /// Independent cancellation flag: the watch notification is a hint, this is
+    /// the source of truth the agent loop polls.
+    cancelled_run: Option<i64>,
     sequence: u64,
     shutting_down: bool,
     storage_failed: bool,
@@ -69,6 +72,7 @@ impl Kernel {
                 active_run: None,
                 last_run,
                 control: None,
+                cancelled_run: None,
                 sequence: 0,
                 shutting_down: false,
                 storage_failed: false,
@@ -171,12 +175,15 @@ impl Kernel {
         self: &Arc<Self>,
         session_id: i64,
         prompt: String,
-        config: ChatConfig,
+        mut config: ChatConfig,
     ) -> AppResult<i64> {
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() || prompt.len() > 8192 {
             return Err("Prompt must contain 1–8192 UTF-8 bytes".into());
         }
+        // OpenCode gateways route/cache per conversation: keep one stable id
+        // for every turn of this session.
+        config.session = Some(format!("maestro-{session_id}"));
         let _command = self.commands.lock().await;
         let mode = {
             let state = self.state.lock().await;
@@ -225,6 +232,7 @@ impl Kernel {
                 finishing: false,
                 pending: None,
             });
+            state.cancelled_run = None;
             self.emit_locked(&mut state, EventData::Status { run: run.clone() });
             self.emit_locked(&mut state, EventData::SessionsChanged);
         }
@@ -237,8 +245,10 @@ impl Kernel {
     }
 
     pub async fn cancel(&self, run_id: i64) -> AppResult<()> {
-        let _command = self.commands.lock().await;
+        // Cancellation must never queue behind the command gate: a long
+        // mutating command would otherwise make "stop" feel dead.
         let mut state = self.state.lock().await;
+        let active = state.active_run.as_ref().map(|run| run.id);
         // Idempotent best-effort: the control channel is a singleton for the
         // single in-flight run, so an id mismatch or an already-finished run
         // is a harmless no-op — never an error the UI should surface.
@@ -246,14 +256,29 @@ impl Kernel {
         if control.finishing {
             return Ok(());
         }
-        let _ = control.cancel.send(true);
+        // send_replace also works when no receiver is currently polling.
+        control.cancel.send_replace(true);
         // Unblock any call suspended on an approval so the loop can observe
         // the cancellation and finish instead of hanging on the user's answer.
         if let Some(pending) = control.pending.take() {
             let _ = pending.responder.send(false);
         }
+        // Flag after the control borrow ends: the loop polls this even if the
+        // watch notification is lost.
+        state.cancelled_run = active;
         let _ = run_id;
         Ok(())
+    }
+
+    /// True once cancellation was requested for this run. The agent loop polls
+    /// this between turns/tools so a missed watch notification cannot hang it.
+    pub(crate) async fn is_cancelled(&self, run_id: i64) -> bool {
+        let state = self.state.lock().await;
+        state.cancelled_run == Some(run_id)
+            || state
+                .control
+                .as_ref()
+                .is_none_or(|control| control.finishing || *control.cancel.borrow())
     }
 
     /// Authorization is tied to the active run, never to a frontend-supplied mode.
@@ -280,6 +305,7 @@ impl Kernel {
             .ok_or("No matching active run")?;
         if state.shutting_down
             || state.storage_failed
+            || state.cancelled_run == Some(run_id)
             || state
                 .control
                 .as_ref()
@@ -335,7 +361,7 @@ impl Kernel {
             self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
             return Err(reason);
         }
-        let text = self.router.execute(run.session_id, tool, "{}").await?;
+        let text = self.router.execute(run.session_id, tool, "{}").await?.text;
         self.database
             .record_tool(run_id, tool.into(), "read-only".into(), true)
             .await?;
@@ -389,64 +415,166 @@ impl Kernel {
         tool: &str,
         arguments_json: &str,
     ) -> AppResult<String> {
+        self.execute_tool_calls(run_id, &[(tool.to_string(), arguments_json.to_string())])
+            .await
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err("missing tool result".into()))
+    }
+
+    /// Execute a batch of model-requested calls that share ONE approval
+    /// decision: every suspended call emits its own Started + AwaitingApproval
+    /// event (each with its own preview), but the batch registers a single
+    /// responder — one Approve executes all, one Reject blocks all.
+    pub(crate) async fn execute_tool_calls(
+        &self,
+        run_id: i64,
+        calls: &[(String, String)],
+    ) -> Vec<AppResult<String>> {
+        enum Gate {
+            Denied(AppResult<String>),
+            Allow(ToolEffect),
+            Suspended(ToolEffect),
+        }
         let run = {
             let _command = self.commands.lock().await;
-            Self::active_run_locked(&*self.state.lock().await, run_id)?
-        };
-        self.emit_tool(run_id, tool, ToolPhase::Started, "").await;
-        let effect = match self.router.classify(tool).await {
-            Ok(effect) => effect,
-            Err(reason) => return self.block_tool(run_id, tool, reason).await,
-        };
-        // One audit row per call: approval upgrades the terminal record's
-        // detail instead of writing a second row.
-        let mut audit = "extension";
-        match policy::gate(run.mode, effect) {
-            ToolGate::Deny => {
-                return self
-                    .block_tool(
-                        run_id,
-                        tool,
-                        format!("Plan Mode blocked tool: {tool}; only read tools are allowed"),
-                    )
-                    .await;
+            match Self::active_run_locked(&*self.state.lock().await, run_id) {
+                Ok(run) => run,
+                Err(reason) => return calls.iter().map(|_| Err(reason.clone())).collect(),
             }
-            ToolGate::RequireApproval => {
-                let preview = self.router.approval_preview(tool, arguments_json).await;
-                let (tx, rx) = oneshot::channel();
-                {
-                    let mut state = self.state.lock().await;
-                    if Self::active_run_locked(&state, run_id).is_err() {
-                        return self
-                            .block_tool(run_id, tool, "Run no longer active".into())
-                            .await;
+        };
+        // Phase 1: classify + gate every call before any execution so the
+        // whole batch can share one approval wait.
+        let mut gates = Vec::with_capacity(calls.len());
+        let mut suspended = Vec::new();
+        for (index, (tool, arguments_json)) in calls.iter().enumerate() {
+            let target = ToolRouter::call_target(tool, arguments_json);
+            self.emit_tool(run_id, tool, ToolPhase::Started, &target).await;
+            let gate = match self.router.classify(tool).await {
+                Err(reason) => Gate::Denied(self.block_tool(run_id, tool, reason).await),
+                Ok(effect) => match policy::gate(run.mode, effect) {
+                    ToolGate::Deny => Gate::Denied(
+                        self.block_tool(
+                            run_id,
+                            tool,
+                            format!("Plan Mode blocked tool: {tool}; only read tools are allowed"),
+                        )
+                        .await,
+                    ),
+                    ToolGate::RequireApproval => {
+                        suspended.push(index);
+                        Gate::Suspended(effect)
                     }
+                    ToolGate::Allow => Gate::Allow(effect),
+                },
+            };
+            gates.push(gate);
+        }
+        // Phase 2: one shared suspension — every gated call reports
+        // AwaitingApproval (with its own preview) before the single wait.
+        let approved = if suspended.is_empty() {
+            true
+        } else {
+            let (tx, rx) = oneshot::channel();
+            let mut waiting = false;
+            {
+                let mut state = self.state.lock().await;
+                if Self::active_run_locked(&state, run_id).is_ok() {
                     if let Some(control) = state.control.as_mut() {
                         control.pending = Some(PendingApproval { responder: tx });
+                        waiting = true;
                     }
                 }
-                self.emit_tool(run_id, tool, ToolPhase::AwaitingApproval, &preview)
-                    .await;
-                // No lock is held while suspended: cancel, resolve_approval and
-                // shutdown can all reach the pending responder. A dropped
-                // responder (run finished, shutdown) counts as rejection.
-                let approved = rx.await.unwrap_or(false);
-                if !approved {
-                    return self
-                        .block_tool(run_id, tool, "用户拒绝了该操作".into())
-                        .await;
-                }
-                audit = "user approved";
             }
-            ToolGate::Allow => {}
+            for &index in &suspended {
+                let preview = self
+                    .router
+                    .approval_preview(&calls[index].0, &calls[index].1)
+                    .await;
+                self.emit_tool(run_id, &calls[index].0, ToolPhase::AwaitingApproval, &preview)
+                    .await;
+            }
+            waiting && rx.await.unwrap_or(false)
+        };
+        // Phase 3: execute (or reject) each call in order.
+        let mut results = Vec::with_capacity(calls.len());
+        for (index, (tool, arguments_json)) in calls.iter().enumerate() {
+            // A batch can be large; stop before the next side effect instead of
+            // finishing every call after the user pressed stop.
+            let cancelled = {
+                let state = self.state.lock().await;
+                state
+                    .control
+                    .as_ref()
+                    .is_none_or(|control| *control.cancel.borrow())
+            };
+            if cancelled {
+                results.push(Err("Run cancelled".into()));
+                continue;
+            }
+            match &mut gates[index] {
+                Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
+                Gate::Suspended(_) if !approved => {
+                    results.push(self.block_tool(run_id, tool, "用户拒绝了该操作".into()).await);
+                }
+                Gate::Allow(effect) | Gate::Suspended(effect) => {
+                    let audit = if suspended.contains(&index) {
+                        "user approved"
+                    } else {
+                        "extension"
+                    };
+                    let target = ToolRouter::call_target(tool, arguments_json);
+                    results.push(
+                        self.finish_tool(run_id, run.session_id, tool, arguments_json, &target, audit, *effect)
+                            .await,
+                    );
+                }
+            }
         }
-        match self.router.execute(run.session_id, tool, arguments_json).await {
-            Ok(text) => {
+        results
+    }
+
+    /// Execute the routed call, audit the terminal result, emit
+    /// Finished/Failed and refresh the workspace on any side effect.
+    async fn finish_tool(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        tool: &str,
+        arguments_json: &str,
+        target: &str,
+        audit: &str,
+        effect: ToolEffect,
+    ) -> AppResult<String> {
+        match self.router.execute(session_id, tool, arguments_json).await {
+            Ok(outcome) => {
+                let detail = if target.is_empty() {
+                    audit.to_string()
+                } else {
+                    format!("{audit} · {target}")
+                };
                 self.database
-                    .record_tool(run_id, tool.into(), audit.into(), true)
+                    .record_tool(run_id, tool.into(), detail, true)
                     .await?;
-                self.emit_tool(run_id, tool, ToolPhase::Finished, "").await;
-                Ok(text)
+                // Write tools send a structured payload the UI diffs; every
+                // other tool sends the bounded result text.
+                let event_detail = match &outcome.write {
+                    Some(report) => serde_json::json!({
+                        "kind": "write_result",
+                        "path": report.path,
+                        "before": report.before.chars().take(8192).collect::<String>(),
+                        "after": report.after.chars().take(8192).collect::<String>(),
+                    })
+                    .to_string(),
+                    None => outcome.text.chars().take(2048).collect::<String>(),
+                };
+                self.emit_tool(run_id, tool, ToolPhase::Finished, &event_detail).await;
+                // Any side-effecting success may have changed the tree.
+                if effect != ToolEffect::ReadOnly {
+                    let mut state = self.state.lock().await;
+                    self.emit_locked(&mut state, EventData::WorkspaceChanged);
+                }
+                Ok(outcome.text)
             }
             Err(reason) => {
                 let _ = self
@@ -634,6 +762,7 @@ impl Kernel {
     pub(crate) async fn reasoning_token(&self, run_id: i64, token: String) {
         let mut state = self.state.lock().await;
         if state.shutting_down
+            || state.cancelled_run == Some(run_id)
             || state
                 .control
                 .as_ref()
@@ -653,6 +782,7 @@ impl Kernel {
     pub(crate) async fn token(&self, run_id: i64, token: String) {
         let mut state = self.state.lock().await;
         if state.shutting_down
+            || state.cancelled_run == Some(run_id)
             || state
                 .control
                 .as_ref()
@@ -749,6 +879,7 @@ impl Kernel {
             }
         }
         state.control = None;
+        state.cancelled_run = None;
         self.emit_locked(&mut state, EventData::Status { run });
         self.emit_locked(&mut state, EventData::SessionsChanged);
     }
@@ -801,6 +932,7 @@ mod tests {
             provider: crate::adapters::llm::Provider::Openai,
             reasoning: None,
             max_output: None,
+            session: None,
         }
     }
 
@@ -1216,6 +1348,29 @@ mod tests {
             .iter()
             .any(|event| matches!(event.data, EventData::ToolCall { phase: ToolPhase::Blocked, .. })));
         kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_is_not_queued_behind_other_commands() {
+        let (kernel, _) = test_kernel().await;
+        let (id, _receiver) = seed_run(&kernel).await;
+        // Simulate a long mutating command holding the command gate: stop must
+        // still reach the run instead of waiting for the queue.
+        let gate = kernel.commands.lock().await;
+        let cancelled = tokio::time::timeout(Duration::from_millis(200), kernel.cancel(id)).await;
+        drop(gate);
+        assert!(cancelled.is_ok(), "cancel must not wait for the command gate");
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_flag_is_visible_to_the_loop() {
+        let (kernel, _) = test_kernel().await;
+        let (id, _receiver) = seed_run(&kernel).await;
+        assert!(!kernel.is_cancelled(id).await);
+        kernel.state.lock().await.cancelled_run = Some(id);
+        assert!(kernel.is_cancelled(id).await);
         kernel.shutdown().await.unwrap();
     }
 
