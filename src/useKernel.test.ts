@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { conversationRuns, initialSnapshot, kernelReducer, reconcileSnapshot } from './lib/conversation';
+import { conversationRuns, initialSnapshot, kernelReducer, pendingApproval, reconcileSnapshot } from './lib/conversation';
 import type { RunView } from './api/types';
 
 describe('IPC state reconciliation', () => {
@@ -43,5 +43,17 @@ describe('IPC state reconciliation', () => {
     const snapshot = { ...initialSnapshot, activeRun: { ...run, output: 'live' }, lastRun: saved };
     expect(conversationRuns(detail, 2, snapshot).map((item) => item.output)).toEqual(['live', 'saved']);
     expect(conversationRuns(detail, 99, snapshot)).toEqual([]);
+  });
+});
+
+describe('pendingApproval', () => {
+  it('finds the single awaiting call and decodes its preview', () => {
+    expect(pendingApproval(undefined)).toBeNull();
+    expect(pendingApproval({ 1: [{ runId: 1, tool: 'read_file', detail: '', allowed: true, pending: true }] })).toBeNull();
+    const view = pendingApproval({ 7: [{ runId: 7, tool: 'write_file', detail: '{"kind":"write","path":"a.txt","exists":false,"old":"","new":"hi"}', allowed: true, awaitingApproval: true }] });
+    expect(view?.runId).toBe(7);
+    expect(view?.preview?.kind).toBe('write');
+    const cmd = pendingApproval({ 2: [{ runId: 2, tool: 'run_command', detail: '{"kind":"command","command":"npm test"}', allowed: true, awaitingApproval: true }] });
+    expect(cmd?.preview?.kind === 'command' && cmd.preview.command).toBe('npm test');
   });
 });

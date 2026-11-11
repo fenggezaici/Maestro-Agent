@@ -28,6 +28,7 @@ import { flattenFileTree } from '../commandCenter';
 import { readPinnedSessions, savePinnedSessions } from '../sessionGroups';
 import { mockExplorerFiles } from './workbenchMock';
 import { pickDirectory } from '../api/dialog';
+import { pendingApproval } from '../lib/conversation';
 import { useAppearance } from '../useAppearance';
 import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
@@ -59,6 +60,7 @@ export interface WorkbenchController {
   deleteSession?: (sessionId: number) => unknown;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (id: number) => unknown;
+  resolveApproval?: (runId: number, approved: boolean) => unknown;
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
 }
@@ -127,6 +129,12 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const lastSession = useRef(c.selectedSessionId);
   const promptBytes = new TextEncoder().encode(prompt.trim()).length;
   const plans = c.detail?.plans ?? [];
+  const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
+  // Surface suspended tool calls in the Review pane the moment they appear —
+  // the diff/command preview is what the user actually approves.
+  useEffect(() => {
+    if (approval) { setRightTab('review'); setReviewOpen(true); }
+  }, [approval]);
   const session = c.sessions.find((item) => item.id === c.selectedSessionId);
   const projects: WorkbenchProject[] = suppliedProjects ?? (c.projects ?? []).filter((project) => !project.archived).map((project) => ({
     id: String(project.id), name: project.name, path: project.path,
@@ -304,6 +312,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
               plans={plans} reasoningDisplay={preferences.reasoningDisplay} theme={theme} preview={preview}
               messageAttachments={messageAttachments} pending={c.pending}
               onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
+              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
               onScroll={() => { const element = history.current; if (element) { historyScrollTop.current = element.scrollTop; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 96; autoScroll.current = near; setAtBottom(near); } }} />
             <Composer atBottom={atBottom} onScrollBottom={() => { autoScroll.current = true; setAtBottom(true); history.current?.scrollTo({ top: history.current.scrollHeight, behavior: 'smooth' }); }}
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
@@ -321,7 +330,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setRightTab('review'); 
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel tab={rightTab} onTabChange={setRightTab} plans={plans} selectedId={selectedPlanId} onSelect={setSelectedPlanId} diffView={diffView} onDiffViewChange={setDiffView} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} workspaceName={currentProject.name} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
+      } review={reviewOpen ? <RightPanel tab={rightTab} onTabChange={setRightTab} plans={plans} selectedId={selectedPlanId} onSelect={setSelectedPlanId} diffView={diffView} onDiffViewChange={setDiffView} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} workspaceName={currentProject.name} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} pending={approval} onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}

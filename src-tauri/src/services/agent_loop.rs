@@ -23,10 +23,11 @@ const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 /// completed turns of the same session within a byte budget.
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
     let policy = match run.mode {
-        Mode::Plan => "你处于只读计划模式。可用 list_dir/read_file 读取工作区进行分析；不得执行有副作用的工具、修改文件或声称已应用变更。",
-        Mode::Code | Mode::Execute => "你处于 Code 模式。提出代码修改和具体 Diff，每次变更须等待批准。当前未启用执行器，不得声称已应用修改。",
-        Mode::Confirm => "你处于 Confirm 模式。每个工具或命令必须逐步确认。当前未启用工具执行器，不得声称已执行操作。",
-        Mode::Auto => "你处于 Auto 策略。仅可使用实际开放且授权的能力；当前只有文本聊天，不得声称拥有文件写入或命令执行能力。",
+        Mode::Plan => "你处于只读计划模式。仅可使用列表中提供的只读工具进行分析；写操作与命令执行不会出现在工具列表中，也不得声称已应用变更。",
+        Mode::Code => "你处于 Code 模式。读操作直接执行；写文件与命令类工具调用会挂起并展示给用户，经批准后才真实执行——你收到的工具结果才是真实执行结果，不得声称已应用未被批准的修改。",
+        Mode::Confirm => "你处于 Confirm 模式。每个工具调用（含只读）都会挂起等待用户逐项确认后才执行；以工具结果为准，不得声称已执行未经确认的操作。",
+        Mode::Execute => "你处于历史 execute 模式（遗留记录）。仅可使用实际开放且授权的能力。",
+        Mode::Auto => "你处于 Auto 策略。已开放的工具调用会直接执行；以工具结果为准，不得声称拥有未提供的能力。",
     };
     let mut messages = vec![ChatMessage::text("system", policy)];
     let prior: Vec<_> = detail
@@ -149,7 +150,7 @@ pub(crate) async fn run(
         }
         let detail = kernel.session_detail(run.session_id).await?;
         let mut messages = conversation(&detail, &run);
-        let tools = kernel.agent_tools().await;
+        let tools = kernel.agent_tools(run.mode).await;
         let provider = kernel.llm_provider(&config);
         for _round in 0..MAX_TOOL_ROUNDS {
             if *cancel.borrow() {

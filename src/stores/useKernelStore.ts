@@ -57,6 +57,7 @@ export interface KernelStore {
   deleteSession: (sessionId: number) => Promise<void>;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (runId: number) => Promise<void>;
+  resolveApproval: (runId: number, approved: boolean) => Promise<void>;
   setMode: (mode: Mode) => Promise<void>;
   decidePlan: (card: PlanCard, decision: PlanDecision) => Promise<PlanCard | undefined>;
 }
@@ -192,7 +193,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
           const { [event.run.id]: _reasoning, ...liveReasoning } = s.liveReasoning;
           const calls = s.liveTools[event.run.id];
           const liveTools = calls?.some((call) => call.pending)
-            ? { ...s.liveTools, [event.run.id]: calls.map((call) => call.pending ? { ...call, pending: undefined } : call) }
+            ? { ...s.liveTools, [event.run.id]: calls.map((call) => call.pending ? { ...call, pending: undefined, awaitingApproval: undefined } : call) }
             : s.liveTools;
           return { liveReasoning, liveTools };
         });
@@ -342,12 +343,13 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         const { [runId]: _reasoning, ...liveReasoning } = s.liveReasoning;
         const calls = s.liveTools[runId];
         const liveTools = calls?.some((call) => call.pending)
-          ? { ...s.liveTools, [runId]: calls.map((call) => call.pending ? { ...call, pending: undefined } : call) }
+          ? { ...s.liveTools, [runId]: calls.map((call) => call.pending ? { ...call, pending: undefined, awaitingApproval: undefined } : call) }
           : s.liveTools;
         return { liveReasoning, liveTools };
       });
       return command(() => kernelApi.abort(runId)).then(() => undefined);
     },
+    resolveApproval: (runId, approved) => command(() => kernelApi.resolveApproval(runId, approved)).then(() => undefined),
     setMode: (mode) => command(() => kernelApi.setMode(mode)).then(() => undefined),
     decidePlan: (card, decision) => command(async () => {
       const plan = await sessionsApi.decidePlan(card.sessionId, card.id, decision);

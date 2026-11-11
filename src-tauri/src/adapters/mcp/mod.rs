@@ -26,7 +26,7 @@ use crate::domain::{
 use config::{
     load_config, save_config, valid_server_config, valid_server_name,
 };
-use tools::{parse_tools, split_mcp_tool, tool_result_text};
+use tools::{call_result_text, parse_tools, split_mcp_tool};
 use transport::{
     read_loop, Pending, RunningServer, CALL_TIMEOUT, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
 };
@@ -306,7 +306,7 @@ impl McpManager {
                 CALL_TIMEOUT,
             )
             .await?;
-        Ok(tool_result_text(&result))
+        call_result_text(&result)
     }
 
     /// Report the readOnlyHint classification for authorization checks.

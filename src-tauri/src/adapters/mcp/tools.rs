@@ -55,6 +55,22 @@ pub fn parse_tools(listed: &Value) -> Vec<McpToolView> {
         .unwrap_or_default()
 }
 
+/// Interpret one `tools/call` result for the agent loop: a result flagged
+/// `isError` is a tool-reported failure and must surface as `Err` — the model
+/// never gets to treat a failed call as a success.
+pub fn call_result_text(result: &Value) -> Result<String, String> {
+    let text = tool_result_text(result);
+    if result
+        .get("isError")
+        .and_then(|flag| flag.as_bool())
+        .unwrap_or(false)
+    {
+        Err(text)
+    } else {
+        Ok(text)
+    }
+}
+
 /// Flatten an MCP tools/call result into bounded display text.
 pub fn tool_result_text(result: &Value) -> String {
     let text = result
@@ -85,6 +101,16 @@ mod tests {
         assert_eq!(split_mcp_tool("mcp__fs"), None);
         assert_eq!(split_mcp_tool("mcp____x"), None);
         assert_eq!(split_mcp_tool("mcp__fs__a__b"), None);
+    }
+
+    #[test]
+    fn iserror_results_surface_as_failures() {
+        let ok = json!({ "content": [{"type":"text","text":"done"}] });
+        assert_eq!(call_result_text(&ok).unwrap(), "done");
+        let failed = json!({ "isError": true, "content": [{"type":"text","text":"boom"}] });
+        assert_eq!(call_result_text(&failed).unwrap_err(), "boom");
+        let flagged_null = json!({ "isError": true });
+        assert!(call_result_text(&flagged_null).is_err());
     }
 
     #[test]

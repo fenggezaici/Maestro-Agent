@@ -686,6 +686,37 @@
 .tool-call-status.ok { background: #34d3991c; color: #6ee7b7; }
 .tool-call-status.blocked { background: #f871711c; color: #fca5a5; }
 .tool-call-detail { margin: 0; padding: 6px 12px 8px 26px; color: #9c92ad; font-size: 10px; white-space: pre-wrap; word-break: break-word; }
+.tool-call-status.pending { background: #fbbf241c; color: #fcd34d; }
+.tool-call-pending-icon { color: #fcd34d; flex-shrink: 0; }
+.tool-approval { margin: 6px 0 4px 26px; padding: 10px 12px; border: 1px solid #fbbf2430; border-radius: 8px; background: #fbbf2410; display: flex; flex-direction: column; gap: 8px; }
+.tool-approval-head { display: flex; align-items: center; gap: 7px; color: #e8ddf5; font-size: 11px; }
+.tool-approval-head svg { color: #fcd34d; flex-shrink: 0; }
+.tool-approval-badge { margin-left: auto; padding: 1px 7px; border-radius: 5px; background: #fbbf2426; color: #fcd34d; font-size: 9px; }
+.tool-approval-path { margin: 0; color: #b3a8c4; font-size: 10px; }
+.tool-approval-path code { font-family: Consolas, monospace; color: #e8ddf5; }
+.tool-approval-preview { margin: 0; max-height: 220px; overflow: auto; padding: 8px 10px; border-radius: 6px; background: #00000030; color: #d8cfe6; font-family: Consolas, monospace; font-size: 10px; white-space: pre-wrap; word-break: break-word; }
+.tool-approval-old summary { cursor: pointer; color: #9c92ad; font-size: 10px; }
+.tool-approval-old pre { margin: 4px 0 0; max-height: 120px; overflow: auto; padding: 6px 8px; border-radius: 6px; background: #00000020; color: #9c92ad; font-size: 10px; white-space: pre-wrap; word-break: break-word; }
+.tool-approval .approval-actions { justify-content: flex-end; }
+.tool-approval-command { display: flex; align-items: flex-start; gap: 8px; padding: 9px 11px; border-radius: 7px; background: #00000038; color: #d8cfe6; }
+.tool-approval-command svg { color: #fcd34d; flex-shrink: 0; margin-top: 1px; }
+.tool-approval-command code { font-family: Consolas, monospace; font-size: 11px; color: #f0e9f8; white-space: pre-wrap; word-break: break-word; }
+.pending-approval { margin: 0 0 14px; padding: 11px 12px; border: 1px solid #fbbf2430; border-radius: 10px; background: #fbbf240e; display: flex; flex-direction: column; gap: 9px; }
+.pending-approval-head { display: flex; align-items: center; gap: 7px; color: #e8ddf5; font-size: 12px; }
+.pending-approval-head svg { color: #fcd34d; flex-shrink: 0; }
+.pending-approval-diff { height: 320px; display: flex; flex-direction: column; border-radius: 8px; overflow: hidden; border: 1px solid #ffffff10; }
+[data-theme="light"] .tool-approval-command { background: #00000008; }
+[data-theme="light"] .tool-approval-command code { color: #3d3647; }
+[data-theme="light"] .pending-approval { background: #f59e0b10; border-color: #f59e0b30; }
+[data-theme="light"] .pending-approval-head { color: #3d3647; }
+[data-theme="light"] .tool-approval { background: #f59e0b12; border-color: #f59e0b30; }
+[data-theme="light"] .tool-approval-head { color: #3d3647; }
+[data-theme="light"] .tool-approval-path { color: #6b6280; }
+[data-theme="light"] .tool-approval-path code { color: #353535; }
+[data-theme="light"] .tool-approval-preview { background: #00000008; color: #4a4258; }
+[data-theme="light"] .tool-call-status.pending { background: #f59e0b20; color: #b45309; }
+[data-theme="light"] .tool-call-pending-icon, [data-theme="light"] .tool-approval-head svg, [data-theme="light"] .tool-approval-badge { color: #b45309; }
+[data-theme="light"] .tool-approval-badge { background: #f59e0b22; }
 [data-theme="light"] .tool-call-summary { background: #00000005; border-color: #0000000e; color: #3d3647; }
 
 /* Composer project chip + picker (ZCode-style compact control) */

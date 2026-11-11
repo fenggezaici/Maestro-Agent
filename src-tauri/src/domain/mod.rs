@@ -17,7 +17,7 @@ pub use extension::{
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use metrics::RunMetrics;
 pub use plan::{PlanCard, PlanDecision, PlanDraft, PlanStatus, ProposedDiff};
-pub use policy::{authorize, check_mode, ToolEffect, PLAN_TOOL_ALLOWLIST};
+pub use policy::{authorize, classify, gate, ToolEffect, ToolGate};
 pub use session::{
     Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot, ToolCallView,
 };

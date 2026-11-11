@@ -7,43 +7,61 @@ pub enum ToolEffect {
     ProcessExecution,
 }
 
-// Only these registered, implemented read tools are allowed in Plan Mode.
-pub const PLAN_TOOL_ALLOWLIST: &[&str] = &["read_session", "list_sessions", "load_skill"];
+/// What the kernel must do with a tool call under the run's mode.
+/// Resolved entirely on the backend — never accepted from frontend/model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolGate {
+    /// Execute immediately.
+    Allow,
+    /// Suspend the call and wait for an explicit user approval decision.
+    RequireApproval,
+    /// Refuse outright (reported to the model as a failed tool call).
+    Deny,
+}
 
-/// Classifications are resolved here, never accepted from the frontend/model.
-/// `mcp__*` tools are classified by the caller via `check_mode` using the
-/// server's own readOnlyHint annotation.
-pub fn authorize(mode: Mode, tool: &str) -> AppResult<ToolEffect> {
-    let effect = match tool {
+/// Classify a named tool by effect. `mcp__*` tools are classified by the
+/// caller (ToolRouter) via the server's own readOnlyHint annotation.
+pub fn classify(tool: &str) -> AppResult<ToolEffect> {
+    Ok(match tool {
         "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
         _ => return Err(format!("Unknown or unregistered tool: {tool}")),
-    };
-    check_mode(mode, effect, tool)?;
-    Ok(effect)
+    })
 }
 
 /// Mode gate applied to a resolved effect; shared by named and MCP tools.
-pub fn check_mode(mode: Mode, effect: ToolEffect, tool: &str) -> AppResult<()> {
-    if mode == Mode::Plan && !PLAN_TOOL_ALLOWLIST.contains(&tool) && effect != ToolEffect::ReadOnly {
-        return Err(format!(
+/// - Plan: read-only only — side-effect tools are denied and must also be
+///   stripped from the advertised tool list.
+/// - Code: reads execute; writes and process execution suspend for approval.
+/// - Confirm: every tool call suspends for per-call confirmation.
+/// - Auto/Execute: everything allowed.
+pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
+    match mode {
+        Mode::Plan => match effect {
+            ToolEffect::ReadOnly => ToolGate::Allow,
+            _ => ToolGate::Deny,
+        },
+        Mode::Code => match effect {
+            ToolEffect::ReadOnly => ToolGate::Allow,
+            _ => ToolGate::RequireApproval,
+        },
+        Mode::Confirm => ToolGate::RequireApproval,
+        Mode::Auto | Mode::Execute => ToolGate::Allow,
+    }
+}
+
+/// Legacy helper kept for callers that only need allow/deny semantics:
+/// classification plus gate; `RequireApproval` counts as authorized.
+pub fn authorize(mode: Mode, tool: &str) -> AppResult<ToolEffect> {
+    let effect = classify(tool)?;
+    match gate(mode, effect) {
+        ToolGate::Deny => Err(format!(
             "Plan Mode blocked tool: {tool}; only read tools are allowed"
-        ));
+        )),
+        _ => Ok(effect),
     }
-    if mode == Mode::Confirm {
-        return Err(
-            "Confirm mode requires per-tool confirmation; no confirmation executor is enabled"
-                .into(),
-        );
-    }
-    if mode == Mode::Code && effect != ToolEffect::ReadOnly {
-        return Err(
-            "Code mode requires approval of each concrete diff; writes are not enabled".into(),
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -52,7 +70,7 @@ mod tests {
 
     #[test]
     fn plan_mode_denies_side_effects_and_allows_read_only_work() {
-        for tool in PLAN_TOOL_ALLOWLIST {
+        for tool in ["read_session", "list_sessions", "load_skill", "list_dir", "read_file"] {
             assert_eq!(authorize(Mode::Plan, tool).unwrap(), ToolEffect::ReadOnly);
         }
         for tool in ["apply_patch", "write_file", "run_command"] {
@@ -61,14 +79,28 @@ mod tests {
     }
 
     #[test]
-    fn execute_mode_is_an_explicit_opt_in() {
+    fn gate_matrix_covers_every_mode_and_effect() {
+        use ToolGate::*;
+        for effect in [ToolEffect::ReadOnly, ToolEffect::WorkspaceWrite, ToolEffect::ProcessExecution] {
+            assert_eq!(gate(Mode::Confirm, effect), RequireApproval);
+            assert_eq!(gate(Mode::Auto, effect), Allow);
+            assert_eq!(gate(Mode::Execute, effect), Allow);
+        }
+        assert_eq!(gate(Mode::Plan, ToolEffect::ReadOnly), Allow);
+        assert_eq!(gate(Mode::Plan, ToolEffect::WorkspaceWrite), Deny);
+        assert_eq!(gate(Mode::Plan, ToolEffect::ProcessExecution), Deny);
+        assert_eq!(gate(Mode::Code, ToolEffect::ReadOnly), Allow);
+        assert_eq!(gate(Mode::Code, ToolEffect::WorkspaceWrite), RequireApproval);
+        assert_eq!(gate(Mode::Code, ToolEffect::ProcessExecution), RequireApproval);
+    }
+
+    #[test]
+    fn code_mode_authorizes_but_does_not_run_side_effects_directly() {
+        assert_eq!(authorize(Mode::Code, "write_file").unwrap(), ToolEffect::WorkspaceWrite);
+        assert_eq!(authorize(Mode::Code, "read_file").unwrap(), ToolEffect::ReadOnly);
         assert_eq!(
-            authorize(Mode::Execute, "apply_patch").unwrap(),
-            ToolEffect::WorkspaceWrite
-        );
-        assert_eq!(
-            authorize(Mode::Execute, "run_command").unwrap(),
-            ToolEffect::ProcessExecution
+            gate(Mode::Code, authorize(Mode::Code, "write_file").unwrap()),
+            ToolGate::RequireApproval
         );
     }
 
@@ -92,13 +124,5 @@ mod tests {
                 assert!(authorize(mode, tool).is_err());
             }
         }
-    }
-
-    #[test]
-    fn code_requires_diff_approval_and_confirm_blocks_unconfirmed_tools() {
-        assert!(authorize(Mode::Code, "read_session").is_ok());
-        assert!(authorize(Mode::Code, "write_file").is_err());
-        assert!(authorize(Mode::Confirm, "read_session").is_err());
-        assert!(authorize(Mode::Auto, "read_session").is_ok());
     }
 }

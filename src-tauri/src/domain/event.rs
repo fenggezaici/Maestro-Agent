@@ -19,6 +19,9 @@ pub struct KernelEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ToolPhase {
     Started,
+    /// Suspended awaiting a user approval decision; `detail` carries the
+    /// bounded preview payload (diff or arguments JSON) for the approval card.
+    AwaitingApproval,
     Finished,
     Failed,
     Blocked,

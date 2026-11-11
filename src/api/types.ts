@@ -53,7 +53,15 @@ export interface PlanCard {
   status: PlanStatus;
   draft: PlanDraft;
 }
-export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean }
+export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean }
+
+/// Payload carried in an `awaiting_approval` tool_call detail: the kernel's
+/// bounded preview of what would run. `write` diffs render in the Monaco
+/// panel; `command` renders as a terminal card; `args` is the generic fallback.
+export type ApprovalPreview =
+  | { kind: 'write'; path: string; exists: boolean; old: string; new: string }
+  | { kind: 'command'; command: string }
+  | { kind: 'args'; arguments: string };
 export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[] }
 
 /// Single `kernel-event` channel contract. Streamed text arrives already
@@ -69,6 +77,6 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'content'; runId: number; sessionId: number; token: string }
   | { type: 'plan_updated'; plan: PlanCard }
   | { type: 'sessions_changed' }
-  | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'finished' | 'failed' | 'blocked'; detail: string }
+  | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }
   | { type: 'reasoning'; runId: number; token: string }
 );

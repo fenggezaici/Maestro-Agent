@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 
 use std::sync::Mutex as StdMutex;
 
@@ -10,7 +10,7 @@ use crate::{
         llm::{provider_for, ChatConfig, LlmProvider, ProviderResolver},
     },
     domain::{
-        policy::{self, ToolEffect},
+        policy::{self, ToolEffect, ToolGate},
         AppResult, ChatMessage, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft,
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
         ToolPhase, ToolSpec,
@@ -25,6 +25,14 @@ struct Control {
     cancel: watch::Sender<bool>,
     done: watch::Receiver<bool>,
     finishing: bool,
+    /// A tool call suspended awaiting the user's approval decision. At most
+    /// one can exist (the agent loop is serial); dropping the responder
+    /// without answering counts as rejection.
+    pending: Option<PendingApproval>,
+}
+
+struct PendingApproval {
+    responder: oneshot::Sender<bool>,
 }
 
 struct RuntimeState {
@@ -107,6 +115,11 @@ impl Kernel {
     }
 
     pub async fn set_mode(&self, mode: Mode) -> AppResult<()> {
+        // `execute` exists only so historical run rows deserialize; it must
+        // never be selectable again — it bypasses every approval gate.
+        if mode == Mode::Execute {
+            return Err("execute 模式已废弃，仅用于历史记录，不可选择".into());
+        }
         let _command = self.commands.lock().await;
         {
             let state = self.state.lock().await;
@@ -210,6 +223,7 @@ impl Kernel {
                 cancel: cancel_tx,
                 done: done_rx,
                 finishing: false,
+                pending: None,
             });
             self.emit_locked(&mut state, EventData::Status { run: run.clone() });
             self.emit_locked(&mut state, EventData::SessionsChanged);
@@ -224,24 +238,38 @@ impl Kernel {
 
     pub async fn cancel(&self, run_id: i64) -> AppResult<()> {
         let _command = self.commands.lock().await;
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         // Idempotent best-effort: the control channel is a singleton for the
         // single in-flight run, so an id mismatch or an already-finished run
         // is a harmless no-op — never an error the UI should surface.
-        let Some(control) = state.control.as_ref() else { return Ok(()) };
+        let Some(control) = state.control.as_mut() else { return Ok(()) };
         if control.finishing {
             return Ok(());
         }
         let _ = control.cancel.send(true);
+        // Unblock any call suspended on an approval so the loop can observe
+        // the cancellation and finish instead of hanging on the user's answer.
+        if let Some(pending) = control.pending.take() {
+            let _ = pending.responder.send(false);
+        }
         let _ = run_id;
         Ok(())
     }
 
     /// Authorization is tied to the active run, never to a frontend-supplied mode.
+    /// Goes through the router so `mcp__*` tools resolve their readOnlyHint.
     pub async fn authorize_tool(&self, run_id: i64, tool: &str) -> AppResult<ToolEffect> {
-        let state = self.state.lock().await;
-        let run = Self::active_run_locked(&state, run_id)?;
-        policy::authorize(run.mode, tool)
+        let run = {
+            let state = self.state.lock().await;
+            Self::active_run_locked(&state, run_id)?
+        };
+        let effect = self.router.classify(tool).await?;
+        match policy::gate(run.mode, effect) {
+            ToolGate::Deny => Err(format!(
+                "Plan Mode blocked tool: {tool}; only read tools are allowed"
+            )),
+            _ => Ok(effect),
+        }
     }
 
     fn active_run_locked(state: &RuntimeState, run_id: i64) -> AppResult<RunView> {
@@ -288,14 +316,16 @@ impl Kernel {
     ) -> AppResult<serde_json::Value> {
         let _command = self.commands.lock().await;
         let run = Self::active_run_locked(&*self.state.lock().await, run_id)?;
-        let authorization = self.router.authorize(run.mode, tool).await.and_then(|effect| {
-            if effect != ToolEffect::ReadOnly {
-                Err(
-                    "Side-effect execution is not enabled in Phase 1; approval records intent only"
+        let authorization = self.router.classify(tool).await.and_then(|effect| {
+            match policy::gate(run.mode, effect) {
+                ToolGate::Allow => Ok(effect),
+                ToolGate::RequireApproval => Err(
+                    "Tool requires interactive approval; only the agent loop can request it"
                         .into(),
-                )
-            } else {
-                Ok(effect)
+                ),
+                ToolGate::Deny => Err(format!(
+                    "Plan Mode blocked tool: {tool}; only read tools are allowed"
+                )),
             }
         });
         if let Err(reason) = authorization {
@@ -318,15 +348,41 @@ impl Kernel {
         })
     }
 
-    /// Tool definitions offered to the model this run: skill loader, running
-    /// MCP tools, and the built-in workspace/session reads.
-    pub async fn agent_tools(&self) -> Vec<ToolSpec> {
-        self.router.tool_specs().await
+    /// Tool definitions offered to the model this run, already filtered by the
+    /// run's mode: denied tools never reach the request sent to the provider.
+    pub async fn agent_tools(&self, mode: Mode) -> Vec<ToolSpec> {
+        self.router.tool_specs(mode).await
     }
 
-    /// Execute one model-requested tool call: authorize, route, audit, return
-    /// bounded text for the next conversation turn. `tool_call` events replace
-    /// the old in-band `> 调用工具` narration — `run.output` stays pure text.
+    /// Record a blocked call in the audit log and emit the Blocked phase.
+    async fn block_tool(&self, run_id: i64, tool: &str, reason: String) -> AppResult<String> {
+        let _ = self
+            .database
+            .record_tool(run_id, tool.into(), reason.clone(), false)
+            .await;
+        self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
+        Err(reason)
+    }
+
+    /// Resolve a suspended tool call: `true` executes it, `false` rejects it.
+    /// A run holds at most one pending approval; unknown/stale calls error.
+    pub async fn resolve_approval(&self, run_id: i64, approved: bool) -> AppResult<()> {
+        let _command = self.commands.lock().await;
+        let mut state = self.state.lock().await;
+        Self::active_run_locked(&state, run_id)?;
+        let pending = state
+            .control
+            .as_mut()
+            .and_then(|control| control.pending.take())
+            .ok_or("没有等待批准的工具调用")?;
+        let _ = pending.responder.send(approved);
+        Ok(())
+    }
+
+    /// Execute one model-requested tool call: classify, apply the mode gate
+    /// (deny / suspend-for-approval / allow), route, audit, and return bounded
+    /// text for the next conversation turn. The approval wait never holds the
+    /// commands lock, so cancel/resolve/shutdown can always interpose.
     pub(crate) async fn execute_model_tool(
         &self,
         run_id: i64,
@@ -338,18 +394,56 @@ impl Kernel {
             Self::active_run_locked(&*self.state.lock().await, run_id)?
         };
         self.emit_tool(run_id, tool, ToolPhase::Started, "").await;
-        if let Err(reason) = self.router.authorize(run.mode, tool).await {
-            let _ = self
-                .database
-                .record_tool(run_id, tool.into(), reason.clone(), false)
-                .await;
-            self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
-            return Err(reason);
+        let effect = match self.router.classify(tool).await {
+            Ok(effect) => effect,
+            Err(reason) => return self.block_tool(run_id, tool, reason).await,
+        };
+        // One audit row per call: approval upgrades the terminal record's
+        // detail instead of writing a second row.
+        let mut audit = "extension";
+        match policy::gate(run.mode, effect) {
+            ToolGate::Deny => {
+                return self
+                    .block_tool(
+                        run_id,
+                        tool,
+                        format!("Plan Mode blocked tool: {tool}; only read tools are allowed"),
+                    )
+                    .await;
+            }
+            ToolGate::RequireApproval => {
+                let preview = self.router.approval_preview(tool, arguments_json).await;
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut state = self.state.lock().await;
+                    if Self::active_run_locked(&state, run_id).is_err() {
+                        return self
+                            .block_tool(run_id, tool, "Run no longer active".into())
+                            .await;
+                    }
+                    if let Some(control) = state.control.as_mut() {
+                        control.pending = Some(PendingApproval { responder: tx });
+                    }
+                }
+                self.emit_tool(run_id, tool, ToolPhase::AwaitingApproval, &preview)
+                    .await;
+                // No lock is held while suspended: cancel, resolve_approval and
+                // shutdown can all reach the pending responder. A dropped
+                // responder (run finished, shutdown) counts as rejection.
+                let approved = rx.await.unwrap_or(false);
+                if !approved {
+                    return self
+                        .block_tool(run_id, tool, "用户拒绝了该操作".into())
+                        .await;
+                }
+                audit = "user approved";
+            }
+            ToolGate::Allow => {}
         }
         match self.router.execute(run.session_id, tool, arguments_json).await {
             Ok(text) => {
                 self.database
-                    .record_tool(run_id, tool.into(), "extension".into(), true)
+                    .record_tool(run_id, tool.into(), audit.into(), true)
                     .await?;
                 self.emit_tool(run_id, tool, ToolPhase::Finished, "").await;
                 Ok(text)
@@ -647,6 +741,13 @@ impl Kernel {
         let mut state = self.state.lock().await;
         state.active_run = None;
         state.last_run = Some(run.clone());
+        // Reject any approval still suspended before dropping the control so
+        // a waiting execute_model_tool resolves as rejected, not as a hang.
+        if let Some(control) = state.control.as_mut() {
+            if let Some(pending) = control.pending.take() {
+                let _ = pending.responder.send(false);
+            }
+        }
         state.control = None;
         self.emit_locked(&mut state, EventData::Status { run });
         self.emit_locked(&mut state, EventData::SessionsChanged);
@@ -661,8 +762,11 @@ impl Kernel {
             let _command = self.commands.lock().await;
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            state.control.as_ref().map(|control| {
+            state.control.as_mut().map(|control| {
                 let _ = control.cancel.send(true);
+                if let Some(pending) = control.pending.take() {
+                    let _ = pending.responder.send(false);
+                }
                 control.done.clone()
             })
         };
@@ -839,9 +943,13 @@ mod tests {
 
     // Seed a run without the demo task to exercise the terminal boundary deterministically.
     async fn seed_run(kernel: &Arc<Kernel>) -> (i64, watch::Receiver<bool>) {
+        seed_run_mode(kernel, Mode::Plan).await
+    }
+
+    async fn seed_run_mode(kernel: &Arc<Kernel>, mode: Mode) -> (i64, watch::Receiver<bool>) {
         let id = kernel
             .database
-            .create_run("boundary".into(), Mode::Plan)
+            .create_run("boundary".into(), mode)
             .await
             .unwrap();
         let (cancel, receiver) = watch::channel(false);
@@ -861,7 +969,7 @@ mod tests {
             id,
             session_id,
             prompt: "boundary".into(),
-            mode: Mode::Plan,
+            mode,
             status: RunStatus::Running,
             output: String::new(),
             error: None,
@@ -870,6 +978,7 @@ mod tests {
             cancel,
             done,
             finishing: false,
+            pending: None,
         });
         (id, receiver)
     }
@@ -1000,5 +1109,197 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event.data, EventData::BackendError { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_mode_is_not_selectable_over_ipc() {
+        let (kernel, _) = test_kernel().await;
+        assert!(kernel.set_mode(Mode::Execute).await.is_err());
+        assert_eq!(kernel.snapshot().await.mode, Mode::Plan);
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_specs_are_filtered_by_mode() {
+        let (kernel, _) = test_kernel().await;
+        let plan: Vec<String> = kernel
+            .agent_tools(Mode::Plan)
+            .await
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(plan.iter().any(|name| name == "read_file"));
+        assert!(plan.iter().any(|name| name == "load_skill"));
+        assert!(!plan.iter().any(|name| name == "write_file"));
+        assert!(!plan.iter().any(|name| name == "apply_patch"));
+        assert!(!plan.iter().any(|name| name == "run_command"));
+        for mode in [Mode::Code, Mode::Confirm, Mode::Auto] {
+            let names: Vec<String> = kernel
+                .agent_tools(mode)
+                .await
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            assert!(names.iter().any(|name| name == "write_file"), "{mode:?}");
+            assert!(names.iter().any(|name| name == "run_command"), "{mode:?}");
+        }
+        kernel.shutdown().await.unwrap();
+    }
+
+    async fn wait_for_phase(
+        events: &Arc<StdMutex<Vec<KernelEvent>>>,
+        phase: ToolPhase,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(&event.data, EventData::ToolCall { phase: p, .. } if *p == phase))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn code_mode_write_suspends_for_approval_then_executes() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"a.txt","content":"hello"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel.resolve_approval(id, true).await.unwrap();
+        assert!(call.await.unwrap().is_ok());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "hello"
+        );
+        kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_approval_blocks_the_write() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"b.txt","content":"nope"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel.resolve_approval(id, false).await.unwrap();
+        assert!(call.await.unwrap().is_err());
+        assert!(!workspace.path().join("b.txt").exists());
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.data, EventData::ToolCall { phase: ToolPhase::Blocked, .. })));
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_rejects_a_suspended_approval() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"c.txt","content":"x"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel.cancel(id).await.unwrap();
+        assert!(call.await.unwrap().is_err());
+        assert!(!workspace.path().join("c.txt").exists());
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn code_mode_run_command_suspends_then_executes_after_approval() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "run_command", r#"{"command":"echo approved-run"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel.resolve_approval(id, true).await.unwrap();
+        let output = call.await.unwrap().unwrap();
+        assert!(output.contains("exit code 0"), "{output}");
+        assert!(output.contains("approved-run"), "{output}");
+        kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_mode_suspends_even_read_tools() {
+        let (kernel, events) = test_kernel().await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker.execute_model_tool(id, "list_sessions", "{}").await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel.resolve_approval(id, true).await.unwrap();
+        assert!(call.await.unwrap().is_ok());
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_skill_body_is_wrapped_in_a_system_warning() {
+        let (kernel, _) = test_kernel().await;
+        let skill_dir = kernel
+            .extensions()
+            .maestro_dir()
+            .join("skills")
+            .join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\n---\n\nskill body text",
+        )
+        .unwrap();
+        let (id, _rx) = seed_run(&kernel).await;
+        let text = kernel
+            .execute_model_tool(id, "load_skill", r#"{"name":"demo-skill"}"#)
+            .await
+            .unwrap();
+        assert!(text.contains("<system_warning>"));
+        assert!(text.contains("skill body text"));
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
     }
 }

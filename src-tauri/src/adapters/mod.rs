@@ -1,6 +1,7 @@
 //! Adapter layer: everything that touches the outside world (SQLite, the
 //! filesystem, MCP child processes, LLM HTTP transports).
 pub mod db;
+pub mod exec;
 pub mod fs;
 pub mod llm;
 pub mod mcp;

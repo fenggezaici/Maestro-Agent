@@ -52,6 +52,7 @@ pub fn run() {
             commands::kernel::set_mode,
             commands::kernel::cancel_agent,
             commands::kernel::abort_chat,
+            commands::kernel::resolve_tool_approval,
             commands::kernel::list_runs,
             commands::sessions::create_session,
             commands::sessions::set_session_archived,

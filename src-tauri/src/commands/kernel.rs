@@ -83,6 +83,20 @@ pub async fn abort_chat(
     cancel_agent(window, kernel, run_id).await
 }
 
+/// Approve or reject the active run's suspended tool call. The kernel only
+/// accepts this while a call is actually waiting — replayed or stale
+/// decisions error instead of being silently applied later.
+#[tauri::command]
+pub async fn resolve_tool_approval(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+    approved: bool,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.resolve_approval(run_id, approved).await
+}
+
 #[tauri::command]
 pub async fn list_runs(
     window: WebviewWindow,

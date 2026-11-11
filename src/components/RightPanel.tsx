@@ -5,16 +5,19 @@ import DiffPanel, { type DiffViewState } from './DiffPanel';
 import ExplorerPanel, { type ExplorerViewState } from './ExplorerPanel';
 import { mockExplorerFiles } from './workbenchMock';
 import type { PlanCard } from '../api/types';
+import type { PendingApprovalView } from '../lib/conversation';
 import LiveExplorerPanel from './LiveExplorerPanel';
 import type { WorkspaceController } from '../hooks/useWorkspace';
 
-export default function RightPanel({ tab, onTabChange, plans, selectedId, onSelect, diffView, onDiffViewChange, explorerView, onExplorerViewChange, scope, workspaceName, fontSize, fontFamily, preview, workspace }: {
+export default function RightPanel({ tab, onTabChange, plans, selectedId, onSelect, diffView, onDiffViewChange, explorerView, onExplorerViewChange, scope, workspaceName, fontSize, fontFamily, preview, workspace, pending, onResolveApproval }: {
   tab: 'review' | 'explorer'; onTabChange: (tab: 'review' | 'explorer') => void;
   plans: PlanCard[]; selectedId: number | null; onSelect: (id: number) => void;
   diffView: DiffViewState; onDiffViewChange: (view: DiffViewState) => void;
   explorerView: ExplorerViewState; onExplorerViewChange: (view: ExplorerViewState) => void;
   scope: string; workspaceName: string; fontSize: number; fontFamily: string;
   preview: boolean; workspace: WorkspaceController;
+  pending?: PendingApprovalView | null;
+  onResolveApproval?: (runId: number, approved: boolean) => void;
 }) {
   const plan = plans.find((item) => item.id === selectedId) ?? plans.at(-1);
   const files = useMemo(() => {
@@ -28,7 +31,7 @@ export default function RightPanel({ tab, onTabChange, plans, selectedId, onSele
       <Tabs.List aria-label="右侧视图"><Tabs.Trigger value="review" aria-label="Review"><GitCompareArrows size={14} />Review</Tabs.Trigger><Tabs.Trigger value="explorer" aria-label="Explorer"><Files size={14} />Explorer<span className="mock-badge">{preview ? 'Mock' : 'Local'}</span></Tabs.Trigger></Tabs.List>
     </Tabs.Root>
     <div className="right-panel-body">
-      {tab === 'review' ? <DiffPanel plans={plans} selectedId={selectedId} onSelect={onSelect} view={diffView} onViewChange={onDiffViewChange} workspaceName={workspaceName} fontSize={fontSize} fontFamily={fontFamily} />
+      {tab === 'review' ? <DiffPanel plans={plans} selectedId={selectedId} onSelect={onSelect} view={diffView} onViewChange={onDiffViewChange} workspaceName={workspaceName} fontSize={fontSize} fontFamily={fontFamily} pending={pending} onResolveApproval={preview ? undefined : onResolveApproval} />
         : preview ? <ExplorerPanel files={files} scope={scope} view={explorerView} onViewChange={onExplorerViewChange} fontSize={fontSize} fontFamily={fontFamily} />
           : <LiveExplorerPanel workspace={workspace} view={explorerView} onViewChange={onExplorerViewChange} fontSize={fontSize} fontFamily={fontFamily} />}
     </div>

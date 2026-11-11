@@ -1,7 +1,7 @@
 /// Pure kernel-state helpers: snapshot reducer, event folding, conversation
 /// assembly. No React, no IPC — unit-testable in isolation.
 import type {
-  ChatMessage, KernelEvent, RunView, SessionDetail, Snapshot, ToolCallView,
+  ApprovalPreview, ChatMessage, KernelEvent, RunView, SessionDetail, Snapshot, ToolCallView,
 } from '../api/types';
 
 export const initialSnapshot: Snapshot = {
@@ -65,11 +65,57 @@ export function applyToolEvent(
     tool: event.tool,
     detail: event.detail,
     allowed: event.phase !== 'blocked' && event.phase !== 'failed',
-    pending: event.phase === 'started' || undefined,
+    pending: event.phase === 'started' || event.phase === 'awaiting_approval' || undefined,
+    awaitingApproval: event.phase === 'awaiting_approval' || undefined,
   };
   if (event.phase === 'started' || pendingIndex < 0) list.push(entry);
   else list[pendingIndex] = entry;
   return { ...current, [event.runId]: list };
+}
+
+/// Decode the kernel's approval-preview JSON carried in an `awaiting_approval`
+/// detail. Anything malformed falls back to the generic args shape so the UI
+/// still shows what was asked.
+export function parseApprovalPreview(detail: string): ApprovalPreview | null {
+  try {
+    const value: unknown = JSON.parse(detail);
+    if (!value || typeof value !== 'object') return null;
+    const preview = value as Record<string, unknown>;
+    if (preview.kind === 'write') {
+      return {
+        kind: 'write',
+        path: typeof preview.path === 'string' ? preview.path : '',
+        exists: preview.exists === true,
+        old: typeof preview.old === 'string' ? preview.old : '',
+        new: typeof preview.new === 'string' ? preview.new : '',
+      };
+    }
+    if (preview.kind === 'command') {
+      return { kind: 'command', command: typeof preview.command === 'string' ? preview.command : '' };
+    }
+    if (preview.kind === 'args') {
+      return { kind: 'args', arguments: typeof preview.arguments === 'string' ? preview.arguments : detail };
+    }
+    return { kind: 'args', arguments: detail };
+  } catch {
+    return null;
+  }
+}
+
+export interface PendingApprovalView {
+  runId: number;
+  tool: string;
+  preview: ApprovalPreview | null;
+}
+
+/// The one call currently suspended on a user decision, if any — the agent
+/// loop is serial so at most one `awaitingApproval` row exists across runs.
+export function pendingApproval(liveTools: Record<number, ToolCallView[]> | undefined): PendingApprovalView | null {
+  for (const calls of Object.values(liveTools ?? {})) {
+    const call = calls.find((item) => item.awaitingApproval);
+    if (call) return { runId: call.runId, tool: call.tool, preview: parseApprovalPreview(call.detail) };
+  }
+  return null;
 }
 
 export function conversationRuns(detail: SessionDetail | null, sessionId: number | null, snapshot: Snapshot): RunView[] {

@@ -28,7 +28,7 @@ function cleanRunOutput(text: string): string {
   return text.replace(/(^|\n)> (?:调用工具|工具调用（?)：?(?!预算已用尽)[^\n]*/g, '$1').trimStart();
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveReasoning, liveReasoningMs, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveReasoning, liveReasoningMs, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onResolveApproval }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -46,6 +46,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onCopyError: (message: string) => void;
   onReviewPlan: (id: number) => void;
   onDecidePlan: (plan: Plan, decision: PlanDecision) => void;
+  onResolveApproval?: (runId: number, approved: boolean) => void;
 }) {
   return <div ref={historyRef} className="chat-history" aria-label="对话消息" onScroll={onScroll}>
     <div className="chat-history-inner">
@@ -53,8 +54,11 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
       {loadingSession && runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
       {runs.map((run) => <section key={run.id} className="conversation-turn" aria-label={`对话轮次 ${run.id}`}>
         <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><button type="button" className="user-copy-button" aria-label={`复制用户消息 ${run.id}`} onClick={async () => { try { await navigator.clipboard.writeText(run.prompt); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
-        {(() => { const calls = [...(detailTools ?? []), ...(liveTools?.[run.id] ?? [])].filter((call) => call.runId === run.id);
-          return calls.length > 0 && <ToolCallBlocks calls={calls} />; })()}
+        {(() => { const live = liveTools?.[run.id] ?? [];
+          // Live event rows already cover this run's calls; the DB audit
+          // snapshot would duplicate them, so prefer live whenever present.
+          const calls = live.length ? live : (detailTools ?? []).filter((call) => call.runId === run.id);
+          return calls.length > 0 && <ToolCallBlocks calls={calls} onResolveApproval={preview ? undefined : onResolveApproval} />; })()}
         {(() => {
           const { reasoning: inlineReasoning, content } = extractReasoning(run.output || '');
           const reasoning = (liveReasoning?.[run.id] ?? '') + inlineReasoning;
