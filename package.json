@@ -10,7 +10,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "screenshot": "node scripts/capture-ui.mjs",
+    "screenshot": "node scripts/capture-preview.mjs",
+    "screenshot:verify": "node scripts/capture-ui.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
