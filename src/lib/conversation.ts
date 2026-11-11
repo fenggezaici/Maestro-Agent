@@ -53,6 +53,16 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/// Relative time for the turn preview card (createdAt is unix seconds).
+export function relativeTime(createdAt: number | undefined, now = Date.now()): string {
+  if (!createdAt) return '刚刚';
+  const seconds = Math.max(0, Math.floor(now / 1000) - createdAt);
+  if (seconds < 60) return '刚刚';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
+}
+
 /// Fold one `tool_call` lifecycle event into the per-run tool list: `started`
 /// appends a pending row, later phases update it in place. Returns the touched
 /// row index so the reasoning timeline can keep the same ordering.

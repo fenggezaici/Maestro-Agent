@@ -102,6 +102,16 @@ it('renders a clickable turn rail once there are multiple turns', () => {
   expect(view.container.querySelector('.chat-turn-rail')).not.toBeNull();
   expect(ticks).toHaveLength(2);
   expect(ticks[1].getAttribute('aria-current')).toBe('location');
+
+  fireEvent.mouseEnter(ticks[0]);
+  const card = screen.getByRole('tooltip');
+  expect(card).toHaveTextContent('You');
+  expect(card).toHaveTextContent('Maestro');
+  expect(card).toHaveTextContent('first');
+  fireEvent.mouseLeave(ticks[0]);
+  expect(screen.queryByRole('tooltip')).toBeNull();
+
   fireEvent.click(ticks[0]);
   expect(onJumpToTurn).toHaveBeenCalledWith(1);
+  expect(view.container.querySelector('.conversation-turn')?.className).toContain('turn-flash');
 });

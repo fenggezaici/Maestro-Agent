@@ -15,6 +15,8 @@ export interface RunView {
   status: RunStatus;
   output: string;
   error: string | null;
+  /** Unix seconds; absent in older fixtures/mocks. */
+  createdAt?: number;
 }
 
 export interface Snapshot {

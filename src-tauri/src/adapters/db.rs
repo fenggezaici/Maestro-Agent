@@ -680,9 +680,9 @@ fn read_session_view(connection: &Connection, id: i64) -> AppResult<SessionView>
 
 fn read_runs(connection: &Connection, session_id: Option<i64>) -> AppResult<Vec<RunView>> {
     let query = if session_id.is_some() {
-        "SELECT id, session_id, prompt, mode, status, output, error FROM runs WHERE session_id = ?1 ORDER BY id"
+        "SELECT id, session_id, prompt, mode, status, output, error, created_at FROM runs WHERE session_id = ?1 ORDER BY id"
     } else {
-        "SELECT id, session_id, prompt, mode, status, output, error FROM runs WHERE ?1 IS NULL ORDER BY id DESC LIMIT 50"
+        "SELECT id, session_id, prompt, mode, status, output, error, created_at FROM runs WHERE ?1 IS NULL ORDER BY id DESC LIMIT 50"
     };
     let mut statement = connection.prepare(query).map_err(db_error)?;
     let rows = statement
@@ -710,6 +710,7 @@ fn read_runs(connection: &Connection, session_id: Option<i64>) -> AppResult<Vec<
                 status: RunStatus::from_db(&status),
                 output: row.get(5)?,
                 error: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })
         .map_err(db_error)?;
@@ -923,6 +924,7 @@ mod tests {
                         status: RunStatus::Completed,
                         output: "done".into(),
                         error: None,
+                        created_at: 0,
                     })
                     .await
                     .unwrap();
@@ -969,6 +971,7 @@ mod tests {
                 status: RunStatus::Completed,
                 output: "persisted".into(),
                 error: None,
+                created_at: 0,
             })
             .await
             .unwrap();
@@ -1025,6 +1028,7 @@ mod tests {
             status: RunStatus::Completed,
             output: "first result".into(),
             error: None,
+            created_at: 0,
         };
         database.finish_run(run.clone()).await.unwrap();
         assert!(database
@@ -1337,6 +1341,7 @@ mod tests {
                 status: RunStatus::Completed,
                 output: "done".into(),
                 error: None,
+                created_at: 0,
             })
             .await
             .unwrap();

@@ -19,5 +19,6 @@ pub use metrics::RunMetrics;
 pub use plan::{PlanCard, PlanDecision, PlanDraft, PlanStatus, ProposedDiff};
 pub use policy::{authorize, classify, gate, ToolEffect, ToolGate};
 pub use session::{
-    Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot, ToolCallView,
+    unix_now, Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
+    ToolCallView,
 };

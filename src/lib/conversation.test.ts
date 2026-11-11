@@ -1,6 +1,15 @@
 import { expect, it } from 'vitest';
 
-import { appendReasoning, appendTool, applyToolEventIndexed, closeReasoning } from './conversation';
+import { appendReasoning, appendTool, applyToolEventIndexed, closeReasoning, relativeTime } from './conversation';
+
+it('formats relative time for the turn preview card', () => {
+  const now = 1_700_000_000_000;
+  expect(relativeTime(undefined, now)).toBe('刚刚');
+  expect(relativeTime(now / 1000 - 30, now)).toBe('刚刚');
+  expect(relativeTime(now / 1000 - 120, now)).toBe('2 分钟前');
+  expect(relativeTime(now / 1000 - 7200, now)).toBe('2 小时前');
+  expect(relativeTime(now / 1000 - 172800, now)).toBe('2 天前');
+});
 
 it('splits reasoning bursts around tool calls and seals each one', () => {
   let items = appendReasoning(undefined, 'a', 100);

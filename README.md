@@ -17,6 +17,13 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 
 </details>
 
+<details>
+<summary>查看轮次预览卡片</summary>
+
+![Timeline turn hover card](artifacts/ui/maestro-turn-card.png)
+
+</details>
+
 以上为项目自带 Mock 数据的浏览器截图，展示布局与交互，不代表真实工作区、模型执行或原生桌面验收结果。
 
 ## 功能状态
@@ -31,6 +38,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
 | Review / 审批 | 提议 Diff 与单次计划决定；批准不应用修改，真实模型暂不自动生成审批卡片 |
 | IDE 工作台 | 可拖拽分栏、会话搜索与项目分组、Settings、应用内快捷键；对话左侧可点击轮次导航条 |
+| 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
 | Command Center | `Ctrl/Cmd+K` 顶部快速面板：命令 / 会话 / 文件模糊搜索、方向键导航、本地搜索历史 |
 | 会话列表 | 本地置顶与本日分组（今天 / 昨天 / 7 天内 / 更早）；置顶仅存 localStorage，不同步后端 |
 | 计划卡片 | 待审批默认展开、已结案折叠为摘要行；审批仍只记录决定 |

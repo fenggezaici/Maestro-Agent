@@ -220,6 +220,7 @@ impl Kernel {
             status: RunStatus::Running,
             output: String::new(),
             error: None,
+            created_at: crate::domain::unix_now(),
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(false);
@@ -1105,6 +1106,7 @@ mod tests {
             status: RunStatus::Running,
             output: String::new(),
             error: None,
+            created_at: 0,
         });
         state.control = Some(Control {
             cancel,

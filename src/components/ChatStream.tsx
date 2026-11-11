@@ -1,10 +1,10 @@
 /// Dumb chat stream: renders conversation turns, tool-call blocks, reasoning
 /// panes and plan cards. Everything arrives as props — no IPC, no stores.
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import { BrainCircuit, Copy, Pencil, WandSparkles } from 'lucide-react';
+import { BrainCircuit, Copy, Pencil, WandSparkles, Wrench } from 'lucide-react';
 
 import type { PlanCard as Plan, PlanDecision, RunView, ToolCallView } from '../api/types';
-import type { ReasoningSegment, TimelineItem } from '../lib/conversation';
+import { relativeTime, type ReasoningSegment, type TimelineItem } from '../lib/conversation';
 import type { UiPreferences } from '../uiPreferences';
 import CollapsibleBlock from './CollapsibleBlock';
 import PlanCard from './PlanCard';
@@ -53,6 +53,29 @@ function ReasoningNode({ segment, display }: { segment: ReasoningSegment; displa
     open={active ? true : undefined} contentClass="reasoning-content"><ReasoningText text={segment.text} streaming={active} /></CollapsibleBlock>;
 }
 
+const CARD_STATUS: Record<RunView['status'], string> = { running: '进行中', completed: '已完成', cancelled: '已停止', failed: '失败' };
+
+/// Dark preview card for one turn: role badges, relative time, prompt and
+/// answer snippets, plus the last tool call. Rendered next to the rail.
+function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]; preview: boolean }) {
+  const answer = cleanRunOutput(extractReasoning(run.output || '').content).trim();
+  const lastTool = calls[calls.length - 1]?.tool;
+  return <>
+    <div className="turn-card-head">
+      <span className="turn-role user">You</span>
+      <span className="turn-arrow">→</span>
+      <span className="turn-role agent">Maestro</span>
+      <span className="turn-time">{preview ? '示例' : relativeTime(run.createdAt)}</span>
+    </div>
+    <p className="turn-summary">{run.prompt || '（无提问）'}</p>
+    {answer && <p className="turn-answer">{answer}</p>}
+    <div className="turn-card-foot">
+      <span className={`turn-state ${run.status}`}>{CARD_STATUS[run.status]}</span>
+      {lastTool && <span className="turn-tool"><Wrench size={10} />{lastTool}</span>}
+    </div>
+  </>;
+}
+
 export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
@@ -76,7 +99,28 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
 }) {
   const railRef = useRef<HTMLElement>(null);
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
+  const [card, setCard] = useState<{ runId: number; top: number } | null>(null);
+  const [flashRunId, setFlashRunId] = useState<number | null>(null);
+  const flashTimer = useRef<number | undefined>(undefined);
   const turnKey = runs.map((run) => run.id).join(',');
+
+  const showCard = (runId: number, element: HTMLElement) => {
+    const shell = element.closest('.chat-history-shell');
+    const shellRect = shell?.getBoundingClientRect();
+    const rect = element.getBoundingClientRect();
+    const top = shellRect
+      ? Math.max(8, Math.min(rect.top - shellRect.top + rect.height / 2 - 36, shellRect.height - 130))
+      : 0;
+    setCard({ runId, top });
+  };
+
+  const flashTurn = (runId: number) => {
+    setFlashRunId(runId);
+    if (flashTimer.current) window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => setFlashRunId(null), 1200);
+  };
+
+  useEffect(() => () => { if (flashTimer.current) window.clearTimeout(flashTimer.current); }, []);
 
   // Current turn = the last one whose top has crossed the viewport top.
   useEffect(() => {
@@ -118,18 +162,32 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   }, [activeRunId]);
 
   return <div className={`chat-history-shell ${runs.length > 1 ? 'has-rail' : ''}`}>
-    {runs.length > 1 && <nav ref={railRef} className="chat-turn-rail" aria-label="对话轮次导航">
-      {runs.map((run, index) => <button key={run.id} type="button" className="chat-turn-tick"
-        aria-current={activeRunId === run.id ? 'location' : undefined}
-        aria-label={`跳转到第 ${index + 1} 轮：${run.prompt.replace(/\s+/g, ' ').slice(0, 80)}`}
-        title={run.prompt.slice(0, 200)}
-        onClick={() => onJumpToTurn?.(run.id)}><span aria-hidden="true" /></button>)}
-    </nav>}
+    {runs.length > 1 && <>
+      <nav ref={railRef} className="chat-turn-rail" aria-label="对话轮次导航">
+        {runs.map((run, index) => <button key={run.id} type="button" className="chat-turn-tick"
+          aria-current={activeRunId === run.id ? 'location' : undefined}
+          aria-label={`跳转到第 ${index + 1} 轮：${run.prompt.replace(/\s+/g, ' ').slice(0, 80)}`}
+          onMouseEnter={(event) => showCard(run.id, event.currentTarget)}
+          onMouseLeave={() => setCard(null)}
+          onFocus={(event) => showCard(run.id, event.currentTarget)}
+          onBlur={() => setCard(null)}
+          onClick={() => { flashTurn(run.id); onJumpToTurn?.(run.id); }}><span aria-hidden="true" /></button>)}
+      </nav>
+      {card && (() => {
+        const run = runs.find((item) => item.id === card.runId);
+        if (!run) return null;
+        const calls = liveTools?.[run.id] ?? (detailTools ?? []).filter((call) => call.runId === run.id);
+        return <div className="turn-hover-card" role="tooltip" style={{ top: card.top }}>
+          <span className="turn-card-arrow" aria-hidden="true" />
+          <TurnCard run={run} calls={calls} preview={preview} />
+        </div>;
+      })()}
+    </>}
     <div ref={historyRef} className="chat-history" aria-label="对话消息" onScroll={onScroll}>
       <div className="chat-history-inner">
         {runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>What should we build?</h3><p>描述你的任务。Agent 会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
         {loadingSession && runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
-        {runs.map((run) => <section key={run.id} className="conversation-turn" data-turn-id={run.id} aria-label={`对话轮次 ${run.id}`}>
+        {runs.map((run) => <section key={run.id} className={`conversation-turn ${flashRunId === run.id ? 'turn-flash' : ''}`} data-turn-id={run.id} aria-label={`对话轮次 ${run.id}`}>
           <div className="user-message-group">
             <article className="user-message"><div className="message-meta"><span className="user-avatar">Y</span><strong>You</strong><span>{preview ? '11:42 AM' : `#${run.id}`}</span></div><p>{run.prompt}</p><LocalAttachments items={messageAttachments[run.id] ?? []} sent /></article>
             <div className="user-message-actions">

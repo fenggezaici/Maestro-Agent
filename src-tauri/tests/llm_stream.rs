@@ -270,6 +270,7 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
         status: RunStatus::Running,
         output: String::new(),
         error: None,
+        created_at: 0,
     };
     let prior = RunView {
         id: 1,

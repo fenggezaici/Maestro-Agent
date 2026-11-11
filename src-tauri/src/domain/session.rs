@@ -64,6 +64,15 @@ pub struct RunView {
     pub status: RunStatus,
     pub output: String,
     pub error: Option<String>,
+    pub created_at: i64,
+}
+
+/// Unix seconds for a freshly created run (wall clock, UI relative time only).
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize)]

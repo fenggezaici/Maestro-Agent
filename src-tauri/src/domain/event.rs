@@ -148,6 +148,7 @@ mod tests {
             status: RunStatus::Completed,
             output: "done".into(),
             error: None,
+            created_at: 0,
         };
         let event = KernelEvent {
             sequence: 8,
@@ -158,7 +159,7 @@ mod tests {
             json!({
                 "sequence": 8, "type": "status", "run": {
                     "id": 7, "sessionId": 2, "prompt": "hello", "mode": "plan", "status": "completed",
-                    "output": "done", "error": null,
+                    "output": "done", "error": null, "createdAt": 0,
                 },
             })
         );
