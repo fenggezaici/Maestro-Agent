@@ -31,14 +31,14 @@ OpenAI and DeepSeek use Chat Completions SSE. Anthropic uses Messages, `x-api-ke
 
 ## Modes
 
-Rust owns selectable Plan / Code / Confirm / Auto; Code is the default.
+Rust owns selectable Plan / Code / Confirm / Auto; Plan is the backend default.
 
-- Plan: read-only policy.
-- Code: every concrete code diff requires approval.
-- Confirm: each tool/command requires explicit confirmation.
-- Auto: autonomous policy only over capabilities actually implemented and authorized.
+- Plan: read-only policy; side-effect tools are stripped from the model's tool list.
+- Code: reads run immediately; write/patch/command tools suspend for approval, then execute for real.
+- Confirm: every tool/command suspends for explicit per-call confirmation, then executes.
+- Auto: already-authorized tools execute directly, including writes and commands.
 
-**This version does not execute model tools, modify workspace files or run commands.** Mode selection does not create those executors. Code side effects and unconfirmed Confirm tools fail closed. Existing plan approval records intent only.
+Approving a plan only records intent — it never applies a diff by itself. Tool-level write/command calls are what produce approval cards; rejected or cancelled approvals leave the workspace untouched.
 Schema v3 transactionally rebuilds the mode constraint while preserving IDs/high-water state, legacy Plan/Execute rows, sessions, audits and plan decisions. Old Execute remains history-only, not a new selectable option.
 
 ## Usage and media
@@ -59,3 +59,12 @@ Local HTTP tests cover OpenAI usage and Anthropic text/thinking-budget/usage con
 
 R1/context correction: **70 frontend tests**, production TypeScript/Vite build and Chromium screenshot suite passed. The added coverage exercises aliases, provider-specific strengths, R1 local deployment metadata, Settings persistence and storage-failure rollback. Reproduction screenshots: `artifacts/ui/maestro-r1-context.png`, `maestro-thinking-strength.png`, `maestro-model-capabilities.png`. They use isolated frontend preview data, not cloud inference.
 
+
+
+## Timeline, tool rows and stop
+
+- Reasoning bursts, tool calls and assistant text share one ordered timeline. Consecutive reasoning/tool items form an execution phase (`已工作 X 秒`); assistant text is rendered at the exact point it arrived instead of being appended after the whole turn.
+- An execution phase starts expanded while the run is active and collapses when the phase ends or the run reaches a terminal state. Users can toggle it manually; manual state is not overridden.
+- Tool and reasoning rows expose a right-side chevron with `aria-expanded`. Finished tool rows are intentionally quiet (gray text/icons) and only brighten on hover; `已执行` is not rendered, while failed/awaiting calls keep a status label.
+- Clicking a file target opens the right-side Explorer and loads the file in Monaco. Historical runs use the same `onOpenFile` path as live runs.
+- Stop sends `abort_chat` and immediately seals the visible reasoning/tool state; there is no custom "stopping" pill. The final cancelled state is driven by the backend terminal event. The Rust kernel keeps a `cancelled_run` flag and a 250ms stream poll so cancellation does not depend on a single watch notification.

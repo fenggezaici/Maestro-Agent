@@ -15,7 +15,7 @@
 ## 边界
 
 - Preview（`?preview=1`）不调用 `invoke/listen`；live 专属能力（原生对话框、IPC）在 preview 下禁用，不造假。
-- Explorer 只读；工具执行、文件写入、命令执行未开放，不伪造后端能力。
+- Explorer 只读；写入/命令在 Plan 下被物理剥离，Code/Confirm 经审批后真实执行，Auto 直接执行；不伪造未实现的后端能力。
 - 未知模型的 context/thinking 不编造数字，显示"服务端配置"。
 
 ## 构建/运行环境

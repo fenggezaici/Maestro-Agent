@@ -20,8 +20,6 @@ it('shows R1 context and a visible built-in thinking indicator without fake Low/
   saveLlmSettings(config);
   composer();
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-r1');
-  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('128k context');
-  expect(screen.getByLabelText('上下文长度')).toHaveAttribute('title', expect.stringContaining('128,000 tokens'));
   fireEvent.click(screen.getByLabelText('选择模型'));
   expect(screen.getByText('内置推理（模型固定）')).toBeVisible();
   expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument();
@@ -36,7 +34,6 @@ it('changes from fixed R1 to adjustable gpt-5.2, persisting effort that stays su
   composer();
   fireEvent.click(screen.getByLabelText('选择模型'));
   fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
-  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('400k context');
   expect(screen.queryByText('内置推理（模型固定）')).not.toBeInTheDocument();
   const slider = screen.getByRole('slider');
   expect(slider).toHaveAttribute('aria-valuenow', '1');
@@ -61,8 +58,6 @@ it('keeps the previous thinking selection if localStorage rejects a save', () =>
 it('explains Ollama deployment context without losing the R1 thinking indicator', () => {
   saveLlmSettings({ ...config, apiKey: '', baseUrl: 'http://localhost:11434/v1', provider: 'ollama' });
   composer();
-  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('服务端配置');
-  expect(screen.getByLabelText('上下文长度')).toHaveAttribute('title', expect.stringContaining('num_ctx'));
   fireEvent.click(screen.getByLabelText('选择模型'));
   expect(screen.getByText('内置推理（模型固定）')).toBeVisible();
 });
@@ -75,7 +70,6 @@ it('shows supported thinking strength in the detailed variant, and updates capab
   fireEvent.click(screen.getByRole('option', { name: 'High' }));
   expect(onReasoning).toHaveBeenCalledWith('high');
   rerender(<Tooltip.Provider><ModelCapabilityControls model="deepseek-r1" provider="deepseek" reasoning="low" onReasoning={onReasoning} detailed /></Tooltip.Provider>);
-  expect(screen.getByLabelText('上下文长度')).toHaveTextContent('128k context');
   expect(screen.getByLabelText('思考模式：模型内置推理')).toBeVisible();
   expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument();
 });

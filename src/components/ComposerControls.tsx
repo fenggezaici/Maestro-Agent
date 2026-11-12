@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Gauge } from 'lucide-react';
 import { readLlmSettings, saveLlmSettings } from '../settings';
 import type { UiPreferences } from '../uiPreferences';
-import { contextLabel, type ProviderId, type ThinkingLevel } from '../modelCapabilities';
+import type { ProviderId, ThinkingLevel } from '../modelCapabilities';
 import { fetchModelsApi } from '../api/models';
 import { fetchedStale, saveFetchedModels } from '../modelFetch';
 import { loadCatalog, resolveCapability } from '../modelCatalog';
@@ -92,12 +91,6 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
     } catch (error) { onError(error instanceof Error ? error.message : '无法选择模型'); }
   }
 
-  const contextNote = context !== null
-    ? `模型参考上下文上限：${context.toLocaleString('en-US')} tokens。网关或部署配置可能更低；此处不是本次已用 Token 数。`
-    : provider === 'ollama'
-      ? '本地模型的实际上下文由 Ollama num_ctx / 服务配置决定；后台自动拉取 /api/show 的真实 context_length。'
-      : 'OpenAI 协议的 /models 不返回上下文与思考元数据；Settings→模型 可在模型列表中手动声明。';
-
   return <div className="composer-model-controls">
     <ModelPicker model={model} provider={provider} capability={capability} thinking={thinking} rows={rows}
       disabled={!preview && disabled}
@@ -111,6 +104,5 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
         try { saveLlmSettings({ ...readLlmSettings(), reasoning: value }); }
         catch (error) { setThinking(previous); onError(error instanceof Error ? error.message : 'Cannot save thinking mode'); }
       }} />
-    <span tabIndex={0} className="context-limit" aria-label="上下文长度" title={contextNote}><Gauge size={12} /><span>{contextLabel(context)}</span></span>
   </div>;
 }

@@ -67,6 +67,6 @@ export function saveUiPreferences(source: 'live' | 'preview', preferences: UiPre
 
 export function labels(language: UiPreferences['language']) {
   return language === 'zh-CN'
-    ? { agents: '会话', automations: '自动任务', extensions: '扩展', settings: '设置', general: '常规', appearance: '外观', models: '模型', shortcuts: '快捷键' }
-    : { agents: 'Agents', automations: 'Automations', extensions: 'Extensions', settings: 'Settings', general: 'General', appearance: 'Appearance', models: 'Models', shortcuts: 'Shortcuts' };
+    ? { agents: '会话', automations: '自动任务', extensions: '扩展', settings: '设置', general: '常规', appearance: '外观', models: '模型', shortcuts: '快捷键', agentSession: '智能体会话', workspace: '工作区', newAgent: '新会话', workspaceOverview: '工作区概览', backToChat: '返回对话', activityDashboard: '活动面板', workspaceInsights: '工作区洞察', proposedPlan: '建议计划', workspaceFiles: '工作区文件', localReadOnly: '本地 / 只读', noWorkspace: '未选择工作区', contextUsed: '上下文已用', workspaceCapabilities: '工作区能力', virtual: '虚拟' }
+    : { agents: 'Agents', automations: 'Automations', extensions: 'Extensions', settings: 'Settings', general: 'General', appearance: 'Appearance', models: 'Models', shortcuts: 'Shortcuts', agentSession: 'AGENT SESSION', workspace: 'WORKSPACE', newAgent: 'New agent', workspaceOverview: 'Workspace overview', backToChat: 'Back to Chat', activityDashboard: 'Activity Dashboard', workspaceInsights: 'WORKSPACE INSIGHTS', proposedPlan: 'PROPOSED PLAN', workspaceFiles: 'WORKSPACE FILES', localReadOnly: 'local / read only', noWorkspace: 'no workspace', contextUsed: 'context used', workspaceCapabilities: 'WORKSPACE CAPABILITIES', virtual: 'Virtual' };
 }

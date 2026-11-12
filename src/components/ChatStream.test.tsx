@@ -63,10 +63,25 @@ it('interleaves sealed reasoning nodes with tool rows and keeps the active burst
     reasoning('follow-up', 4000),
   ];
   render(<ChatStream {...base} liveTools={{ 1: calls }} liveTimeline={{ 1: timeline }} />);
-  expect(screen.getByRole('button', { name: /思考 · 持续了 3 秒/ })).toHaveAttribute('aria-expanded', 'false');
-  expect(screen.getByRole('button', { name: /思考 · 进行中/ })).toHaveAttribute('aria-expanded', 'true');
+  fireEvent.click(screen.getByRole('button', { name: /已工作 3 秒/ }));
+  expect(screen.getByText('思考 · 3 秒')).toBeInTheDocument();
+  expect(screen.getByText('思考 · 进行中…')).toBeInTheDocument();
   expect(screen.getByText('读取')).toBeInTheDocument();
   expect(screen.getByText('index.ts')).toBeInTheDocument();
+
+  const tool = screen.getByText('读取').closest('.tool-call-summary') as HTMLElement;
+  expect(tool).toHaveAttribute('aria-expanded', 'false');
+  const target = tool.querySelector('.tool-call-target-link');
+  expect(target?.nextElementSibling?.classList.contains('tool-call-chevron')).toBe(true);
+  expect(target?.nextElementSibling?.nextElementSibling?.classList.contains('tool-call-spacer')).toBe(true);
+  fireEvent.click(tool);
+  expect(tool).toHaveAttribute('aria-expanded', 'true');
+  expect(document.querySelector('.tool-call-panel')).not.toBeNull();
+
+  const reasoningToggle = screen.getByText('思考 · 3 秒').closest('.reasoning-toggle') as HTMLElement;
+  expect(reasoningToggle).toHaveAttribute('aria-expanded', 'false');
+  fireEvent.click(reasoningToggle);
+  expect(reasoningToggle).toHaveAttribute('aria-expanded', 'true');
 });
 
 it('no longer renders the assistant meta row or the message footnote', () => {
@@ -74,8 +89,9 @@ it('no longer renders the assistant meta row or the message footnote', () => {
   expect(screen.queryByText('Maestro')).toBeNull();
   expect(screen.queryByText('正在生成')).toBeNull();
   expect(screen.queryByText('模型回复 · 不执行工具或应用修改')).toBeNull();
-  expect(screen.queryByRole('button', { name: '复制回复 1' })).toBeNull();
+  expect(screen.getByRole('button', { name: '复制回复 1' })).toBeInTheDocument();
   expect(screen.getByLabelText('Agent 回复 1')).toBeInTheDocument();
+  expect(screen.getByLabelText('回复内容 1').closest('[data-turn-id="1"]')).not.toBeNull();
   expect(screen.getByRole('button', { name: '复制用户消息 1' })).toBeInTheDocument();
 });
 

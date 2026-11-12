@@ -1,71 +1,111 @@
-import { useEffect, useState, type ReactNode } from 'react';
-import { Group as PanelGroup, Panel, Separator as PanelResizeHandle, type Layout } from 'react-resizable-panels';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+
+const SIDEBAR_KEY = 'maestro.sidebar.width.v1';
+const REVIEW_KEY = 'maestro.review.width.v1';
+const SIDEBAR_MIN = 220;
+const SIDEBAR_MAX = 360;
+const REVIEW_MIN = 320;
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+function storedWidth(key: string, fallback: number) {
+  try {
+    const value = Number(localStorage.getItem(key));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  } catch { return fallback; }
+}
 
 function breakpoint() {
   if (typeof window === 'undefined') return 'desktop';
   return window.innerWidth <= 650 ? 'mobile' : window.innerWidth <= 1040 ? 'stacked' : 'desktop';
 }
 
-function loadLayout(key: string, ids: string[]): Layout | undefined {
-  try {
-    const layout: unknown = JSON.parse(localStorage.getItem(key) ?? 'null');
-    if (!layout || typeof layout !== 'object' || Array.isArray(layout)) return;
-    const values = ids.map((id) => (layout as Layout)[id]);
-    if (values.every((value) => Number.isFinite(value) && value >= 0 && value <= 100)
-      && Math.abs(values.reduce((total, value) => total + value, 0) - 100) < 0.1) return layout as Layout;
-  } catch { /* Ignore unavailable or invalid UI storage. */ }
-}
-
-function SavedGroup({ name, source, ids, orientation, children }: {
-  name: string; source: string; ids: string[]; orientation: 'horizontal' | 'vertical'; children: ReactNode;
-}) {
-  const key = `maestro.panels.v1.${source}.${name}`;
-  const [defaultLayout] = useState(() => loadLayout(key, ids));
-  return <PanelGroup id={`panels-${name}`} orientation={orientation} defaultLayout={defaultLayout}
-    className="workbench-panel-group" resizePreviewMode="panel" resizeTargetMinimumSize={{ fine: 8, coarse: 20 }}
-    onLayoutChanged={(layout, meta) => {
-      if (meta.isUserInteraction) {
-        try { localStorage.setItem(key, JSON.stringify(meta.requestedLayout ?? layout)); } catch { /* UI preferences only. */ }
-      }
-    }}>{children}</PanelGroup>;
-}
-
-function Handle({ id, label }: { id: string; label: string }) {
-  return <PanelResizeHandle id={id} aria-label={label} className="resizable-handle"><span /></PanelResizeHandle>;
-}
-
-export default function WorkbenchLayout({ sidebar, conversation, review, source }: {
+/// ZCode-style outer shell: plain flex + pixel widths + pointer drag. The
+/// sidebar is a normal DOM node, so inserting/removing the review column never
+/// remounts it or recalculates its width.
+export default function WorkbenchLayout({ sidebar, conversation, review }: {
   sidebar: ReactNode; conversation: ReactNode; review: ReactNode | null; source: 'live' | 'preview';
 }) {
   const [mode, setMode] = useState(breakpoint);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ kind: 'sidebar' | 'review'; startX: number; startWidth: number } | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(() => clamp(storedWidth(SIDEBAR_KEY, 280), SIDEBAR_MIN, SIDEBAR_MAX));
+  const [reviewWidth, setReviewWidth] = useState(() => storedWidth(REVIEW_KEY, 0));
+
   useEffect(() => {
     const update = () => setMode(breakpoint());
     window.addEventListener('resize', update);
     return () => window.removeEventListener('resize', update);
   }, []);
 
-  if (mode === 'mobile') return <div className="workbench-mobile" data-layout="mobile">{sidebar}{conversation}{review}</div>;
-  if (mode === 'stacked') return <div className="workbench-layout" data-layout="stacked">
-    <SavedGroup key={`stacked-${!!review}`} name={`stacked-${!!review}`} source={source} ids={['sidebar', 'main']} orientation="horizontal">
-      <Panel id="sidebar" defaultSize={320} minSize={180} maxSize="40%" groupResizeBehavior="preserve-pixel-size" className="panel-content">{sidebar}</Panel>
-      <Handle id="resize-sidebar-stacked" label="调整侧栏宽度" />
-      <Panel id="main" minSize={260} className="panel-content">
-        <SavedGroup key={`rows-${!!review}`} name={`rows-${!!review}`} source={source} ids={review ? ['chat', 'review'] : ['chat']} orientation="vertical">
-          <Panel id="chat" defaultSize={review ? '60%' : '100%'} minSize={280} className="panel-content">{conversation}</Panel>
-          {review && <><Handle id="resize-review-stacked" label="调整对话与 Diff 高度" /><Panel id="review" minSize={180} className="panel-content">{review}</Panel></>}
-        </SavedGroup>
-      </Panel>
-    </SavedGroup>
-  </div>;
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    shell.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+    const fallbackReview = shell.getBoundingClientRect().width * 0.42;
+    const width = clamp(reviewWidth || fallbackReview, REVIEW_MIN, shell.getBoundingClientRect().width * 0.65);
+    if (!reviewWidth) setReviewWidth(width);
+    shell.style.setProperty('--review-width', `${width}px`);
+  }, [sidebarWidth, reviewWidth]);
 
-  return <div className="workbench-layout" data-layout="desktop">
-    <SavedGroup key={`desktop-${!!review}`} name={`desktop-${!!review}`} source={source} ids={review ? ['sidebar', 'chat', 'review'] : ['sidebar', 'chat']} orientation="horizontal">
-      <Panel id="sidebar" defaultSize={240} minSize={180} maxSize="35%" groupResizeBehavior="preserve-pixel-size" className="panel-content">{sidebar}</Panel>
-      <Handle id="resize-sidebar" label="调整侧栏宽度" />
-      <Panel id="chat" minSize={280} className="panel-content">{conversation}</Panel>
-      {review && <><Handle id="resize-review" label="调整对话与 Diff 宽度" /><Panel id="review" defaultSize="45%" minSize={320} maxSize="65%" className="panel-content">{review}</Panel></>}
-    </SavedGroup>
+  const start = (kind: 'sidebar' | 'review', event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    const shell = shellRef.current;
+    if (!shell) return;
+    const startWidth = kind === 'sidebar' ? sidebarWidth : reviewWidth;
+    drag.current = { kind, startX: event.clientX, startWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  };
+
+  const move = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const session = drag.current;
+    const shell = shellRef.current;
+    if (!session || !shell) return;
+    const shellWidth = shell.getBoundingClientRect().width;
+    const delta = event.clientX - session.startX;
+    // Sidebar handle is on its right edge; review handle is on its left edge.
+    const next = session.kind === 'sidebar' ? session.startWidth + delta : session.startWidth - delta;
+    const width = session.kind === 'sidebar'
+      ? clamp(next, SIDEBAR_MIN, SIDEBAR_MAX)
+      : clamp(next, REVIEW_MIN, shellWidth * 0.65);
+    shell.style.setProperty(session.kind === 'sidebar' ? '--sidebar-width' : '--review-width', `${width}px`);
+  };
+
+  const end = () => {
+    const session = drag.current;
+    const shell = shellRef.current;
+    drag.current = null;
+    if (!session || !shell) return;
+    const raw = Number.parseFloat(shell.style.getPropertyValue(session.kind === 'sidebar' ? '--sidebar-width' : '--review-width'));
+    if (!Number.isFinite(raw)) return;
+    if (session.kind === 'sidebar') {
+      setSidebarWidth(raw);
+      try { localStorage.setItem(SIDEBAR_KEY, String(Math.round(raw))); } catch { /* UI only. */ }
+    } else {
+      setReviewWidth(raw);
+      try { localStorage.setItem(REVIEW_KEY, String(Math.round(raw))); } catch { /* UI only. */ }
+    }
+  };
+
+  if (mode === 'mobile') return <div className="workbench-mobile" data-layout="mobile">{sidebar}{conversation}{review}</div>;
+
+  return <div className={`workbench-layout ${mode === 'stacked' ? 'is-stacked' : ''}`} data-layout={mode} ref={shellRef}>
+    <aside className="panel-content sidebar-panel">{sidebar}</aside>
+    <div className="resize-handle" role="separator" aria-orientation="vertical" aria-label="调整侧栏宽度"
+      onPointerDown={(event) => start('sidebar', event)} onPointerMove={move} onPointerUp={end} onPointerCancel={end} />
+    <main className="panel-content main-panel">
+      {mode === 'stacked'
+        ? <div className="stacked-rows">
+            <div className="panel-content chat-panel">{conversation}</div>
+            {review && <><div className="resize-handle is-horizontal" /><section className="panel-content review-panel is-stacked">{review}</section></>}
+          </div>
+        : conversation}
+    </main>
+    {mode === 'desktop' && review && <>
+      <div className="resize-handle" role="separator" aria-orientation="vertical" aria-label="调整对话与 Diff 宽度"
+        onPointerDown={(event) => start('review', event)} onPointerMove={move} onPointerUp={end} onPointerCancel={end} />
+      <section className="panel-content review-panel">{review}</section>
+    </>}
   </div>;
 }
-
-

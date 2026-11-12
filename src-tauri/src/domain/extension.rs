@@ -52,6 +52,10 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Explicit user opt-in for this server's `readOnlyHint`. Default false:
+    /// an untrusted server's tools always count as side-effecting.
+    #[serde(default)]
+    pub trust: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -78,6 +82,7 @@ pub struct McpServerView {
     pub command: String,
     pub args: Vec<String>,
     pub disabled: bool,
+    pub trust: bool,
     pub running: bool,
     pub tool_count: usize,
     pub error: Option<String>,

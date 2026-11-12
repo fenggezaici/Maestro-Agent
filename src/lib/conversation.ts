@@ -5,7 +5,7 @@ import type {
 } from '../api/types';
 
 export const initialSnapshot: Snapshot = {
-  ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0,
+  ready: false, mode: 'plan', activeRun: null, lastRun: null, sequence: 0,
 };
 
 export type KernelAction =
@@ -104,7 +104,16 @@ export interface ReasoningSegment { text: string; startedAt: number; endedAt?: n
 /// happened. Tool items point at the row index in `liveTools`.
 export type TimelineItem =
   | { kind: 'reasoning'; segment: ReasoningSegment }
-  | { kind: 'tool'; index: number };
+  | { kind: 'tool'; index: number }
+  | { kind: 'content'; text: string };
+
+export function appendContent(items: TimelineItem[] | undefined, token: string): TimelineItem[] {
+  const list = [...(items ?? [])];
+  const last = list[list.length - 1];
+  if (last?.kind === 'content') list[list.length - 1] = { kind: 'content', text: last.text + token };
+  else list.push({ kind: 'content', text: token });
+  return list;
+}
 
 export function appendReasoning(items: TimelineItem[] | undefined, token: string, now: number): TimelineItem[] {
   const list = [...(items ?? [])];
@@ -239,13 +248,12 @@ export function reviewFiles(input: {
 
 /// The one call currently suspended on a user decision, if any — the agent
 /// loop is serial so at most one `awaitingApproval` row exists across runs.
-export type AgentStatus = 'stopping' | 'approval' | 'tool' | 'thinking' | 'working';
+export type AgentStatus = 'approval' | 'tool' | 'thinking' | 'working';
 
 /// Devin-style bottom status pill: the first matching live state wins —
 /// stopping > waiting for approval > tool executing > reasoning > working.
-export function agentStatus(input: { running: boolean; liveCalls?: ToolCallView[]; reasoning?: string; hasApproval?: boolean; stopping?: boolean }): AgentStatus | null {
+export function agentStatus(input: { running: boolean; liveCalls?: ToolCallView[]; reasoning?: string; hasApproval?: boolean }): AgentStatus | null {
   if (!input.running) return null;
-  if (input.stopping) return 'stopping';
   if (input.hasApproval) return 'approval';
   if (input.liveCalls?.some((call) => call.pending)) return 'tool';
   if (input.reasoning) return 'thinking';

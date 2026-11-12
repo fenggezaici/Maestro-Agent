@@ -92,15 +92,22 @@ export const useWorkspaceStore = create<WorkspaceStore>()((set, get) => ({
     if (!workspace?.path) return;
     const revision = ++fileRevision;
     set({ selectedPath: path, file: null, fileError: null, fileLoading: true });
+    let timer: number | undefined;
     try {
-      const content = await workspaceApi.text(workspace.path, path);
+      const timeout = new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error('读取文件超时')), 10_000);
+      });
+      const content = await Promise.race([workspaceApi.text(workspace.path, path), timeout]);
       if (mounted && revision === fileRevision && root?.path === workspace.path) {
         set({ file: { id: `disk:${workspace.path}:${path}`, path, content, source: 'disk' } });
       }
     } catch (reason) {
-      if (mounted && revision === fileRevision && root?.path === workspace.path) set({ fileError: errorMessage(reason) });
+      if (mounted && revision === fileRevision) set({ fileError: errorMessage(reason) });
     } finally {
-      if (mounted && revision === fileRevision && root?.path === workspace.path) set({ fileLoading: false });
+      if (timer) window.clearTimeout(timer);
+      // Always settle the spinner for the latest request, even if the root
+      // changed mid-read; otherwise the right pane can hang on "loading".
+      if (mounted && revision === fileRevision) set({ fileLoading: false });
     }
   },
 

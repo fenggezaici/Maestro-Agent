@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useT } from '../i18n';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { Braces, Check, ChevronDown, FileCode2, Folder, FolderOpen, GitCompareArrows, LockKeyhole, PanelsTopLeft, RefreshCw, Rows3 } from 'lucide-react';
@@ -105,6 +106,7 @@ export default function RightPanel({ listTab, onListTabChange, activeFile, onAct
   scope: string; fontSize: number; fontFamily: string;
 }) {
   const [split, setSplit] = useState(true);
+  const t = useT();
   // Agent write/command side effects bump this tick — coalesce bursts into one
   // refresh so a long tool loop cannot keep the tree permanently "loading".
   const tick = useKernelStore((s) => s.workspaceTick);
@@ -175,8 +177,8 @@ export default function RightPanel({ listTab, onListTabChange, activeFile, onAct
           {listTab === 'explorer' ? <>
             {!preview && <>
               <div className="list-workspace">
-                <span className="list-workspace-name">{workspace.info?.name ?? 'WORKSPACE'}</span>
-                <span className="list-workspace-meta">{workspace.info?.path ? 'local / read only' : 'no workspace'}</span>
+                <span className="list-workspace-name">{workspace.info?.name ?? t.workspace}</span>
+                <span className="list-workspace-meta">{workspace.info?.path ? t.localReadOnly : t.noWorkspace}</span>
                 <button type="button" className="icon-button" aria-label="打开工作区" disabled={workspace.loading || workspace.refreshing}
                   onClick={async () => { const picked = await pickDirectory(); if (picked) void workspace.selectWorkspace(picked); }}><FolderOpen size={12} /></button>
                 <button type="button" className="icon-button" aria-label="刷新文件树" disabled={workspace.loading || workspace.refreshing} onClick={() => void workspace.refresh()}><RefreshCw size={12} /></button>

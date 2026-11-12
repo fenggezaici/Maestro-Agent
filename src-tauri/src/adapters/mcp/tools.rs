@@ -7,6 +7,13 @@ use crate::domain::McpToolView;
 pub const MAX_TOOL_RESULT_BYTES: usize = 65536;
 pub const MAX_TOOLS_PER_SERVER: usize = 256;
 
+/// `readOnlyHint` is self-declared by the child process. Only an explicitly
+/// trusted server may use it to become read-only; untrusted servers are always
+/// treated as side-effecting (fail-closed).
+pub fn effective_read_only(trust: bool, read_only: bool) -> bool {
+    trust && read_only
+}
+
 /// Split `mcp__<server>__<tool>` into (server, tool); returns None otherwise.
 pub fn split_mcp_tool(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("mcp__")?;
@@ -122,8 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tools_with_read_only_annotations() {
-        let listed = json!({ "tools": [
+    fn parses_tools_with_read_only_annotations() {        let listed = json!({ "tools": [
             {"name":"read_file","description":"reads","annotations":{"readOnlyHint":true}},
             {"name":"write_file","description":"writes"},
         ]});
@@ -131,5 +137,13 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert!(tools[0].read_only && !tools[1].read_only);
         assert!(parse_tools(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn read_only_hint_requires_explicit_trust() {
+        assert!(!effective_read_only(false, true));
+        assert!(!effective_read_only(false, false));
+        assert!(!effective_read_only(true, false));
+        assert!(effective_read_only(true, true));
     }
 }

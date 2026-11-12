@@ -1,7 +1,7 @@
 /// Dumb chat stream: renders conversation turns, tool-call blocks, reasoning
 /// panes and plan cards. Everything arrives as props — no IPC, no stores.
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import { BrainCircuit, Copy, Pencil, WandSparkles, Wrench } from 'lucide-react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { BrainCircuit, ChevronDown, ChevronRight, Clock3, Copy, Pencil, ThumbsDown, ThumbsUp, WandSparkles, Wrench } from 'lucide-react';
 
 import type { PlanCard as Plan, PlanDecision, RunView, ToolCallView } from '../api/types';
 import { relativeTime, type ReasoningSegment, type TimelineItem } from '../lib/conversation';
@@ -49,9 +49,60 @@ function ReasoningNode({ segment, display }: { segment: ReasoningSegment; displa
   if (display === 'hidden') return null;
   const active = segment.endedAt === undefined;
   const seconds = active ? 0 : Math.max(1, Math.round((segment.endedAt! - segment.startedAt) / 1000));
-  return <CollapsibleBlock title={active ? '思考 · 进行中…' : `思考 · 持续了 ${seconds} 秒`} icon={<BrainCircuit size={13} />}
-    open={active ? true : undefined} contentClass="reasoning-content"><ReasoningText text={segment.text} streaming={active} /></CollapsibleBlock>;
+  const [open, setOpen] = useState(active);
+  useEffect(() => { if (active) setOpen(true); }, [active]);
+  return <div className="execution-reasoning">
+    <button type="button" className="execution-row reasoning-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+      <BrainCircuit size={12} /><span>{active ? '思考 · 进行中…' : `思考 · ${seconds} 秒`}</span>
+      {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+    </button>
+    {open && <div className="reasoning-content execution-reasoning-body"><ReasoningText text={segment.text} streaming={active} /></div>}
+  </div>;
 }
+
+/// One turn's middle work: every reasoning burst and tool call. Collapsed to a
+/// single "worked for X" row by default; expands on demand and auto-collapses
+/// once the final answer starts (unless the user opened it manually).
+function ExecutionGroup({ timeline, running, children }: { timeline: TimelineItem[]; running: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(running);
+  const manual = useRef(false);
+  useEffect(() => {
+    if (manual.current) return;
+    setOpen(running);
+  }, [running]);
+  const sealed = timeline.flatMap((item) => item.kind === 'reasoning' && item.segment.endedAt !== undefined ? [item.segment.startedAt, item.segment.endedAt] : []);
+  const ms = sealed.length ? Math.max(...sealed) - Math.min(...sealed) : 0;
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  const tools = timeline.filter((item) => item.kind === 'tool').length;
+  const label = ms > 0 ? (seconds >= 60 ? `已工作 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `已工作 ${seconds} 秒`) : `已执行 ${tools} 个工具`;
+  return <div className={`execution-group ${open ? 'open' : ''}`}>
+    <button type="button" className="execution-summary" aria-expanded={open}
+      onClick={() => { manual.current = true; setOpen((value) => !value); }}>
+      <Clock3 size={12} /><span>{label}</span><ChevronRight size={12} className="execution-chevron" />
+    </button>
+    <div className="execution-body" aria-hidden={!open}>{children}</div>
+  </div>;
+}
+
+/// Copy / feedback / timestamp under the final answer. Votes are local UI state
+/// only — there is no feedback backend yet.
+function MessageActions({ run, onCopyError }: { run: RunView; onCopyError: (message: string) => void }) {
+  const [vote, setVote] = useState<'up' | 'down' | null>(null);
+  const time = run.createdAt
+    ? new Date(run.createdAt * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : '';
+  return <div className="message-actions">
+    <button type="button" className="message-action" aria-label={`复制回复 ${run.id}`}
+      onClick={async () => { try { await navigator.clipboard.writeText(run.output); } catch { onCopyError('Cannot access clipboard'); } }}><Copy size={12} /></button>
+    <button type="button" className="message-action" aria-label={`点赞回复 ${run.id}`} aria-pressed={vote === 'up'}
+      onClick={() => setVote((value) => value === 'up' ? null : 'up')}><ThumbsUp size={12} /></button>
+    <button type="button" className="message-action" aria-label={`点踩回复 ${run.id}`} aria-pressed={vote === 'down'}
+      onClick={() => setVote((value) => value === 'down' ? null : 'down')}><ThumbsDown size={12} /></button>
+    {time && <span className="message-actions-time">{time}</span>}
+  </div>;
+}
+
+const greeting = () => { const hour = new Date().getHours(); return hour < 6 ? '夜深了' : hour < 12 ? '早上好' : hour < 14 ? '中午好' : hour < 18 ? '下午好' : '晚上好'; };
 
 const CARD_STATUS: Record<RunView['status'], string> = { running: '进行中', completed: '已完成', cancelled: '已停止', failed: '失败' };
 
@@ -76,7 +127,7 @@ function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]
   </>;
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -96,6 +147,8 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onSelectFile?: (path: string) => void;
   onEditPrompt?: (text: string) => void;
   onJumpToTurn?: (runId: number) => void;
+  onOpenFile?: (path: string) => void;
+  onResolveApproval?: (runId: number, approved: boolean) => void;
 }) {
   const railRef = useRef<HTMLElement>(null);
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
@@ -185,7 +238,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
     </>}
     <div ref={historyRef} className="chat-history" aria-label="对话消息" onScroll={onScroll}>
       <div className="chat-history-inner">
-        {runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>What should we build?</h3><p>描述你的任务。Agent 会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
+        {runs.length === 0 && <div className="conversation-welcome"><span className="welcome-icon"><WandSparkles size={27} strokeWidth={1.2} /></span><h3>{greeting()}，要不要先休息一下？</h3><p>或者告诉我你想构建什么，我会先规划，再提交可审查的变更。</p><div className="welcome-suggestions">重构模块<span>·</span>排查问题<span>·</span>审查代码</div></div>}
         {loadingSession && runs.length === 0 && <p className="loading-note">正在加载会话…</p>}
         {runs.map((run) => <section key={run.id} className={`conversation-turn ${flashRunId === run.id ? 'turn-flash' : ''}`} data-turn-id={run.id} aria-label={`对话轮次 ${run.id}`}>
           <div className="user-message-group">
@@ -205,20 +258,37 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
           // audit tool list plus one inline-thinking block.
           return <>
             {timeline?.length
-              ? <div className="reasoning-timeline" aria-label={`思考与工具时间线 ${run.id}`}>
-                {timeline.map((item, index) => {
-                  if (item.kind === 'reasoning') return <ReasoningNode key={`r${index}`} segment={item.segment} display={reasoningDisplay} />;
-                  const call = liveCalls[item.index];
-                  return call ? <div key={`t${index}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} /></div> : null;
-                })}
-              </div>
+              ? (() => {
+                const blocks: Array<{ key: string; items?: TimelineItem[]; text?: string }> = [];
+                timeline.forEach((item, index) => {
+                  if (item.kind === 'content') { blocks.push({ key: `c${index}`, text: item.text }); return; }
+                  const last = blocks[blocks.length - 1];
+                  if (last && last.items) last.items.push(item);
+                  else blocks.push({ key: `e${index}`, items: [item] });
+                });
+                const hasContent = blocks.some((block) => block.text !== undefined);
+                return <>
+                  {blocks.map((block, index) => block.text !== undefined
+                    ? <div key={block.key} aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={block.text} light={theme === 'light'} /></div>
+                    : <ExecutionGroup key={block.key} timeline={block.items!} running={run.status === 'running' && index === blocks.length - 1}>
+                        {block.items!.map((item, itemIndex) => {
+                          if (item.kind === 'reasoning') return <ReasoningNode key={`r${itemIndex}`} segment={item.segment} display={reasoningDisplay} />;
+                          const call = item.kind === 'tool' ? liveCalls[item.index] : undefined;
+                          return call ? <div key={`t${itemIndex}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onResolveApproval={onResolveApproval} /></div> : null;
+                        })}
+                      </ExecutionGroup>)}
+                  {!hasContent && (body !== '' || run.status !== 'running') &&
+                    <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
+                </>;
+              })()
               : <>
-                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} />}
+                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} onOpenFile={onOpenFile} />}
                 {inlineReasoning && reasoningDisplay !== 'hidden' &&
                   <CollapsibleBlock title="思考" icon={<BrainCircuit size={13} />} contentClass="reasoning-content"><ReasoningText text={inlineReasoning} streaming={false} /></CollapsibleBlock>}
               </>}
-            {(body !== '' || run.status !== 'running') &&
+            {!timeline?.length && (body !== '' || run.status !== 'running') &&
               <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
+            {body !== '' && <MessageActions run={run} onCopyError={onCopyError} />}
           </>;
         })()}
         <article aria-label={`Agent 回复 ${run.id}`} className="agent-message">

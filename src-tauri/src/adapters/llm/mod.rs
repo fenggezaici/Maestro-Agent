@@ -239,10 +239,26 @@ pub(crate) async fn stream_common(
     if *cancel.borrow() {
         return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
     }
+    let host = request
+        .try_clone()
+        .and_then(|builder| builder.build().ok())
+        .and_then(|request| request.url().host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into());
     let response = tokio::select! {
         biased;
         _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
-        response = request.send() => response.map_err(|error| if error.is_timeout() { "模型连接超时" } else { "无法连接模型服务，请检查地址、网络和 TLS 证书" }.to_string())?,
+        response = request.send() => response.map_err(|error| {
+            eprintln!("LLM request failed: host={host} error={error}");
+            if error.is_timeout() {
+                format!("模型连接超时（{host}）")
+            } else if error.is_connect() {
+                format!("无法连接模型服务（{host}）：连接被拒绝或不可达")
+            } else if error.is_request() {
+                format!("无法连接模型服务（{host}）：TLS/请求错误")
+            } else {
+                format!("无法连接模型服务（{host}）：{error}")
+            }
+        })?,
     };
     if !response.status().is_success() {
         let code = response.status().as_u16();

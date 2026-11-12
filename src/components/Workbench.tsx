@@ -24,6 +24,7 @@ import useExtensions, { type ExtensionsController } from '../hooks/useExtensions
 import { formatShortcut, labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
 import { useWorkspace } from '../hooks/useWorkspace';
 import { useStickyScroll } from '../hooks/useStickyScroll';
+import { I18nProvider } from '../i18n';
 import CommandCenter, { type PaletteCommand } from './CommandCenter';
 import { flattenFileTree } from '../commandCenter';
 import { readPinnedSessions, savePinnedSessions } from '../sessionGroups';
@@ -31,7 +32,6 @@ import { mockExplorerFiles } from './workbenchMock';
 import { pickDirectory } from '../api/dialog';
 import { agentStatus, pendingApproval, reviewFiles, type TimelineItem } from '../lib/conversation';
 import { useAppearance } from '../useAppearance';
-import MarkdownMessage from './MarkdownMessage';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import SessionStats from './SessionStats';
 import ChatStream from './ChatStream';
@@ -132,7 +132,8 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const plans = c.detail?.plans ?? [];
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
-  const status = agentStatus({ running: c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running'), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval), stopping: c.stoppingRunId !== null });
+  const stepCount = useMemo(() => Math.max(c.detail?.tools?.length ?? 0, Object.values(c.liveTools ?? {}).reduce((total, calls) => total + calls.length, 0)), [c.detail?.tools, c.liveTools]);
+  const status = agentStatus({ running: c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running'), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval) });
   // Surface suspended tool calls in the Review pane the moment they appear —
   // the diff/command preview is what the user actually approves.
   useEffect(() => {
@@ -222,26 +223,16 @@ ${item.text}\`\`\``).join('');
     else { setMessageAttachments((current) => ({ ...current, [runId]: sentAttachments })); setAttachments([]); }
   }
 
-  /// Strip tool-call narration leaked into persisted output (pre-fix runs) or
-/// emitted by non-function-calling models. Keeps the intentional
-/// `> 工具调用预算已用尽` note.
-/// Models without `reasoning_content` emit inline <think>…</think> blocks —
-/// pull them into the reasoning pane instead of the answer body.
-function extractReasoning(text: string): { reasoning: string; content: string } {
-  const parts: string[] = [];
-  const content = text.replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_m, inner: string) => { parts.push(inner); return ''; });
-  return { reasoning: parts.join('\n'), content };
-}
-
-function cleanRunOutput(text: string): string {
-  return text
-    .replace(/^\s*>\s*调用工具[^\n]*\n?/gm, '')
-    .replace(/^\s*调用工具[^\n]*\n?/gm, '')
-    .replace(/\n{3,}/g, '\n\n');
-}
-
 function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); setReviewOpen(true); }
   function selectReviewFile(path: string) { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }
+  function openWorkspaceFile(rawPath: string) {
+    const path = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!path) return;
+    setReviewOpen(true);
+    setListTab('explorer');
+    setActiveFile({ kind: 'workspace', path });
+    if (!preview) void workspace.selectFile(path);
+  }
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -263,7 +254,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
     return () => window.removeEventListener('keydown', onKey);
   }, [preferences.shortcuts, settingsOpen, paletteOpen]);
 
-  return <Tooltip.Provider delayDuration={250}>
+  return <I18nProvider language={preferences.language}><Tooltip.Provider delayDuration={250}>
     <div className={`workbench ${preview ? 'is-preview' : ''} ${!reviewOpen ? 'review-hidden' : ''}`} style={{ zoom: `${Number(preferences.fontScale) / 100}` }}>
       <WorkbenchLayout source={source} sidebar={
       <aside aria-label="会话列表" className="sessions-pane">
@@ -300,13 +291,14 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
           onDeleteProject={preview ? sessionActions?.deleteProject : c.deleteProject ? (id) => setDeleteTarget(projects.find((project) => project.id === id) ?? null) : undefined} />
         <div className="sidebar-bottom">
           <div className="connection-status"><span className={`status-dot ${c.state.ready && !preview ? 'connected' : ''}`} /><span role="status">{preview ? 'Frontend preview' : c.state.ready ? 'Rust 内核已就绪' : '正在连接 Rust 内核…'}</span><span className="local-tag">{preview ? 'MOCK' : 'LOCAL'}</span></div>
+          <span className="build-stamp" title={__BUILD_TIME__}>build {new Date(__BUILD_TIME__).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
           <button type="button" className="navigation-item sidebar-settings-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} strokeWidth={1.5} /><span>{text.settings}</span></button>
         </div>
       </aside>
       } conversation={
       <main aria-label={navigation === 'activity' ? 'Activity 工作区' : 'Agent 对话'} className="conversation-pane">
         <header className="conversation-header">
-          <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← 返回对话</button>}<span className="eyebrow">{navigation === 'agents' ? 'AGENT SESSION' : 'WORKSPACE'}</span><h2>{navigation === 'agents' ? session?.title ?? 'New agent' : navigation === 'activity' ? 'Workspace overview' : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
+          <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← {text.backToChat}</button>}<span className="eyebrow">{navigation === 'agents' ? text.agentSession : text.workspace}</span><h2>{navigation === 'agents' ? session?.title ?? text.newAgent : navigation === 'activity' ? text.workspaceOverview : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
           <div className="header-actions"><IconButton label="切换右侧面板" onClick={() => setReviewOpen(!reviewOpen)}>{reviewOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</IconButton>
             <IconButton label="会话信息" onClick={() => setSettingsOpen(true)}><MoreHorizontal size={17} /></IconButton></div>
         </header>
@@ -324,6 +316,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               messageAttachments={messageAttachments} pending={c.pending}
               onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
               onSelectFile={selectReviewFile}
+              onOpenFile={openWorkspaceFile}
               onEditPrompt={(text) => { setPrompt(text); setPromptFocus((value) => value + 1); }}
               onJumpToTurn={(runId) => {
                 const root = history.current;
@@ -332,13 +325,13 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
                 const top = root.scrollTop + turn.getBoundingClientRect().top - root.getBoundingClientRect().top - 12;
                 scroll.scrollToTop(top);
               }}
+              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
               onScroll={scroll.onScroll} />
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}
               preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
-              approval={approval} onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
-              status={status}
+              status={status} steps={stepCount}
               currentProject={currentProject} projects={projects}
               onSelectProject={(id) => c.selectProject?.(id)}
               onSetProjectPath={c.updateProjectPath ? (id, dir) => c.updateProjectPath!(id, dir) : undefined}
@@ -379,6 +372,6 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         return result?.error ?? null;
       }} />
     <ErrorToast message={toastError} onDismiss={dismissToast} />
-  </Tooltip.Provider>;
+  </Tooltip.Provider></I18nProvider>;
 }
 

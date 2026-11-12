@@ -75,6 +75,7 @@ pub fn run() {
             commands::extensions::import_skill_github,
             commands::extensions::list_mcp_servers,
             commands::extensions::add_mcp_server,
+            commands::extensions::set_mcp_server_trust,
             commands::extensions::import_mcp_json,
             commands::extensions::start_mcp_server,
             commands::extensions::stop_mcp_server,

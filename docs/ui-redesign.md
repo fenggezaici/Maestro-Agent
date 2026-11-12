@@ -5,8 +5,8 @@
 ## 设计与组件
 
 - Canvas `#171717`, sidebar Surface `#1e1e1e`, code surface `#1b1b1b`. Tonal backgrounds and spacing replace hard panel borders.
-- 初始 240px 侧栏、弹性对话区和约 45% Monaco 审查区；三栏可实时拖拽，尺寸在本地保存。
-- 使用 react-resizable-panels v4 的 Group / Panel / Separator（Group 在组件内别名为 PanelGroup），手柄仅 1px 可视线，提供扩大的拖拽命中区域与键盘调整。
+- 默认两栏：侧栏 280px（220-360，可拖拽并持久化）+ 弹性主舞台；打开文件/Diff 时才插入约 42% 的 Review 栏。
+- 外层布局使用自定义 flex + 像素宽度 + pointer drag（参考 ZCode 的 WorkspaceShellLayout），不再使用 react-resizable-panels，避免开关右栏时重挂载重置侧栏宽度。
 - 窄窗口使用嵌套纵向分栏，移动端单列；Monaco 自动调整尺寸，隐藏/恢复和断点切换保留文件及 Diff 模式。
 - 会话按 Workspace 使用 Radix Accordion 分组，保留展开状态；搜索临时展开匹配组，清空后恢复。
 - Activity 采用单行导航入口，点击后只切换中间工作区，不打开 Modal 或覆盖右侧 Diff。

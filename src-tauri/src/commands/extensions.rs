@@ -82,6 +82,7 @@ pub async fn add_mcp_server(
     name: String,
     command: String,
     args: Option<Vec<String>>,
+    trust: Option<bool>,
 ) -> AppResult<()> {
     require_main(&window)?;
     kernel.extensions().mcp.upsert_server(
@@ -91,8 +92,20 @@ pub async fn add_mcp_server(
             args: args.unwrap_or_default(),
             env: Default::default(),
             disabled: false,
+            trust: trust.unwrap_or(false),
         },
     )
+}
+
+#[tauri::command]
+pub async fn set_mcp_server_trust(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    name: String,
+    trust: bool,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.extensions().mcp.set_trust(&name, trust).await
 }
 
 #[tauri::command]

@@ -32,6 +32,8 @@ pub struct RunningServer {
     pub pending: Arc<Mutex<Pending>>,
     pub next_id: AtomicU64,
     pub tools: Vec<McpToolView>,
+    /// Whether the user explicitly trusts this server's readOnlyHint.
+    pub trust: bool,
     /// Set when the reader task died or the handshake/tool list failed.
     pub failed: Option<String>,
 }

@@ -1,5 +1,6 @@
 import { ChevronDown, FileCode2, Folder } from 'lucide-react';
 import { useMemo } from 'react';
+import { useT } from '../i18n';
 import MonacoCode from './MonacoCode';
 import type { ExplorerFile } from './workbenchMock';
 
@@ -29,6 +30,7 @@ export default function ExplorerPanel({ files, scope, view, onViewChange, fontSi
   files: ExplorerFile[]; scope: string; view: ExplorerViewState; onViewChange: (value: ExplorerViewState) => void; fontSize: number; fontFamily: string;
 }) {
   const tree = useMemo(() => fileTree(files, scope), [files, scope]);
+  const t = useT();
   const selected = files.find((file) => file.id === view.selected) ?? files[0];
   function nodes(items: TreeNode[], depth = 0) {
     return <ul>{items.map((node) => <li key={node.id}>
@@ -37,7 +39,7 @@ export default function ExplorerPanel({ files, scope, view, onViewChange, fontSi
     </li>)}</ul>;
   }
   return <section aria-label="文件浏览器" className="explorer-pane">
-    <div className="explorer-summary"><strong>WORKSPACE FILES</strong><span className="mock-badge">Virtual</span></div>
+    <div className="explorer-summary"><strong>{t.workspaceFiles}</strong><span className="mock-badge">{t.virtual}</span></div>
     <nav aria-label="虚拟文件树" className="explorer-tree">{nodes(tree)}</nav>
     {selected ? <><div className="explorer-file-heading"><FileCode2 size={13} /><span>{selected.path}</span><small>{selected.source === 'mock' ? 'Mock' : 'Proposal'}</small></div><MonacoCode file={selected} fontSize={fontSize} fontFamily={fontFamily} /></>
       : <div className="editor-empty">没有可预览的文件。</div>}

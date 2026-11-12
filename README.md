@@ -4,7 +4,7 @@
 
 Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作台。它将对话、会话管理和代码审查组织在可调整的三栏界面中，使用系统 WebView，不引入 Electron。
 
-> **开发阶段：Phase 3。**真实模型聊天、工具调用循环（Skill/MCP）和只读文件浏览已经实现；自主代码修改与命令执行尚未开放。部分界面用于明确标注的 Mock 演示。
+> **开发阶段：Phase 3。**真实模型聊天、工具调用循环（Skill/MCP）、只读文件浏览，以及经批准的写入/命令执行已经实现。部分界面用于明确标注的 Mock 演示。
 
 ## 界面预览
 
@@ -31,14 +31,19 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 功能 | 当前状态 |
 | --- | --- |
 | Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
-| 思考时间线 | reasoning 流按 `tool_call` / 正文时机切分为独立段，与工具调用按真实顺序交错渲染为单行折叠节点；活动段展开并自动贴底，结束后折叠为「思考 · 持续了 X 秒」 |
-| 停止生成 | 前端立即封存当前段并忽略该轮后续 token；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁 |
+| 执行时间线 | reasoning、tool_call 与正文都进入同一条时间线；连续思考/工具折叠为「已工作 X 秒」执行阶段，正文按真实事件位置穿插，不再固定堆在底部 |
+| 工具事件行 | 工具/思考行右侧 Chevron 展开详情；执行中亮色 + Loader，完成后整行与图标灰化、hover 恢复；点击文件名打开右侧 Explorer 并加载 Monaco |
+| 停止生成 | 前端封存当前段并忽略该轮后续 token；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁；不显示自定义「停止中」中间态，终态由后端事件驱动 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
-| Review / 审批 | 提议 Diff 与单次计划决定；批准不应用修改，真实模型暂不自动生成审批卡片 |
-| IDE 工作台 | 可拖拽分栏、会话搜索与项目分组、Settings、应用内快捷键；对话左侧可点击轮次导航条 |
+| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；真实模型的写文件/命令调用会生成工具级审批卡片 |
+| IDE 工作台 | 默认两栏（侧栏 + 主舞台），侧栏像素宽度 280（220-360）可拖拽并持久化；打开文件/Diff 时才插入右侧 Review 栏；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
+| 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip（`596K / 1M context used`），80% 变黄、90% 变红 |
+| 底部状态栏 | 轮次/步数、tok/s、tokens + 缓存命中率、细线 Context 圆环，统一灰色等宽数字排版 |
+| 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
+| 国际化 | 中英切换覆盖 Header、设置、计划卡、Activity、Explorer、工具状态、审批与欢迎页 |
 | Command Center | `Ctrl/Cmd+K` 顶部快速面板：命令 / 会话 / 文件模糊搜索、方向键导航、本地搜索历史 |
 | 会话列表 | 本地置顶与本日分组（今天 / 昨天 / 7 天内 / 更早）；置顶仅存 localStorage，不同步后端 |
 | 计划卡片 | 待审批默认展开、已结案折叠为摘要行；审批仍只记录决定 |
@@ -46,12 +51,12 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 模型能力 / 会话统计 | 动态思考选项与目录上下文上限，Provider usage/计时；缺失用量明确标为估算 |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
-| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`readOnlyHint` 参与模式授权 |
+| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效 |
 | 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计 |
 | 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
 | Activity | Dashboard 仍为 Mock 演示数据 |
 
-**Project-file writes, patch application, or shell command execution are still disabled.** Plan / Code (default) / Confirm / Auto are real Rust policies; selecting Auto or approving a plan does not create missing executors. MCP tools honor each server's `readOnlyHint` and the active mode; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
+**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code and Confirm suspend write/patch/command tools until the user approves, then execute them for real; Auto executes already-authorized tools directly. Approving a plan only records intent — it never applies a diff by itself. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
 
 ## 快速开始
 
@@ -129,8 +134,9 @@ commands/ (仅透传) → services/ (kernel · agent_loop · tool_router · exte
 | `src/api/` | 唯一 IPC 边界：types/kernel/sessions/extensions/workspace/dialog/models |
 | `src/stores/` | `useKernelStore`、`useWorkspaceStore`（zustand 全局状态与命令） |
 | `src/hooks/` | `useAgentStream`（事件订阅/重放/对齐）、`useKernel`、`useWorkspace`、`useExtensions`、`useStickyScroll`（rAF/ResizeObserver 贴底与用户上滑暂停） |
-| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、reasoning/tool 时间线切分、会话拼装 |
-| `src/components/` | Dumb 组件（ChatStream、Composer、Workbench 等），只接 props 不碰 IPC |
+| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、reasoning/tool/content 时间线切分、会话拼装 |
+| `src/components/` | Dumb 组件（ChatStream、Composer、WorkbenchLayout 自定义 flex 分栏、ContextRing 等），只接 props 不碰 IPC |
+| `src/i18n.tsx` | 轻量 I18nProvider / useT，按语言提供统一文案字典 |
 | `src/preview/` | 与真实 IPC/凭据隔离的前端预览数据（不调 invoke/listen） |
 | `src-tauri/src/commands/` | IPC 接口层，仅参数透传与错误包装 |
 | `src-tauri/src/services/` | `kernel`（生命周期/事件/取消）、`agent_loop`（ReAct）、`tool_router`（统一注册/分发）、`extensions` |

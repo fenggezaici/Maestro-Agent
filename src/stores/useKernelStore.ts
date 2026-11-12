@@ -11,7 +11,7 @@ import type {
   SessionDetail, SessionView, Snapshot, ToolCallView,
 } from '../api/types';
 import {
-  appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
+  appendContent, appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
   conversationRuns, errorMessage, initialSnapshot, kernelReducer, type KernelAction, type TimelineItem,
 } from '../lib/conversation';
 import { readLlmSettings, validateLlmSettings } from '../settings';
@@ -172,7 +172,14 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       // Hard stop: once the user pressed stop, ignore that run's answer tokens
       // immediately instead of waiting for the backend acknowledgement.
       if (action.type === 'event' && action.event.type === 'content' && get().stoppingRunId === action.event.runId) return;
-      set((s) => ({ state: kernelReducer(s.state, action) }));
+      set((s) => {
+        const state = kernelReducer(s.state, action);
+        if (action.type === 'event' && action.event.type === 'content') {
+          const { runId, token } = action.event;
+          return { state, liveTimeline: { ...s.liveTimeline, [runId]: appendContent(s.liveTimeline[runId], token) } };
+        }
+        return { state };
+      });
     },
 
     applySideEffects: (event) => {
@@ -381,9 +388,6 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       window.setTimeout(() => {
         if (get().state.activeRun?.id === runId) void abort();
       }, 1200);
-      window.setTimeout(() => {
-        if (get().state.activeRun?.id === runId && mounted) setError('停止请求未生效，请重试或重启客户端');
-      }, 4000);
       return Promise.resolve();
     },
     resolveApproval: (runId, approved) => command(() => kernelApi.resolveApproval(runId, approved)).then(() => undefined),

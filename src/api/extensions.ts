@@ -14,6 +14,8 @@ export interface McpServerView {
   command: string;
   args: string[];
   disabled: boolean;
+  /** Explicit user opt-in for honoring this server's readOnlyHint. */
+  trust: boolean;
   running: boolean;
   toolCount: number;
   error: string | null;
@@ -42,8 +44,10 @@ export const extensionsApi = {
   importSkillGithub: (repoUrl: string) =>
     invoke<SkillView[]>('import_skill_github', { repoUrl }),
   listMcpServers: () => invoke<McpServerView[]>('list_mcp_servers'),
-  addMcpServer: (name: string, command: string, args: string[]) =>
-    invoke<void>('add_mcp_server', { name, command, args }),
+  addMcpServer: (name: string, command: string, args: string[], trust = false) =>
+    invoke<void>('add_mcp_server', { name, command, args, trust }),
+  setMcpServerTrust: (name: string, trust: boolean) =>
+    invoke<void>('set_mcp_server_trust', { name, trust }),
   importMcpJson: (path: string) => invoke<number>('import_mcp_json', { path }),
   startMcpServer: (name: string) => invoke<McpServerView>('start_mcp_server', { name }),
   stopMcpServer: (name: string) => invoke<void>('stop_mcp_server', { name }),

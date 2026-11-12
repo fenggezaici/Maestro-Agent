@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
+  define: { __BUILD_TIME__: JSON.stringify(new Date().toISOString()) },
   plugins: [react(), tailwindcss()],
   resolve: {
     // Monaco also vendors DOMPurify: overriding npm alone would leave that copy vulnerable.

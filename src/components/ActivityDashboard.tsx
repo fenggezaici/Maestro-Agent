@@ -1,4 +1,5 @@
 import { ArrowLeft, CheckCheck, Coins, FileCode2, Sparkles, TrendingUp } from 'lucide-react';
+import { useT } from '../i18n';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from 'recharts';
 import ActivityGrid from './ActivityGrid';
 import type { MockDashboardData } from './activityMock';
@@ -6,6 +7,7 @@ import type { MockDashboardData } from './activityMock';
 export default function ActivityDashboard({ data, projectName, onBack }: {
   data: MockDashboardData; projectName: string; onBack: () => void;
 }) {
+  const t = useT();
   const metrics = [
     { label: 'Total Lines', value: data.totalLines.toLocaleString('en-US'), detail: 'Lines changed', icon: FileCode2 },
     { label: 'Plans Approved', value: String(data.approvedPlans), detail: 'Plans reviewed', icon: CheckCheck },
@@ -15,8 +17,8 @@ export default function ActivityDashboard({ data, projectName, onBack }: {
   const trendTotal = data.trend.reduce((total, day) => total + day.tokens, 0);
   return <section aria-label="Activity Dashboard" className="dashboard-scroll">
     <div className="dashboard-inner">
-      <button type="button" className="dashboard-back" onClick={onBack}><ArrowLeft size={13} />Back to Chat</button>
-      <div className="dashboard-title"><div><p className="eyebrow">WORKSPACE INSIGHTS</p><h3>Activity Dashboard</h3><p>{projectName} / 过去六个月的工作节奏</p></div><span className="mock-badge">Mock data</span></div>
+      <button type="button" className="dashboard-back" onClick={onBack}><ArrowLeft size={13} />{t.backToChat}</button>
+      <div className="dashboard-title"><div><p className="eyebrow">{t.workspaceInsights}</p><h3>{t.activityDashboard}</h3><p>{projectName} / 过去六个月的工作节奏</p></div><span className="mock-badge">Mock data</span></div>
       <p className="dashboard-disclaimer">所有指标均为前端 Mock，不代表真实代码修改、模型用量或账单。</p>
       <div className="dashboard-metrics" aria-label="核心指标">
         {metrics.map(({ label, value, detail, icon: Icon }) => <article key={label} aria-label={`${label}（Mock）`} className="metric-card">

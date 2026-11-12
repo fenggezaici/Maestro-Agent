@@ -23,6 +23,7 @@ export interface ExtensionsController {
   importSkill: (path: string) => Promise<string | null>;
   importSkillGithub: (repoUrl: string) => Promise<string | null>;
   addMcpServer: (name: string, command: string, args: string[]) => Promise<string | null>;
+  setMcpTrust: (server: McpServerView, trust: boolean) => Promise<void>;
   importMcpJson: (path: string) => Promise<string | null>;
   toggleMcpServer: (server: McpServerView, enable: boolean) => Promise<void>;
   removeMcpServer: (name: string) => Promise<string | null>;
@@ -107,6 +108,17 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
       action('github', () => extensionsApi.importSkillGithub(repoUrl), refresh),
     addMcpServer: (name, command, args) =>
       action('mcp-add', () => extensionsApi.addMcpServer(name, command, args), refresh),
+    setMcpTrust: async (server, trust) => {
+      setPending(`mcp-trust-${server.name}`);
+      try {
+        await extensionsApi.setMcpServerTrust(server.name, trust);
+        setServers((items) => items.map((item) => (item.name === server.name ? { ...item, trust } : item)));
+      } catch (reason) {
+        setServers((items) => items.map((item) => (item.name === server.name ? { ...item, error: errorMessage(reason) } : item)));
+      } finally {
+        setPending(null);
+      }
+    },
     importMcpJson: (path) => action('mcp-import', () => extensionsApi.importMcpJson(path), refresh),
     toggleMcpServer: async (server, enable) => {
       setPending(`mcp-${server.name}`);

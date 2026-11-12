@@ -83,6 +83,7 @@ impl McpManager {
                     command: server.command.clone(),
                     args: server.args.clone(),
                     disabled: server.disabled,
+                    trust: server.trust,
                     running,
                     tool_count: 0, // Filled by the async list_servers caller.
                     error: errors.get(name).cloned(),
@@ -171,6 +172,7 @@ impl McpManager {
                     command: config.command,
                     args: config.args,
                     disabled: false,
+                    trust: config.trust,
                     running: true,
                     tool_count: server.tools.len(),
                     error: server.failed.clone(),
@@ -188,6 +190,7 @@ impl McpManager {
                     command: config.command,
                     args: config.args,
                     disabled: false,
+                    trust: config.trust,
                     running: true,
                     tool_count: tools,
                     error: failed,
@@ -228,6 +231,7 @@ impl McpManager {
             pending,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
+            trust: config.trust,
             failed: None,
         };
         let handshake = async {
@@ -317,11 +321,33 @@ impl McpManager {
                 .lock()
                 .await
                 .get(server_name)
-                .and_then(|server| server.tools.iter().find(|tool| tool.name == tool_name))
-                .map(|tool| tool.read_only)
+                .and_then(|server| {
+                    server
+                        .tools
+                        .iter()
+                        .find(|tool| tool.name == tool_name)
+                        .map(|tool| (server.trust, tool.read_only))
+                })
+                .map(|(trust, read_only)| tools::effective_read_only(trust, read_only))
                 .unwrap_or(false),
             None => false,
         }
+    }
+
+    /// Toggle whether this server's `readOnlyHint` may be honored.
+    pub async fn set_trust(&self, name: &str, trust: bool) -> AppResult<()> {
+        let name = valid_server_name(name)?.to_string();
+        let mut file = self.load()?;
+        let server = file
+            .mcp_servers
+            .get_mut(&name)
+            .ok_or_else(|| format!("MCP 服务 {name} 不存在"))?;
+        server.trust = trust;
+        self.save(&file)?;
+        if let Some(running) = self.running.lock().await.get_mut(&name) {
+            running.trust = trust;
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&self) {

@@ -18,7 +18,7 @@ describe('IPC state reconciliation', () => {
     let state = kernelReducer(initialSnapshot, { type: 'event', event: { type: 'status', run, sequence: 2 } });
     state = kernelReducer(state, { type: 'event', event: { type: 'mode_changed', mode: 'auto', sequence: 1 } });
     state = kernelReducer(state, { type: 'event', event: { type: 'content', runId: 99, sessionId: 2, token: 'foreign', sequence: 3 } });
-    expect(state.mode).toBe('code');
+    expect(state.mode).toBe('plan');
     expect(state.activeRun?.output).toBe('');
   });
 

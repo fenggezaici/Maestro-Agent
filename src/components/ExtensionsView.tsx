@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react';
+import { useT } from '../i18n';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
@@ -125,6 +126,9 @@ function McpRow({ c, server }: { c: ExtensionsController; server: McpServerView 
         {busy ? '处理中…' : server.running ? `运行中 · 已加载 ${server.toolCount} 个工具` : server.error ? server.error : server.disabled ? '已禁用' : '已停止'}
       </span>
     </div>
+    <span className="extension-state" title="只有显式信任的服务才允许其 readOnlyHint 生效">信任只读</span>
+    <Switch.Root aria-label={`信任只读声明 ${server.name}`} className="settings-switch" checked={server.trust} disabled={busy}
+      onCheckedChange={(trust) => void c.setMcpTrust(server, trust)}><Switch.Thumb /></Switch.Root>
     <Switch.Root aria-label={`启用 ${server.name}`} className="settings-switch" checked={server.running} disabled={busy}
       onCheckedChange={(enable) => void c.toggleMcpServer(server, enable)}><Switch.Thumb /></Switch.Root>
     <button type="button" className="icon-button" aria-label={`删除 ${server.name}`} disabled={busy} onClick={() => void c.removeMcpServer(server.name)}><Trash2 size={13} /></button>
@@ -150,8 +154,9 @@ function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: R
 }
 
 export default function ExtensionsView({ controller: c }: { controller: ExtensionsController }) {
+  const t = useT();
   return <section aria-label="Extensions 工作区" className="extensions-view">
-    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">WORKSPACE CAPABILITIES</p><h3>Extensions</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
+    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">{t.workspaceCapabilities}</p><h3>{t.extensions}</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
     <Tabs.Root defaultValue="skills" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
       <Tabs.Trigger value="skills">技能</Tabs.Trigger>
       <Tabs.Trigger value="mcp">MCP 服务</Tabs.Trigger>

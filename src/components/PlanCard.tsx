@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { PlanCard as Plan, PlanDecision } from '../api/types';
+import { useT } from '../i18n';
 import { ArrowUpRight, Check, ChevronDown, FileCheck2, ListChecks, X } from 'lucide-react';
 
 export const planLabels = {
@@ -17,12 +18,13 @@ interface Props {
 
 export default function PlanCard({ plan, canDecide, pending, preview = false, onReview, onDecision }: Props) {
   const [open, setOpen] = useState(plan.status === 'pending');
+  const t = useT();
   return (
     <article aria-label={`计划审批 ${plan.id}`} className="approval-card" data-collapsed={!open}>
       <button type="button" className="approval-heading plan-summary-row" aria-expanded={open}
         aria-label={`${open ? '折叠' : '展开'}计划 ${plan.draft.title}`} onClick={() => setOpen((value) => !value)}>
         <span className="approval-icon"><ListChecks size={17} strokeWidth={1.6} /></span>
-        <div className="flex-1"><p className="eyebrow">PROPOSED PLAN</p><h3>{plan.draft.title}</h3></div>
+        <div className="flex-1"><p className="eyebrow">{t.proposedPlan}</p><h3>{plan.draft.title}</h3></div>
         <span className={`plan-status plan-${plan.status}`}>{planLabels[plan.status]}</span>
         <ChevronDown size={14} className="plan-collapse-icon" />
       </button>
