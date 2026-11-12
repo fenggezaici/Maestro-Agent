@@ -3,7 +3,7 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Popover from '@radix-ui/react-popover';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Command, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
-import type { Mode, PlanCard as Plan, PlanDecision, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
+import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
 import PlanCard from './PlanCard';
 import ToolCallBlocks from './ToolCallBlocks';
@@ -18,6 +18,7 @@ import { NewProjectDialog, DeleteProjectDialog } from './NewProjectDialog';
 import ErrorToast from './ErrorToast';
 import ComposerControls from './ComposerControls';
 import RightPanel from './RightPanel';
+import TaskPlanPanel from './TaskPlanPanel';
 import type { ExplorerViewState } from './ExplorerPanel';
 import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../hooks/useExtensions';
@@ -40,12 +41,17 @@ import { resolveCapability } from '../modelCatalog';
 import type { ProviderId } from '../modelCapabilities';
 
 const ActivityDashboard = lazy(() => import('./ActivityDashboard'));
+const EMPTY_PLAN: PlanStep[] = [];
 
 export interface WorkbenchController {
   state: Snapshot; sessions: SessionView[]; projects?: ProjectView[]; selectedSessionId: number | null;
   liveTools?: Record<number, import('../api/types').ToolCallView[]>;
   liveTimeline?: Record<number, TimelineItem[]>;
   stoppingRunId?: number | null;
+  /** Task-tracker steps for the selected session (per-session in the store). */
+  currentPlan?: PlanStep[];
+  /** Presentation override for the preview build; live derives it from the run. */
+  planRunning?: boolean;
   detail: SessionDetail | null; runs: RunView[]; loadingSession: boolean; pending: boolean; error: string | null;
   metrics?: Record<number, RunMetrics>;
   selectSession: (id: number | null) => void;
@@ -130,6 +136,8 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const lastSession = useRef(c.selectedSessionId);
   const promptBytes = new TextEncoder().encode(prompt.trim()).length;
   const plans = c.detail?.plans ?? [];
+  const planSteps = c.currentPlan ?? EMPTY_PLAN;
+  const planRunning = c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId);
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
   const stepCount = useMemo(() => Math.max(c.detail?.tools?.length ?? 0, Object.values(c.liveTools ?? {}).reduce((total, calls) => total + calls.length, 0)), [c.detail?.tools, c.liveTools]);
@@ -144,6 +152,10 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       if (approval.preview?.kind === 'write') setActiveFile({ kind: 'change', path: approval.preview.path });
     }
   }, [approval]);
+  // The Tasks list is only meaningful while the selected session has a plan.
+  useEffect(() => {
+    if (listTab === 'tasks' && planSteps.length === 0) setListTab('changes');
+  }, [listTab, planSteps.length]);
   const session = c.sessions.find((item) => item.id === c.selectedSessionId);
   const projects: WorkbenchProject[] = suppliedProjects ?? (c.projects ?? []).filter((project) => !project.archived).map((project) => ({
     id: String(project.id), name: project.name, path: project.path,
@@ -306,6 +318,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
           ? <div className="session-context-strip"><span><ChartNoAxesColumnIncreasing size={12} />Mock analytics</span><span>{dashboardData.start} — {dashboardData.end}</span></div>
           : <div className="session-context-strip"><span><GitBranch size={12} />{preview ? 'refactor/session-lifecycle' : 'local / planning'}</span><span><ShieldCheck size={12} />{c.state.mode === 'plan' ? 'Plan mode' : 'Execute mode'}</span>{preview && <span className="preview-tag">示例数据 · 无 Rust IPC</span>}</div>}
         {c.error && <div className="error-message">{c.error}</div>}
+        {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
           <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
@@ -344,7 +357,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}

@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useT } from '../i18n';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Braces, Check, ChevronDown, FileCode2, Folder, FolderOpen, GitCompareArrows, LockKeyhole, PanelsTopLeft, RefreshCw, Rows3 } from 'lucide-react';
+import { Braces, Check, ChevronDown, FileCode2, Folder, FolderOpen, GitCompareArrows, ListTodo, LockKeyhole, PanelsTopLeft, RefreshCw, Rows3 } from 'lucide-react';
 import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
-import type { PlanCard } from '../api/types';
+import type { PlanCard, PlanStep } from '../api/types';
 import type { ReviewFile } from '../lib/conversation';
 import type { WorkspaceController } from '../hooks/useWorkspace';
 import { useKernelStore } from '../stores/useKernelStore';
@@ -15,8 +15,9 @@ import type { ExplorerViewState } from './ExplorerPanel';
 import { countChanges } from './MiniDiff';
 import MonacoDiff from './MonacoDiff';
 import MonacoCode from './MonacoCode';
+import TaskPlanPanel from './TaskPlanPanel';
 
-export type ListTab = 'explorer' | 'changes';
+export type ListTab = 'explorer' | 'changes' | 'tasks';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
 
 interface ListNode { id: string; name: string; children: ListNode[]; leaf?: { path: string; file?: ExplorerFile } }
@@ -97,10 +98,11 @@ function ChangesList({ files, activePath, onPick }: { files: ReviewFile[]; activ
 /// toggled by a compact segmented header) + a right preview column that shows
 /// MonacoCode for workspace files, MonacoDiff for changed files, and a slim
 /// approval bar while a call is suspended.
-export default function RightPanel({ listTab, onListTabChange, activeFile, onActiveFile, reviewFiles, plans, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily }: {
+export default function RightPanel({ listTab, onListTabChange, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily }: {
   listTab: ListTab; onListTabChange: (tab: ListTab) => void;
   activeFile: ActiveFile | null; onActiveFile: (file: ActiveFile | null) => void;
   reviewFiles: ReviewFile[]; plans: PlanCard[];
+  planSteps: PlanStep[]; planRunning: boolean;
   preview: boolean; workspace: WorkspaceController;
   explorerView: ExplorerViewState; onExplorerViewChange: (view: ExplorerViewState) => void;
   scope: string; fontSize: number; fontFamily: string;
@@ -160,8 +162,8 @@ export default function RightPanel({ listTab, onListTabChange, activeFile, onAct
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
               <button type="button" className="list-filter" aria-label="文件列表视图">
-                {listTab === 'explorer' ? <Folder size={12} /> : <GitCompareArrows size={12} />}
-                <span>{listTab === 'explorer' ? 'Explorer' : 'Changes'}</span>
+                {listTab === 'explorer' ? <Folder size={12} /> : listTab === 'tasks' ? <ListTodo size={12} /> : <GitCompareArrows size={12} />}
+                <span>{listTab === 'explorer' ? 'Explorer' : listTab === 'tasks' ? 'Tasks' : 'Changes'}</span>
                 <ChevronDown size={12} className="list-filter-chevron" />
               </button>
             </DropdownMenu.Trigger>
@@ -169,6 +171,7 @@ export default function RightPanel({ listTab, onListTabChange, activeFile, onAct
               <DropdownMenu.Content className="dropdown-content" align="start" sideOffset={4}>
                 <DropdownMenu.Item className="dropdown-item" onSelect={() => onListTabChange('changes')}><span><GitCompareArrows size={12} className="item-menu-icon" /> Changes</span>{listTab === 'changes' && <Check size={12} />}</DropdownMenu.Item>
                 <DropdownMenu.Item className="dropdown-item" onSelect={() => onListTabChange('explorer')}><span><Folder size={12} className="item-menu-icon" /> Explorer</span>{listTab === 'explorer' && <Check size={12} />}</DropdownMenu.Item>
+                {(planSteps.length > 0 || listTab === 'tasks') && <DropdownMenu.Item className="dropdown-item" onSelect={() => onListTabChange('tasks')}><span><ListTodo size={12} className="item-menu-icon" /> Tasks</span>{listTab === 'tasks' && <Check size={12} />}</DropdownMenu.Item>}
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
@@ -190,7 +193,11 @@ export default function RightPanel({ listTab, onListTabChange, activeFile, onAct
               <ListNodes nodes={tree} depth={0} closed={closed} onToggle={toggleFolder} activePath={workspacePath} onPick={pickWorkspace} />
               {!preview && !workspace.loading && !workspace.error && workspace.tree.length === 0 && <p className="workspace-status">{workspace.info?.path ? '该目录为空，或只有已忽略的构建目录。' : '输入项目绝对路径后打开工作区。'}</p>}
             </nav>
-          </> : <nav aria-label="变更文件列表" className="review-files">
+          </> : listTab === 'tasks' ? <div className="task-plan-list-pane">
+            {planSteps.length > 0
+              ? <TaskPlanPanel steps={planSteps} running={planRunning} variant="list" />
+              : <p className="review-files-empty">暂无任务计划</p>}
+          </div> : <nav aria-label="变更文件列表" className="review-files">
             <ChangesList files={reviewFiles} activePath={change?.path ?? null} onPick={(picked) => onActiveFile({ kind: 'change', path: picked })} />
           </nav>}
         </div>

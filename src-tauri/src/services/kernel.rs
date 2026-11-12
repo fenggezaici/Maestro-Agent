@@ -557,6 +557,21 @@ impl Kernel {
                 self.database
                     .record_tool(run_id, tool.into(), detail, true)
                     .await?;
+                // Task-tracker steps are UI state, not workspace content: emit
+                // the dedicated plan event before the generic tool row settles.
+                if let Some(steps) = &outcome.plan {
+                    let mut state = self.state.lock().await;
+                    if Self::active_run_locked(&state, run_id).is_ok() {
+                        self.emit_locked(
+                            &mut state,
+                            EventData::TaskPlanUpdated {
+                                run_id,
+                                session_id,
+                                steps: steps.clone(),
+                            },
+                        );
+                    }
+                }
                 // Write tools send a structured payload the UI diffs; every
                 // other tool sends the bounded result text.
                 let event_detail = match &outcome.write {
@@ -1264,6 +1279,7 @@ mod tests {
             .collect();
         assert!(plan.iter().any(|name| name == "read_file"));
         assert!(plan.iter().any(|name| name == "load_skill"));
+        assert!(plan.iter().any(|name| name == "update_plan"));
         assert!(!plan.iter().any(|name| name == "write_file"));
         assert!(!plan.iter().any(|name| name == "apply_patch"));
         assert!(!plan.iter().any(|name| name == "run_command"));
@@ -1277,6 +1293,40 @@ mod tests {
             assert!(names.iter().any(|name| name == "write_file"), "{mode:?}");
             assert!(names.iter().any(|name| name == "run_command"), "{mode:?}");
         }
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_plan_emits_task_plan_event_in_plan_mode() {
+        let (kernel, events) = test_kernel().await;
+        let (id, _rx) = seed_run(&kernel).await;
+        let result = kernel
+            .execute_model_tool(
+                id,
+                "update_plan",
+                r#"{"steps":[
+                    {"id":"1","description":"分析项目","status":"completed"},
+                    {"id":"2","description":"重构核心文件","status":"in_progress"}
+                ]}"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("1/2"));
+        let emitted = events.lock().unwrap().clone();
+        let steps = emitted
+            .iter()
+            .find_map(|event| match &event.data {
+                EventData::TaskPlanUpdated { steps, run_id, .. } if *run_id == id => Some(steps.clone()),
+                _ => None,
+            })
+            .expect("task_plan_updated must be emitted");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].status, crate::domain::PlanStepStatus::InProgress);
+        assert!(kernel
+            .execute_model_tool(id, "update_plan", r#"{"steps":[]}"#)
+            .await
+            .is_err());
+        kernel.finish(id, RunStatus::Completed, None).await;
         kernel.shutdown().await.unwrap();
     }
 

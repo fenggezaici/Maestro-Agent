@@ -1,4 +1,4 @@
-import type { PlanCard, RunView, SessionDetail, Snapshot } from '../api/types';
+import type { PlanCard, PlanStep, RunView, SessionDetail, Snapshot } from '../api/types';
 import type { ActivityDay, WorkbenchProject } from '../components/workspace';
 
 const before = `#pragma once
@@ -98,6 +98,13 @@ const mainRun: RunView = {
 };
 
 export const previewSnapshot: Snapshot = { ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0 };
+
+/// Static task-tracker sample for the browser-only visual preview.
+export const previewTaskPlan: PlanStep[] = [
+  { id: '1', description: '梳理 BridgeSession 的现有调用方与状态边界', status: 'completed' },
+  { id: '2', description: '重构所有权与并发访问，保留公共 API', status: 'in_progress' },
+  { id: '3', description: '补充重复 stop 与并发切换的回归测试', status: 'pending' },
+];
 
 export interface PreviewProject extends Omit<WorkbenchProject, 'sessions'> { sessions: SessionDetail[] }
 

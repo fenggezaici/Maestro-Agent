@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Database, FileEdit, FileText, Folder, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import { ChevronDown, ChevronRight, Database, FileEdit, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
 import { useState } from 'react';
 import type { ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
@@ -27,6 +27,7 @@ const TOOL_META: Record<string, { icon: LucideIcon; verb: string }> = {
   list_dir: { icon: Folder, verb: '查阅' },
   run_command: { icon: SquareTerminal, verb: '执行' },
   load_skill: { icon: Puzzle, verb: '加载技能' },
+  update_plan: { icon: ListTodo, verb: '更新计划' },
   read_session: { icon: Database, verb: '读取会话' },
   list_sessions: { icon: Database, verb: '列出会话' },
 };

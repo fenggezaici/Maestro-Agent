@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::domain::{
     metrics::RunMetrics,
-    plan::PlanCard,
+    plan::{PlanCard, PlanStep},
     session::{Mode, RunView},
 };
 
@@ -48,6 +48,15 @@ pub enum EventData {
     },
     PlanUpdated {
         plan: PlanCard,
+    },
+    /// Live task-tracker steps published by the model through `update_plan`.
+    /// Distinct from `PlanUpdated`, which carries the approve/reject plan card.
+    TaskPlanUpdated {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "sessionId")]
+        session_id: i64,
+        steps: Vec<PlanStep>,
     },
     SessionsChanged,
     /// A side-effecting tool finished — the workspace tree should re-scan.
@@ -121,6 +130,25 @@ mod tests {
             json!({
                 "sequence": 6, "type": "tool_call", "runId": 7, "tool": "read_file",
                 "phase": "finished", "detail": "",
+            })
+        );
+        let plan = KernelEvent {
+            sequence: 7,
+            data: EventData::TaskPlanUpdated {
+                run_id: 7,
+                session_id: 2,
+                steps: vec![PlanStep {
+                    id: "1".into(),
+                    description: "读取项目".into(),
+                    status: crate::domain::PlanStepStatus::InProgress,
+                }],
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(plan).unwrap(),
+            json!({
+                "sequence": 7, "type": "task_plan_updated", "runId": 7, "sessionId": 2,
+                "steps": [{ "id": "1", "description": "读取项目", "status": "in_progress" }],
             })
         );
     }

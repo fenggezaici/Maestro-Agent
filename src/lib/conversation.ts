@@ -36,6 +36,7 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
         ? { ...next, activeRun: { ...state.activeRun, output: state.activeRun.output + event.token } }
         : next;
     case 'plan_updated':
+    case 'task_plan_updated':
     case 'sessions_changed':
     case 'workspace_changed':
     case 'tool_call': return next;

@@ -57,6 +57,10 @@ export interface PlanCard {
 }
 export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string }
 
+/// Live task-tracker steps published by `update_plan`; per-session UI state.
+export type PlanStepStatus = 'pending' | 'in_progress' | 'completed';
+export interface PlanStep { id: string; description: string; status: PlanStepStatus }
+
 /// Payload carried in an `awaiting_approval` tool_call detail: the kernel's
 /// bounded preview of what would run. `write` diffs render in the Monaco
 /// panel; `command` renders as a terminal card; `args` is the generic fallback.
@@ -78,6 +82,7 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'status'; run: RunView }
   | { type: 'content'; runId: number; sessionId: number; token: string }
   | { type: 'plan_updated'; plan: PlanCard }
+  | { type: 'task_plan_updated'; runId: number; sessionId: number; steps: PlanStep[] }
   | { type: 'sessions_changed' }
   | { type: 'workspace_changed' }
   | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }

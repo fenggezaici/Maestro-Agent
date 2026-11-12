@@ -11,7 +11,7 @@ use crate::{
     adapters::{db::Database, fs},
     domain::{
         policy::{self, ToolGate},
-        AppResult, Mode, ToolEffect, ToolSpec,
+        validate_plan_steps, AppResult, Mode, PlanStep, ToolEffect, ToolSpec,
     },
     services::extensions::ExtensionManager,
 };
@@ -24,6 +24,45 @@ const NO_WORKSPACE: &str =
 pub struct ToolOutcome {
     pub text: String,
     pub write: Option<fs::WriteReport>,
+    /// Validated task-tracker steps from `update_plan`; the kernel emits them
+    /// as a `task_plan_updated` event for the UI panel.
+    pub plan: Option<Vec<PlanStep>>,
+}
+
+/// Decode and validate the `steps` argument of `update_plan`.
+fn plan_steps(arguments: &serde_json::Value) -> AppResult<Vec<PlanStep>> {
+    let steps: Vec<PlanStep> = serde_json::from_value(
+        arguments
+            .get("steps")
+            .cloned()
+            .ok_or_else(|| "update_plan 需要 steps 参数".to_string())?,
+    )
+    .map_err(|error| format!("update_plan 的 steps 格式无效：{error}"))?;
+    validate_plan_steps(&steps)?;
+    Ok(steps)
+}
+
+/// `3/5 · 当前步骤` summary for the tool row.
+fn plan_summary(steps: &[PlanStep]) -> String {
+    let completed = steps
+        .iter()
+        .filter(|step| step.status == crate::domain::PlanStepStatus::Completed)
+        .count();
+    let active = steps
+        .iter()
+        .find(|step| step.status == crate::domain::PlanStepStatus::InProgress)
+        .or_else(|| {
+            steps
+                .iter()
+                .find(|step| step.status == crate::domain::PlanStepStatus::Pending)
+        })
+        .map(|step| step.description.trim())
+        .unwrap_or("");
+    if active.is_empty() {
+        format!("{completed}/{}", steps.len())
+    } else {
+        format!("{completed}/{} · {active}", steps.len())
+    }
 }
 
 pub struct ToolRouter {
@@ -150,6 +189,31 @@ impl ToolRouter {
                 "required": ["path", "before", "after"]
             }),
         });
+        tools.push(ToolSpec {
+            name: "update_plan".into(),
+            description: "更新当前任务的步骤计划（仅 UI 状态，无文件/命令副作用）。执行涉及多个文件或步骤的复杂任务前必须先调用本工具列出计划；之后每完成一步，必须重新提交完整的 steps 列表并更新各步状态。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "description": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["id", "description", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        });
         // Strip every tool the mode gate would deny: Plan mode requests must
         // not advertise side-effect tools at all, whether built-in or MCP.
         let mut visible = Vec::with_capacity(tools.len());
@@ -177,6 +241,13 @@ impl ToolRouter {
             }
             "run_command" => arg("command").unwrap_or("").to_string(),
             "load_skill" => arg("name").unwrap_or("").to_string(),
+            "update_plan" => arguments
+                .get("steps")
+                .cloned()
+                .and_then(|steps| serde_json::from_value::<Vec<PlanStep>>(steps).ok())
+                .filter(|steps| !steps.is_empty())
+                .map(|steps| plan_summary(&steps))
+                .unwrap_or_default(),
             _ if tool.starts_with("mcp__") => arguments
                 .as_object()
                 .and_then(|map| map.values().find_map(|v| v.as_str()))
@@ -257,7 +328,8 @@ impl ToolRouter {
 
     /// Execute one already-authorized tool call: `text` is the bounded result
     /// fed back to the model; `write` carries the before/after contents the UI
-    /// needs to render a diff (workspace write tools only).
+    /// needs to render a diff (workspace write tools only); `plan` carries
+    /// validated task steps from `update_plan`.
     /// `session_id` is the caller's own session — model arguments can never
     /// redirect `read_session` to another session.
     pub async fn execute(
@@ -274,6 +346,7 @@ impl ToolRouter {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("{name} 需要 {key} 参数"))
         };
+        let mut plan = None;
         let (text, write) = match tool {
             "load_skill" => {
                 let name = arg("name", "load_skill")?;
@@ -334,6 +407,12 @@ impl ToolRouter {
                     .ok_or_else(|| NO_WORKSPACE.to_string())?;
                 (fs::read_file(&root, arg("path", tool)?)?, None)
             }
+            "update_plan" => {
+                let steps = plan_steps(&arguments)?;
+                let summary = plan_summary(&steps);
+                plan = Some(steps);
+                (format!("计划已更新：{summary}"), None)
+            }
             "read_session" => (
                 serde_json::to_string(&self.database.session_detail(session_id).await?)
                     .map_err(|error| error.to_string())?,
@@ -349,6 +428,6 @@ impl ToolRouter {
             }
             _ => return Err("未注册的工具".into()),
         };
-        Ok(ToolOutcome { text, write })
+        Ok(ToolOutcome { text, write, plan })
     }
 }

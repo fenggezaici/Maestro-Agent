@@ -428,4 +428,29 @@ describe('desktop IPC interface', () => {
     expect(JSON.stringify(payload)).not.toContain('attachment.png');
     expect(JSON.stringify(payload)).not.toContain('blob:');
   });
+
+  it('renders and updates the task tracker from task_plan_updated', async () => {
+    render(<App />);
+    await ready();
+    act(() => receive({ payload: {
+      type: 'task_plan_updated', runId: 7, sessionId: 1, sequence: 2,
+      steps: [
+        { id: '1', description: '分析项目', status: 'completed' },
+        { id: '2', description: '重构核心文件', status: 'in_progress' },
+      ],
+    } }));
+    expect(await screen.findByText('任务计划')).toBeInTheDocument();
+    expect(screen.getByText('1/2')).toBeInTheDocument();
+    expect(screen.getByText('重构核心文件')).toBeInTheDocument();
+
+    act(() => receive({ payload: {
+      type: 'task_plan_updated', runId: 7, sessionId: 1, sequence: 3,
+      steps: [
+        { id: '1', description: '分析项目', status: 'completed' },
+        { id: '2', description: '重构核心文件', status: 'completed' },
+      ],
+    } }));
+    expect(await screen.findByText('全部完成')).toBeInTheDocument();
+    expect(screen.getByText('2/2')).toBeInTheDocument();
+  });
 });

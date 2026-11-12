@@ -23,7 +23,8 @@ pub enum ToolGate {
 /// caller (ToolRouter) via the server's own readOnlyHint annotation.
 pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     Ok(match tool {
-        "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file" => ToolEffect::ReadOnly,
+        "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file"
+        | "update_plan" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
@@ -70,7 +71,7 @@ mod tests {
 
     #[test]
     fn plan_mode_denies_side_effects_and_allows_read_only_work() {
-        for tool in ["read_session", "list_sessions", "load_skill", "list_dir", "read_file"] {
+        for tool in ["read_session", "list_sessions", "load_skill", "list_dir", "read_file", "update_plan"] {
             assert_eq!(authorize(Mode::Plan, tool).unwrap(), ToolEffect::ReadOnly);
         }
         for tool in ["apply_patch", "write_file", "run_command"] {

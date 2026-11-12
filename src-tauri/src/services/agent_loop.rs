@@ -23,6 +23,11 @@ const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 /// it explains the boundary instead of burning turns probing outside paths.
 const SANDBOX_HINT: &str = "如果任务需要工作区之外的文件（例如用户提到的其他仓库路径），不要尝试绕过沙盒读取；请明确告知用户该路径不在工作区，并请用户将其复制或移动到工作区内后再继续。";
 
+/// Task-tracker discipline: the model must publish a plan before multi-step
+/// work and refresh it after every finished step, otherwise the UI panel has
+/// nothing to render.
+const TASK_PLAN_HINT: &str = "在执行涉及多个文件或步骤的复杂任务前，必须先调用 update_plan 列出计划（每个步骤包含 id、description、status；初始为 pending，当前要做的步骤为 in_progress）。在后续执行中，每完成一步，必须重新调用 update_plan 提交完整步骤列表并更新各步状态；全部完成时所有步骤都应为 completed。简单的单步任务可以跳过。";
+
 /// Conversation assembly: system policy for the run's mode plus prior
 /// completed turns of the same session within a byte budget.
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
@@ -33,7 +38,10 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
         Mode::Execute => "你处于历史 execute 模式（遗留记录）。仅可使用实际开放且授权的能力。",
         Mode::Auto => "你处于 Auto 策略。已开放的工具调用会直接执行；以工具结果为准，不得声称拥有未提供的能力。",
     };
-    let mut messages = vec![ChatMessage::text("system", format!("{policy}\n{SANDBOX_HINT}"))];
+    let mut messages = vec![ChatMessage::text(
+        "system",
+        format!("{policy}\n{SANDBOX_HINT}\n{TASK_PLAN_HINT}"),
+    )];
     let prior: Vec<_> = detail
         .runs
         .iter()

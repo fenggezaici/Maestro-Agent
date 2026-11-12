@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 
-import { appendReasoning, appendTool, applyToolEventIndexed, closeReasoning, relativeTime } from './conversation';
+import { appendReasoning, appendTool, applyToolEventIndexed, closeReasoning, initialSnapshot, kernelReducer, relativeTime } from './conversation';
 
 it('formats relative time for the turn preview card', () => {
   const now = 1_700_000_000_000;
@@ -42,4 +42,18 @@ it('returns the touched tool row index so the timeline keeps event order', () =>
   expect(finished.index).toBe(0);
   expect(finished.next[1]).toHaveLength(1);
   expect(finished.next[1][0]).toMatchObject({ detail: 'ok', pending: undefined, target: 'a.ts' });
+});
+
+it('advances the snapshot on task_plan_updated without touching run state', () => {
+  const event = {
+    sequence: 3,
+    type: 'task_plan_updated' as const,
+    runId: 7,
+    sessionId: 2,
+    steps: [{ id: '1', description: '分析项目', status: 'in_progress' as const }],
+  };
+  const next = kernelReducer({ ...initialSnapshot, ready: true, sequence: 2 }, { type: 'event', event });
+  expect(next.sequence).toBe(3);
+  expect(next.activeRun).toBeNull();
+  expect(next.ready).toBe(true);
 });

@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import Workbench from '../components/Workbench';
 import { usePreviewExtensions } from '../components/workbenchMock';
-import { previewDetail, previewProjects, previewSnapshot } from './fixtures';
+import { previewDetail, previewProjects, previewSnapshot, previewTaskPlan } from './fixtures';
 
 // Explicit browser-only visual preview; deliberately no useKernel/invoke/listen imports.
 export default function PreviewApp() {
@@ -42,6 +42,7 @@ export default function PreviewApp() {
   }} controller={{
     state, sessions: projects.flatMap((project) => project.sessions.map((item) => item.session)), selectedSessionId, detail, runs: detail?.runs ?? [],
     loadingSession: false, pending: false, error: null,
+    currentPlan: previewTaskPlan, planRunning: true,
     selectSession: setSelectedSessionId,
     createSession: () => undefined, start: async () => undefined, cancel: () => undefined,
     setMode: (mode) => setState((current) => ({ ...current, mode })), decidePlan: () => undefined,

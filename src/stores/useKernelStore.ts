@@ -7,7 +7,7 @@ import { create } from 'zustand';
 import { kernelApi } from '../api/kernel';
 import { sessionsApi } from '../api/sessions';
 import type {
-  KernelEvent, Mode, PlanCard, PlanDecision, ProjectView, RunMetrics,
+  KernelEvent, Mode, PlanCard, PlanDecision, PlanStep, ProjectView, RunMetrics,
   SessionDetail, SessionView, Snapshot, ToolCallView,
 } from '../api/types';
 import {
@@ -34,6 +34,10 @@ export interface KernelStore {
   liveTimeline: Record<number, TimelineItem[]>;
   /** Run whose stop was requested but not yet acknowledged by the backend. */
   stoppingRunId: number | null;
+  /** Task-tracker steps per session — the single source of truth. */
+  taskPlans: Record<number, PlanStep[]>;
+  /** Projection of `taskPlans` for the selected session. */
+  currentPlan: PlanStep[];
   /** true while the agent stream connection is mounted. */
   connected: boolean;
 
@@ -85,7 +89,12 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     if (selectedRef === id) return;
     selectedRef = id;
     detailRevision++;
-    set({ detail: null, selectedSessionId: id, loadingSession: id !== null });
+    set({
+      detail: null,
+      selectedSessionId: id,
+      loadingSession: id !== null,
+      currentPlan: id === null ? [] : (get().taskPlans[id] ?? []),
+    });
     if (id !== null) {
       void get().refreshDetail(id).catch((reason) => {
         if (mounted) setError(errorMessage(reason));
@@ -166,6 +175,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     workspaceTick: 0,
     liveTimeline: {},
     stoppingRunId: null,
+    taskPlans: {},
+    currentPlan: [],
     connected: false,
 
     dispatch: (action) => {
@@ -198,6 +209,12 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
       if (event.type === 'workspace_changed') {
         set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
+      }
+      if (event.type === 'task_plan_updated') {
+        set((s) => ({
+          taskPlans: { ...s.taskPlans, [event.sessionId]: event.steps },
+          currentPlan: s.selectedSessionId === event.sessionId ? event.steps : s.currentPlan,
+        }));
       }
       if (event.type === 'reasoning') {
         if (get().stoppingRunId === event.runId) return;
@@ -272,6 +289,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         liveTools: {},
         liveTimeline: {},
         stoppingRunId: null,
+        taskPlans: {},
+        currentPlan: [],
         connected: false,
       });
     },

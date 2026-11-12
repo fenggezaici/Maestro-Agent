@@ -16,7 +16,10 @@ pub use extension::{
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use metrics::RunMetrics;
-pub use plan::{PlanCard, PlanDecision, PlanDraft, PlanStatus, ProposedDiff};
+pub use plan::{
+    validate_plan_steps, PlanCard, PlanDecision, PlanDraft, PlanStatus, PlanStep, PlanStepStatus,
+    ProposedDiff,
+};
 pub use policy::{authorize, classify, gate, ToolEffect, ToolGate};
 pub use session::{
     unix_now, Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
