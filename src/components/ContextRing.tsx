@@ -4,7 +4,7 @@ const compact = (value: number) => value >= 1000000 ? `${(value / 1000000).toFix
 
 /// Devin-style context usage ring: percentage in the center, detailed usage in
 /// a tooltip; yellow at 80%, red at 90%.
-export default function ContextRing({ used, context, size = 26 }: { used: number; context: number | null; size?: number }) {
+export default function ContextRing({ used, context, size = 30 }: { used: number; context: number | null; size?: number }) {
   const ratio = context && context > 0 ? Math.min(1, used / context) : null;
   const percent = ratio === null ? null : Math.round(ratio * 100);
   const tone = ratio === null ? 'unknown' : ratio >= 0.9 ? 'danger' : ratio >= 0.8 ? 'warn' : 'ok';
@@ -13,7 +13,7 @@ export default function ContextRing({ used, context, size = 26 }: { used: number
   return <Tooltip.Root>
     <Tooltip.Trigger asChild>
       <span className={`context-ring ${tone}`} style={{ width: size, height: size }} role="img"
-        aria-label={percent === null ? 'Context usage unavailable' : `Context ${percent}% used`}>
+        aria-label={percent === null ? '上下文用量不可用' : `上下文已用 ${percent}%`}>
         <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true">
           <circle className="context-ring-track" cx="12" cy="12" r={radius} />
           <circle className="context-ring-value" cx="12" cy="12" r={radius}
@@ -23,7 +23,7 @@ export default function ContextRing({ used, context, size = 26 }: { used: number
       </span>
     </Tooltip.Trigger>
     <Tooltip.Portal><Tooltip.Content className="tooltip-content" sideOffset={8}>
-      {context ? `${compact(used)} / ${compact(context)} context used` : `${compact(used)} tokens used`}
+      {context ? `${compact(used)} / ${compact(context)} 上下文已用` : `${compact(used)} tokens 已用`}
     </Tooltip.Content></Tooltip.Portal>
   </Tooltip.Root>;
 }

@@ -2,9 +2,10 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Popover from '@radix-ui/react-popover';
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Command, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, ListTodo, Monitor, Moon, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
 import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
+import MaestroLogo from './MaestroLogo';
 import PlanCard from './PlanCard';
 import ToolCallBlocks from './ToolCallBlocks';
 import type { ActiveFile, ListTab } from './RightPanel';
@@ -18,7 +19,6 @@ import { NewProjectDialog, DeleteProjectDialog } from './NewProjectDialog';
 import ErrorToast from './ErrorToast';
 import ComposerControls from './ComposerControls';
 import RightPanel from './RightPanel';
-import TaskPlanPanel from './TaskPlanPanel';
 import type { ExplorerViewState } from './ExplorerPanel';
 import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../hooks/useExtensions';
@@ -42,6 +42,7 @@ import type { ProviderId } from '../modelCapabilities';
 
 const ActivityDashboard = lazy(() => import('./ActivityDashboard'));
 const EMPTY_PLAN: PlanStep[] = [];
+const MODE_LABEL: Record<Mode, string> = { plan: 'Plan 模式', code: 'Code 模式', confirm: 'Confirm 模式', auto: 'Auto 模式' };
 
 export interface WorkbenchController {
   state: Snapshot; sessions: SessionView[]; projects?: ProjectView[]; selectedSessionId: number | null;
@@ -107,9 +108,11 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [listTab, setListTab] = useState<ListTab>('changes');
+  const [openTabs, setOpenTabs] = useState<ListTab[]>(['explorer', 'changes']);
+  const tasksDismissed = useRef(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<number[]>(() => readPinnedSessions(source));
-  const workspace = useWorkspace(!preview && ((reviewOpen && listTab === 'explorer') || paletteOpen));
+  const workspace = useWorkspace(!preview && ((reviewOpen && listTab === 'explorer' && openTabs.includes('explorer')) || paletteOpen));
   const [explorerView, setExplorerView] = useState<ExplorerViewState>({ selected: null, closedFolders: [] });
   const liveExtensions = useExtensions(!preview && navigation === 'extensions');
   const extensions = suppliedExtensions ?? liveExtensions;
@@ -137,6 +140,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const promptBytes = new TextEncoder().encode(prompt.trim()).length;
   const plans = c.detail?.plans ?? [];
   const planSteps = c.currentPlan ?? EMPTY_PLAN;
+  const planCompleted = planSteps.filter((step) => step.status === 'completed').length;
   const planRunning = c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId);
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
@@ -154,8 +158,10 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   }, [approval]);
   // The Tasks list is only meaningful while the selected session has a plan.
   useEffect(() => {
-    if (listTab === 'tasks' && planSteps.length === 0) setListTab('changes');
-  }, [listTab, planSteps.length]);
+    if (planSteps.length === 0 || tasksDismissed.current) return;
+    if (openTabs.length === 0) setListTab('tasks');
+    setOpenTabs((current) => current.includes('tasks') ? current : [...current, 'tasks']);
+  }, [planSteps.length, openTabs.length]);
   const session = c.sessions.find((item) => item.id === c.selectedSessionId);
   const projects: WorkbenchProject[] = suppliedProjects ?? (c.projects ?? []).filter((project) => !project.archived).map((project) => ({
     id: String(project.id), name: project.name, path: project.path,
@@ -166,7 +172,28 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     .concat(suppliedProjects ? [] : (c.projects ?? []).filter((project) => project.archived).map((project) => ({ key: String(project.id), numeric: project.id, name: project.name })));
   const currentProject = projects.find((project) => project.sessions.some((item) => item.id === c.selectedSessionId)) ?? projects[0] ?? { id: 'local', name: 'Maestro-Agent', sessions: [] };
   const dashboardData = useMemo(() => createMockDashboard(currentProject), [currentProject.id, currentProject.today?.changedLines, currentProject.today?.completedPlans]);
-  const blocked = preview || !c.state.ready || c.pending || !!c.state.activeRun;
+  const running = c.state.activeRun?.status === 'running';
+  const blocked = preview || !c.state.ready || c.pending;
+
+  const addTab = (tab: ListTab) => {
+    setOpenTabs((current) => current.includes(tab) ? current : [...current, tab]);
+    setListTab(tab);
+  };
+  const openTasks = () => {
+    tasksDismissed.current = false;
+    addTab('tasks');
+    setReviewOpen(true);
+  };
+  const closeTab = (tab: ListTab) => {
+    const index = openTabs.indexOf(tab);
+    const next = openTabs.filter((item) => item !== tab);
+    setOpenTabs(next);
+    if (listTab === tab) {
+      const neighbor = next[index] ?? next[index - 1];
+      if (neighbor) setListTab(neighbor);
+    }
+    if (tab === 'tasks') tasksDismissed.current = true;
+  };
 
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
 
@@ -216,7 +243,10 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (blocked || promptBytes === 0 || promptBytes > 8192) return;
+    if (blocked || running || promptBytes === 0 || promptBytes > 8192) {
+      if (running) setToastError('当前任务运行中，请先停止或等待完成');
+      return;
+    }
     scroll.reset();
     const submitted = prompt;
     const sentAttachments = attachments;
@@ -270,7 +300,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
     <div className={`workbench ${preview ? 'is-preview' : ''} ${!reviewOpen ? 'review-hidden' : ''}`} style={{ zoom: `${Number(preferences.fontScale) / 100}` }}>
       <WorkbenchLayout source={source} sidebar={
       <aside aria-label="会话列表" className="sessions-pane">
-        <div className="brand"><span className="brand-mark"><Command size={19} strokeWidth={1.5} /></span><h1>Maestro-Agent</h1><span className="brand-version">beta</span></div>
+        <div className="brand"><MaestroLogo size={24} /><h1>Maestro-Agent</h1><span className="brand-version">beta</span></div>
         {archivedProjects.length > 0 && <div className="archived-projects" aria-label="已归档项目">
           <p className="session-group-label">已归档项目</p>
           {archivedProjects.map((project) => <button key={project.key} type="button" className="archived-project-row" disabled={!c.setProjectArchived && !sessionActions?.archiveProject}
@@ -279,11 +309,11 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         </div>}
         <nav className="primary-navigation" aria-label="核心导航">
           <button className="navigation-item" aria-current={navigation === 'agents' ? 'page' : undefined} onClick={() => setNavigation('agents')}><Bot size={17} strokeWidth={1.5} /><span>{text.agents}</span><span className="navigation-count">{c.sessions.length}</span></button>
-          <button className="navigation-item" aria-current={navigation === 'automations' ? 'page' : undefined} onClick={() => setNavigation('automations')}><Zap size={17} strokeWidth={1.5} /><span>{text.automations}</span><span className="soon-label">Soon</span></button>
-          <button className="navigation-item" aria-current={navigation === 'extensions' ? 'page' : undefined} onClick={() => setNavigation('extensions')}><Puzzle size={17} strokeWidth={1.5} /><span>{text.extensions}</span><span className="soon-label">Mock</span></button>
+          <button className="navigation-item" aria-current={navigation === 'automations' ? 'page' : undefined} onClick={() => setNavigation('automations')}><Zap size={17} strokeWidth={1.5} /><span>{text.automations}</span><span className="soon-label">待接入</span></button>
+          <button className="navigation-item" aria-current={navigation === 'extensions' ? 'page' : undefined} onClick={() => setNavigation('extensions')}><Puzzle size={17} strokeWidth={1.5} /><span>{text.extensions}</span><span className="soon-label">模拟</span></button>
         </nav>
-        <button type="button" className="navigation-item activity-navigation" aria-label="Activity" aria-current={navigation === 'activity' ? 'page' : undefined} onClick={() => setNavigation('activity')}>
-          <ChartNoAxesColumnIncreasing size={16} strokeWidth={1.5} /><span>Activity</span><span className="activity-navigation-summary">{dashboardData.todayLines} lines today</span>
+        <button type="button" className="navigation-item activity-navigation" aria-label="活动" aria-current={navigation === 'activity' ? 'page' : undefined} onClick={() => setNavigation('activity')}>
+          <ChartNoAxesColumnIncreasing size={16} strokeWidth={1.5} /><span>活动</span><span className="activity-navigation-summary">今日 {dashboardData.todayLines} 行</span>
         </button>
         <ProjectSessions projects={projects} currentProjectId={currentProject.id} source={source} selectedSessionId={c.selectedSessionId} activeSessionId={c.state.activeRun?.sessionId}
           pinnedIds={pinnedIds} onTogglePin={togglePin}
@@ -302,8 +332,8 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
           onArchiveProject={preview ? sessionActions?.archiveProject : c.setProjectArchived ? (id, archived) => void c.setProjectArchived!(Number(id), archived) : undefined}
           onDeleteProject={preview ? sessionActions?.deleteProject : c.deleteProject ? (id) => setDeleteTarget(projects.find((project) => project.id === id) ?? null) : undefined} />
         <div className="sidebar-bottom">
-          <div className="connection-status"><span className={`status-dot ${c.state.ready && !preview ? 'connected' : ''}`} /><span role="status">{preview ? 'Frontend preview' : c.state.ready ? 'Rust 内核已就绪' : '正在连接 Rust 内核…'}</span><span className="local-tag">{preview ? 'MOCK' : 'LOCAL'}</span></div>
-          <span className="build-stamp" title={__BUILD_TIME__}>build {new Date(__BUILD_TIME__).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+          <div className="connection-status"><span className={`status-dot ${c.state.ready && !preview ? 'connected' : ''}`} /><span role="status">{preview ? '前端预览' : c.state.ready ? 'Rust 内核已就绪' : '正在连接 Rust 内核…'}</span><span className="local-tag">{preview ? '模拟' : '本地'}</span></div>
+          <span className="build-stamp" title={__BUILD_TIME__}>构建 {new Date(__BUILD_TIME__).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
           <button type="button" className="navigation-item sidebar-settings-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} strokeWidth={1.5} /><span>{text.settings}</span></button>
         </div>
       </aside>
@@ -312,13 +342,12 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         <header className="conversation-header">
           <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← {text.backToChat}</button>}<span className="eyebrow">{navigation === 'agents' ? text.agentSession : text.workspace}</span><h2>{navigation === 'agents' ? session?.title ?? text.newAgent : navigation === 'activity' ? text.workspaceOverview : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
           <div className="header-actions"><IconButton label="切换右侧面板" onClick={() => setReviewOpen(!reviewOpen)}>{reviewOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</IconButton>
-            <IconButton label="会话信息" onClick={() => setSettingsOpen(true)}><MoreHorizontal size={17} /></IconButton></div>
+            <IconButton label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></IconButton></div>
         </header>
         {navigation === 'activity'
           ? <div className="session-context-strip"><span><ChartNoAxesColumnIncreasing size={12} />Mock analytics</span><span>{dashboardData.start} — {dashboardData.end}</span></div>
-          : <div className="session-context-strip"><span><GitBranch size={12} />{preview ? 'refactor/session-lifecycle' : 'local / planning'}</span><span><ShieldCheck size={12} />{c.state.mode === 'plan' ? 'Plan mode' : 'Execute mode'}</span>{preview && <span className="preview-tag">示例数据 · 无 Rust IPC</span>}</div>}
+          : <div className="session-context-strip"><span><GitBranch size={12} />{preview ? 'refactor/session-lifecycle' : 'local / planning'}</span><span><ShieldCheck size={12} />{MODE_LABEL[c.state.mode]}</span>{planSteps.length > 0 && <button type="button" className="task-progress-chip" onClick={openTasks}><ListTodo size={12} />任务 {planCompleted}/{planSteps.length}</button>}{preview && <span className="preview-tag">示例数据 · 无 Rust IPC</span>}</div>}
         {c.error && <div className="error-message">{c.error}</div>}
-        {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
           <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
@@ -352,12 +381,12 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               onNewProject={() => setNewProjectOpen(true)}
               preferences={preferences} onPreferences={updatePreferences} settingsVersion={settingsVersion}
               onError={setToastError} onCapability={updateCapability}
-              running={!!c.state.activeRun && c.state.activeRun.status === 'running'} pending={c.pending}
+              running={running} pending={c.pending}
               onCancel={() => { const run = c.state.activeRun; if (run) void c.cancel(run.id); }}
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}

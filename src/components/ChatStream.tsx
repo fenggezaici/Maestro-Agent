@@ -46,13 +46,19 @@ function ReasoningText({ text, streaming }: { text: string; streaming: boolean }
 /// One thinking burst in the timeline: expanded and auto-following while it is
 /// live, collapsed to a single row (`思考 · 持续了 X 秒`) once it ends.
 function ReasoningNode({ segment, display }: { segment: ReasoningSegment; display: UiPreferences['reasoningDisplay'] }) {
-  if (display === 'hidden') return null;
   const active = segment.endedAt === undefined;
   const seconds = active ? 0 : Math.max(1, Math.round((segment.endedAt! - segment.startedAt) / 1000));
   const [open, setOpen] = useState(active);
-  useEffect(() => { if (active) setOpen(true); }, [active]);
+  const manual = useRef(false);
+  useEffect(() => {
+    // A finished burst collapses unless the user explicitly toggled it.
+    if (manual.current) return;
+    setOpen(active);
+  }, [active]);
+  if (display === 'hidden') return null;
   return <div className="execution-reasoning">
-    <button type="button" className="execution-row reasoning-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button type="button" className="execution-row reasoning-toggle" aria-expanded={open}
+      onClick={() => { manual.current = true; setOpen((value) => !value); }}>
       <BrainCircuit size={12} /><span>{active ? '思考 · 进行中…' : `思考 · ${seconds} 秒`}</span>
       {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
     </button>

@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { ChatMessage, KernelEvent, PlanCard, ProposedDiff, RunView, SessionDetail, SessionView, Snapshot } from './api/types';
@@ -96,11 +96,12 @@ describe('desktop IPC interface', () => {
     await ready();
     fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     expect(screen.getByRole('heading', { name: 'Maestro-Agent' })).toBeInTheDocument();
+    expect(document.querySelector('[data-maestro-logo="true"]')).not.toBeNull();
     expect(screen.getByLabelText('会话列表')).toBeInTheDocument();
     expect(screen.getByLabelText('Agent 对话')).toBeInTheDocument();
     expect(screen.getByLabelText('右侧工作区')).toBeInTheDocument();
     expect(screen.queryByText('架构边界')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Plan');
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('计划');
     expect(mocks.listen.mock.invocationCallOrder[0]).toBeLessThan(mocks.invoke.mock.invocationCallOrder[0]);
   });
 
@@ -111,6 +112,10 @@ describe('desktop IPC interface', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], api_key: 'test-key', base_url: 'http://localhost:1234/v1', model: 'test-model' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
+    expect(screen.getByLabelText('发送消息')).not.toBeDisabled();
+    fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'queued draft' } });
+    fireEvent.keyDown(screen.getByLabelText('发送消息'), { key: 'Enter' });
+    expect(await screen.findByText('当前任务运行中，请先停止或等待完成')).toBeInTheDocument();
     act(() => {
       receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: '演示 token', sequence: 3 } });
       receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: '演示 token', sequence: 3 } });
@@ -136,9 +141,9 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     fireEvent.keyDown(screen.getByLabelText('由 Rust 强制执行'), { key: 'ArrowDown' });
-    fireEvent.click(await screen.findByRole('option', { name: /Auto/ }));
+    fireEvent.click(await screen.findByRole('option', { name: /自动/ }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_mode', { mode: 'auto' }));
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Auto');
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('自动');
   });
 
   it('shows a clear error rather than faking a backend in a plain browser', async () => {
@@ -161,7 +166,7 @@ describe('desktop IPC interface', () => {
     }));
     await ready();
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('baseline + new');
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   });
 
   it('cleans up both StrictMode listener registrations', async () => {
@@ -197,7 +202,7 @@ describe('desktop IPC interface', () => {
     fireEvent.click(approve);
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('decide_plan', { sessionId: 1, planId: 9, decision: 'approve' }));
     await screen.findByText('计划已批准，尚未执行任何修改。');
-    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Plan');
+    expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('计划');
     expect(mocks.invoke).not.toHaveBeenCalledWith('set_mode', { mode: 'execute' });
     expect(screen.queryByRole('button', { name: '批准计划' })).not.toBeInTheDocument();
   });
@@ -267,13 +272,13 @@ describe('desktop IPC interface', () => {
     await waitFor(() => expect(screen.getByLabelText('发送消息')).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'keep this draft' } });
     const callCount = mocks.invoke.mock.calls.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    fireEvent.click(screen.getByRole('button', { name: '活动' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
     expect(screen.getByLabelText('Total Lines（Mock）')).toHaveTextContent('12,450');
     expect(screen.getByText('Rust 内核已就绪')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(mocks.invoke.mock.calls.length).toBe(callCount);
-    fireEvent.click(screen.getByRole('button', { name: 'Back to Chat' }));
+    fireEvent.click(screen.getByRole('button', { name: '返回对话' }));
     expect(screen.getByLabelText('发送消息')).toHaveValue('keep this draft');
   });
 
@@ -284,10 +289,10 @@ describe('desktop IPC interface', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     const listeners = mocks.listen.mock.calls.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    fireEvent.click(screen.getByRole('button', { name: '活动' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
     act(() => receive({ payload: { type: 'content', runId: 7, sessionId: 1, token: 'arrived while dashboard was open', sequence: 3 } }));
-    fireEvent.click(screen.getByRole('button', { name: 'Back to Chat' }));
+    fireEvent.click(screen.getByRole('button', { name: '返回对话' }));
     expect(screen.getByLabelText('回复内容 7')).toHaveTextContent('arrived while dashboard was open');
     expect(mocks.listen.mock.calls.length).toBe(listeners);
   });
@@ -296,8 +301,11 @@ describe('desktop IPC interface', () => {
     render(<App />);
     await ready();
     localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'configured-model', enabled: true }]));
-    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Models' }));
+    fireEvent.click(screen.getByRole('button', { name: '设置' }));
+    fireEvent.click(screen.getByRole('button', { name: '外观' }));
+    expect(screen.queryByText('Temperature')).not.toBeInTheDocument();
+    expect(screen.getByText(/默认 100%/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '模型' }));
     expect(screen.getByLabelText('API Key')).toHaveAttribute('type', 'password');
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'new-test-key' } });
     fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://example.test/v1' } });
@@ -395,29 +403,28 @@ describe('desktop IPC interface', () => {
     expect(mocks.invoke.mock.calls.some(([name]) => name === 'read_directory_tree')).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
     const footer = document.querySelector('.sidebar-bottom')!;
-    expect(footer.contains(screen.getByRole('button', { name: 'Settings' }))).toBe(true);
-    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Explorer/ }));
+    expect(footer.contains(screen.getByRole('button', { name: '设置' }))).toBe(true);
+    fireEvent.click(screen.getByRole('tab', { name: '文件' }));
     const file = await screen.findByRole('button', { name: '文件 src/unique.rs' });
     expect(mocks.invoke).toHaveBeenCalledWith('read_directory_tree', { workspacePath: 'E:/actual-project' });
     expect(screen.queryByRole('button', { name: /BridgeSession.cpp/ })).not.toBeInTheDocument();
-    expect(screen.getByText('Empty folder')).toBeInTheDocument();
+    expect(screen.getByText('空文件夹')).toBeInTheDocument();
     fireEvent.click(file);
     expect(await screen.findByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
     expect(mocks.invoke).toHaveBeenCalledWith('read_workspace_text', { workspacePath: 'E:/actual-project', path: 'src/unique.rs' });
-    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Changes/ }));
-    fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
-    fireEvent.click(await screen.findByRole('menuitem', { name: /Explorer/ }));
+    fireEvent.click(screen.getByRole('tab', { name: '变更' }));
+    fireEvent.click(screen.getByRole('tab', { name: '文件' }));
     expect(screen.getByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
   });
 
   it('keeps sent attachments as local bubble placeholders without uploading them', async () => {
+    localStorage.setItem(LLM_SETTINGS_KEY, JSON.stringify({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'gpt-5' }));
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:attachment-local') });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
     render(<App />);
     await ready();
     fireEvent.change(screen.getByLabelText('选择本地媒体附件'), { target: { files: [new File(['local-image'], 'attachment.png', { type: 'image/png' })] } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'text request with local placeholder' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
@@ -427,6 +434,7 @@ describe('desktop IPC interface', () => {
     const payload = mocks.invoke.mock.calls.find(([command]) => command === 'stream_chat')![1];
     expect(JSON.stringify(payload)).not.toContain('attachment.png');
     expect(JSON.stringify(payload)).not.toContain('blob:');
+    expect((payload.messages as ChatMessage[]).at(-1)?.images?.[0]).toMatch(/^data:image\/png;base64,/);
   });
 
   it('renders and updates the task tracker from task_plan_updated', async () => {
@@ -439,8 +447,8 @@ describe('desktop IPC interface', () => {
         { id: '2', description: '重构核心文件', status: 'in_progress' },
       ],
     } }));
-    expect(await screen.findByText('任务计划')).toBeInTheDocument();
-    expect(screen.getByText('1/2')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: /任务 1\/2/ }));
+    expect((await screen.findAllByText('任务计划')).length).toBeGreaterThan(0);
     expect(screen.getByText('重构核心文件')).toBeInTheDocument();
 
     act(() => receive({ payload: {
@@ -450,7 +458,42 @@ describe('desktop IPC interface', () => {
         { id: '2', description: '重构核心文件', status: 'completed' },
       ],
     } }));
+    expect(await screen.findByRole('button', { name: /任务 2\/2/ })).toBeInTheDocument();
     expect(await screen.findByText('全部完成')).toBeInTheDocument();
-    expect(screen.getByText('2/2')).toBeInTheDocument();
+  });
+
+  it('switches right-panel views with tabs and shows Tasks only when a plan exists', async () => {
+    render(<App />);
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+    expect(screen.getByRole('tab', { name: '文件' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '变更' })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: '任务' })).not.toBeInTheDocument();
+
+    act(() => receive({ payload: {
+      type: 'task_plan_updated', runId: 7, sessionId: 1, sequence: 2,
+      steps: [{ id: '1', description: '分析项目', status: 'in_progress' }],
+    } }));
+    fireEvent.click(await screen.findByRole('tab', { name: '任务' }));
+    expect(screen.getByText('左侧列出当前会话的步骤与进度。')).toBeInTheDocument();
+  });
+
+  it('renders sessions as single-line rows with metadata in the title', async () => {
+    render(<App />);
+    await ready();
+    const button = screen.getByRole('button', { name: /测试会话.*0 轮对话/ });
+    expect(button).toHaveAttribute('title', expect.stringContaining('#1'));
+    expect(within(button).queryByText(/轮对话/)).toBeNull();
+  });
+
+  it('confirms session deletion with a dialog instead of window.confirm', async () => {
+    render(<App />);
+    await ready();
+    fireEvent.keyDown(screen.getByRole('button', { name: '会话 1 操作' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /删除/ }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('删除会话');
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(mocks.invoke).not.toHaveBeenCalledWith('delete_session', expect.anything());
   });
 });

@@ -40,15 +40,14 @@ try {
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 1, reducedMotion: 'reduce' });
   await page.goto(`${origin}/?preview=1`, { waitUntil: 'networkidle' });
-  await page.getByText('Frontend preview', { exact: true }).waitFor({ timeout: 30_000 });
+  await page.getByText('前端预览', { exact: true }).waitFor({ timeout: 30_000 });
   await page.getByRole('button', { name: '切换右侧面板' }).click();
   await page.locator('.right-pane').waitFor({ timeout: 10_000 });
   await page.locator('[data-editor-ready="true"]').waitFor({ timeout: 30_000 });
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: path.join(output, 'maestro-workbench.png'), animations: 'disabled' });
 
-  await page.getByRole('button', { name: '文件列表视图' }).click();
-  await page.getByRole('menuitem', { name: /Explorer/ }).click();
+  await page.getByRole('tab', { name: '文件' }).click();
   await page.getByRole('button', { name: '文件 src/bridge/BridgeSession.cpp' }).click();
   await page.locator('[data-code-ready="true"]').waitFor({ timeout: 30_000 });
   await page.evaluate(() => document.fonts.ready);

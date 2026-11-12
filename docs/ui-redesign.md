@@ -5,14 +5,16 @@
 ## 设计与组件
 
 - Canvas `#171717`, sidebar Surface `#1e1e1e`, code surface `#1b1b1b`. Tonal backgrounds and spacing replace hard panel borders.
-- 默认两栏：侧栏 280px（220-360，可拖拽并持久化）+ 弹性主舞台；打开文件/Diff 时才插入约 42% 的 Review 栏。
+- 默认三栏：侧栏 280px（220-360，可拖拽并持久化）+ 弹性对话主舞台 + 可增删的右侧面板；右侧为 文件/变更/任务 Tab，Diff 默认行内/上下。
 - 外层布局使用自定义 flex + 像素宽度 + pointer drag（参考 ZCode 的 WorkspaceShellLayout），不再使用 react-resizable-panels，避免开关右栏时重挂载重置侧栏宽度。
 - 窄窗口使用嵌套纵向分栏，移动端单列；Monaco 自动调整尺寸，隐藏/恢复和断点切换保留文件及 Diff 模式。
 - 会话按 Workspace 使用 Radix Accordion 分组，保留展开状态；搜索临时展开匹配组，清空后恢复。
 - Activity 采用单行导航入口，点击后只切换中间工作区，不打开 Modal 或覆盖右侧 Diff。
 - Dashboard 包含四项 KPI、六个月 GitHub 风格热力图与 Recharts 30 日 Token 折线图；所有统计明确为 Mock。
 - 本地 Inter 字体、Lucide 细线图标、Radix Select / Tabs / Tooltip / DropdownMenu / Dialog。
-- 圆角输入区、低对比消息、分步计划卡片、实心 Approve 与幽灵 Reject。
+- 圆角输入区、低对比消息、分步计划卡片、实心 Approve 与幽灵 Reject；Composer 下方为两枚统计 Pill（轮/步/tok/s、tokens/缓存命中）。
+- 侧栏会话为单行（状态点 + 标题 + 相对时间），完整元信息放在 tooltip/aria-label；任务步骤通过 `update_plan` 进入右侧 Tasks Tab。
+- 侧栏与桌面图标使用双色 M 品牌标；Tauri 图标由 `app-icon.svg` 生成。
 - Monaco 真正只读，支持文件标签、并排/行内视图和柔和红绿高亮；切换与卸载时释放编辑器及模型。
 - 编辑器与少量语法语言按需加载；本地 worker 和字体不依赖 CDN，也不需要 `blob:` worker 或 eval。
 

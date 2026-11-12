@@ -131,3 +131,12 @@ it('renders a clickable turn rail once there are multiple turns', () => {
   expect(onJumpToTurn).toHaveBeenCalledWith(1);
   expect(view.container.querySelector('.conversation-turn')?.className).toContain('turn-flash');
 });
+
+it('collapses a reasoning burst when it finishes unless manually reopened', () => {
+  const view = render(<ChatStream {...base} liveTimeline={{ 1: [reasoning('streaming', 0)] }} />);
+  expect(view.container.querySelector('.reasoning-content')).not.toBeNull();
+  view.rerender(<ChatStream {...base} liveTimeline={{ 1: [reasoning('streaming', 0, 3000)] }} />);
+  expect(view.container.querySelector('.reasoning-content')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: /思考 · 3 秒/ }));
+  expect(view.container.querySelector('.reasoning-content')).not.toBeNull();
+});

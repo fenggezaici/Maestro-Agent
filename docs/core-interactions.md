@@ -23,7 +23,7 @@ Browser preview supports UI/theme/model-capability exploration without Rust. For
 
 Both Composer and **Settings → Models → 模型能力 · Context & Thinking** use the same capability controls. Select an adjustable model such as OpenAI `o3-mini` or Anthropic Claude 3.7 to configure supported effort/budget levels. Settings saves the chosen level; Composer applies it immediately after successful storage. A failed save does not leave a falsely selected strength in the UI. Fixed reasoning does not mean an adjustable effort parameter is available, nor that reasoning text is streamed separately.
 
-Context tooltips give the numeric reference limit and distinguish it from provider usage and deployment configuration. These labels do not change Rust history limits or configure an Ollama server. On narrow Composer panels, the toolbar wraps instead of horizontally hiding controls.
+Context tooltips give the numeric reference limit and distinguish it from provider usage and deployment configuration. These labels do not change Rust history limits or configure an Ollama server. On narrow Composer panels, container queries progressively hide labels and cap selector widths instead of wrapping the toolbar.
 
 Unknown strengths are never manufactured merely to fill a dropdown. The registry labels Max as a possible UI value but exposes it only if a supported model mapping is added; no current transport pretends to support an unconfigured Max effort.
 
@@ -68,3 +68,5 @@ R1/context correction: **70 frontend tests**, production TypeScript/Vite build a
 - Tool and reasoning rows expose a right-side chevron with `aria-expanded`. Finished tool rows are intentionally quiet (gray text/icons) and only brighten on hover; `已执行` is not rendered, while failed/awaiting calls keep a status label.
 - Clicking a file target opens the right-side Explorer and loads the file in Monaco. Historical runs use the same `onOpenFile` path as live runs.
 - Stop sends `abort_chat` and immediately seals the visible reasoning/tool state; there is no custom "stopping" pill. The final cancelled state is driven by the backend terminal event. The Rust kernel keeps a `cancelled_run` flag and a 250ms stream poll so cancellation does not depend on a single watch notification.
+
+Composer stats follow the DeepSeek Harness pattern: two centered pills below the composer, provider-reported usage when available, and an explicit `est.` marker for live output estimates. Cache hit is cache-read tokens over billed prompt input; output tokens are excluded, and a missing provider cache bucket shows `—` rather than an invented value.

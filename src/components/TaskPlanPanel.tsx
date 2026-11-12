@@ -29,17 +29,17 @@ export default function TaskPlanPanel({ steps, running, variant }: {
 }) {
   const completed = steps.filter((step) => step.status === 'completed').length;
   const allDone = steps.length > 0 && completed === steps.length;
-  const [open, setOpen] = useState(!allDone);
+  const [open, setOpen] = useState(variant === 'list');
   const manual = useRef(false);
   const active = steps.find((step) => step.status === 'in_progress')
     ?? steps.find((step) => step.status === 'pending')
     ?? steps[steps.length - 1];
 
-  // Follow the run state until the user takes over the disclosure.
+  // The floating card stays collapsed until the user asks for the full list;
+  // the right-panel list is always expanded.
   useEffect(() => {
-    if (manual.current) return;
-    setOpen(!allDone);
-  }, [allDone]);
+    if (variant === 'list') setOpen(true);
+  }, [variant]);
 
   if (!steps.length) return null;
 

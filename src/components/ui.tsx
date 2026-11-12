@@ -3,6 +3,15 @@ import * as Tooltip from '@radix-ui/react-tooltip';
 import { Check, ChevronDown } from 'lucide-react';
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
+export type ButtonVariant = 'primary' | 'secondary' | 'outline' | 'ghost' | 'destructive';
+export type ButtonSize = 'xs' | 'sm' | 'md' | 'lg' | 'icon';
+
+/// Shared action button: one variant/size contract for new UI. Existing
+/// one-off classes remain during the region-by-region migration.
+export function Button({ variant = 'secondary', size = 'md', className = '', ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant; size?: ButtonSize }) {
+  return <button type="button" className={`btn btn-${variant} btn-${size} ${className}`} {...props} />;
+}
+
 export function IconButton({ label, children, className = '', ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
   return <Tooltip.Root>
     <Tooltip.Trigger asChild><button type="button" aria-label={label} className={`icon-button ${className}`} {...props}>{children}</button></Tooltip.Trigger>

@@ -28,12 +28,12 @@ it('renders safe Markdown with code language and clipboard controls without raw 
 
 it('applies Light and basic language labels immediately, with isolated UI preferences', () => {
   render(<PreviewApp />);
-  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  fireEvent.click(screen.getByRole('button', { name: '外观' }));
   fireEvent.keyDown(screen.getByLabelText('主题'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: 'Light' }));
+  fireEvent.click(screen.getByRole('option', { name: '浅色' }));
   expect(document.documentElement.dataset.theme).toBe('light');
-  fireEvent.click(screen.getByRole('button', { name: 'General' }));
+  fireEvent.click(screen.getByRole('button', { name: '常规' }));
   fireEvent.keyDown(screen.getByLabelText('界面语言'), { key: 'ArrowDown' });
   fireEvent.click(screen.getByRole('option', { name: '简体中文' }));
   expect(document.documentElement.lang).toBe('zh-CN');
@@ -56,10 +56,10 @@ it('follows system appearance and cleans up the media-query listener', () => {
   const media = { get matches() { return dark; }, addEventListener: (_type: string, callback: () => void) => listeners.add(callback), removeEventListener: (_type: string, callback: () => void) => listeners.delete(callback) };
   vi.stubGlobal('matchMedia', () => media);
   const view = render(<PreviewApp />);
-  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  fireEvent.click(screen.getByRole('button', { name: '外观' }));
   fireEvent.keyDown(screen.getByLabelText('主题'), { key: 'ArrowDown' });
-  fireEvent.click(screen.getByRole('option', { name: 'System' }));
+  fireEvent.click(screen.getByRole('option', { name: '跟随系统' }));
   expect(document.documentElement.dataset.theme).toBe('dark');
   act(() => { dark = false; listeners.forEach((callback) => callback()); });
   expect(document.documentElement.dataset.theme).toBe('light');

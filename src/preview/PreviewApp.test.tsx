@@ -16,12 +16,12 @@ beforeEach(() => localStorage.clear());
 it('shows explicit preview data without making Rust calls or enabling backend mutations', () => {
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
-  expect(screen.getByText('Frontend preview')).toBeInTheDocument();
+  expect(screen.getByText('前端预览')).toBeInTheDocument();
   expect(screen.getByText('示例数据 · 无 Rust IPC')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '批准计划' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '在项目 Maestro-Agent 下新建会话' })).toBeEnabled();
-  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
+  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   expect(screen.getByRole('button', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('aria-pressed', 'true');
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   expect(screen.getByLabelText('Diff tests/BridgeSession.test.cpp')).toHaveTextContent('stop_is_idempotent');
@@ -36,11 +36,11 @@ it('supports search, settings and navigation without pretending unsupported back
   fireEvent.change(screen.getByLabelText('搜索会话'), { target: { value: 'Refactor' } });
   expect(screen.getByRole('button', { name: /Refactor session lifecycle/ })).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Improve event dispatch/ })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-  expect(screen.getByRole('dialog')).toHaveTextContent('General');
-  expect(screen.getByRole('button', { name: 'Appearance' })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  expect(screen.getByRole('dialog')).toHaveTextContent('常规');
+  expect(screen.getByRole('button', { name: '外观' })).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '关闭设置' }));
-  fireEvent.click(screen.getByRole('button', { name: /Automations/ }));
+  fireEvent.click(screen.getByRole('button', { name: /自动任务/ }));
   expect(screen.getByText('自动任务尚未接入后端，本次重构仅展示入口。')).toBeInTheDocument();
 });
 
@@ -73,8 +73,8 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   fireEvent.keyDown(screen.getByRole('tab', { name: '行内差异' }), { key: 'Enter' });
-  const activity = screen.getByRole('button', { name: 'Activity' });
-  expect(activity).toHaveTextContent('120 lines today');
+  const activity = screen.getByRole('button', { name: '活动' });
+  expect(activity).toHaveTextContent('今日 120 行');
   fireEvent.click(activity);
   const dashboard = await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
   expect(activity).toHaveAttribute('aria-current', 'page');
@@ -90,7 +90,7 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   fireEvent.focus(today);
   expect(await screen.findByRole('tooltip')).toHaveTextContent('修改 120 行代码');
   fireEvent.blur(today);
-  fireEvent.click(screen.getByRole('button', { name: 'Back to Chat' }));
+  fireEvent.click(screen.getByRole('button', { name: '返回对话' }));
   expect(screen.getByLabelText('发送消息')).toBeInTheDocument();
   expect(screen.queryByRole('region', { name: 'Activity Dashboard' })).not.toBeInTheDocument();
   expect(ipc.invoke).not.toHaveBeenCalled();
@@ -100,11 +100,11 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
 it('returns to chat through Agents, a session, or new-session creation', async () => {
   render(<PreviewApp />);
   async function openDashboard() {
-    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    fireEvent.click(screen.getByRole('button', { name: '活动' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
   }
   await openDashboard();
-  fireEvent.click(screen.getByRole('button', { name: /^Agents/ }));
+  fireEvent.click(within(screen.getByLabelText('核心导航')).getByRole('button', { name: /会话/ }));
   expect(screen.getByLabelText('发送消息')).toBeInTheDocument();
   await openDashboard();
   fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
@@ -122,22 +122,22 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
   localStorage.setItem('maestro.ui.v1.preview', JSON.stringify({ provider: 'openai', previewModel: 'deepseek-chat' }));
   localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'gpt-5.2', enabled: true }]));
   render(<PreviewApp />);
-  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('Code');
+  expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-chat');
-  expect(screen.getByLabelText('实时会话统计')).toHaveTextContent('1 轮 0 步');
+  expect(screen.getByLabelText('实时会话统计')).toHaveTextContent(/1 轮.*0 步/);
   expect(screen.queryByRole('button', { name: '模型参数' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByLabelText('选择模型'));
   fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
   expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '1');
-  fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Models' }));
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  fireEvent.click(screen.getByRole('button', { name: '模型' }));
   expect(screen.getByLabelText('API Key')).toHaveValue('');
   expect(screen.getByLabelText('API Key')).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: 'Anthropic' }));
   expect(screen.getByLabelText('Base URL')).toHaveValue('https://api.anthropic.com/v1');
-  fireEvent.click(screen.getByRole('button', { name: 'Shortcuts' }));
-  fireEvent.change(screen.getByLabelText('搜索快捷键'), { target: { value: 'Open Activity' } });
-  fireEvent.click(screen.getByRole('button', { name: '重新绑定 Open Activity' }));
+  fireEvent.click(screen.getByRole('button', { name: '快捷键' }));
+  fireEvent.change(screen.getByLabelText('搜索快捷键'), { target: { value: '打开活动' } });
+  fireEvent.click(screen.getByRole('button', { name: '重新绑定 打开活动' }));
   fireEvent.keyDown(screen.getByRole('dialog'), { key: 'b', code: 'KeyB', ctrlKey: true, shiftKey: true });
   expect(screen.getByRole('dialog')).toHaveTextContent('Ctrl+Shift+B');
   expect(localStorage.getItem(LLM_SETTINGS_KEY)).toBe(sentinel);
@@ -148,27 +148,25 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
 it('switches Review/Explorer, folds folders and preserves virtual extension states', () => {
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
-  fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
-  fireEvent.click(screen.getByRole('menuitem', { name: /Explorer/ }));
+  fireEvent.click(screen.getByRole('tab', { name: '文件' }));
   expect(screen.getByLabelText('文件浏览器')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /BridgeSession.cpp/ }));
   expect(screen.getByLabelText('文件预览 src/bridge/BridgeSession.cpp')).toHaveTextContent('void BridgeSession::stop');
   fireEvent.click(screen.getByRole('button', { name: '文件夹 bridge' }));
   expect(screen.getByRole('button', { name: '文件夹 bridge' })).toHaveAttribute('aria-expanded', 'false');
-  fireEvent.keyDown(screen.getByRole('button', { name: '文件列表视图' }), { key: 'Enter' });
-  fireEvent.click(screen.getByRole('menuitem', { name: /Changes/ }));
+  fireEvent.click(screen.getByRole('tab', { name: '变更' }));
   fireEvent.click(screen.getByRole('button', { name: 'src/bridge/BridgeSession.h' }));
   expect(screen.getByLabelText('Diff src/bridge/BridgeSession.h')).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
-  expect(screen.getByLabelText('Extensions 工作区')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: /^扩展/ }));
+  expect(screen.getByLabelText('扩展工作区')).toBeInTheDocument();
   fireEvent.mouseDown(screen.getByRole('tab', { name: 'MCP 服务' }));
   expect(screen.getByRole('switch', { name: '启用 filesystem' })).toHaveAttribute('data-state', 'checked');
   fireEvent.click(screen.getByRole('switch', { name: '启用 github' }));
   expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
   fireEvent.mouseDown(screen.getByRole('tab', { name: '发现' }));
   expect(screen.getByRole('button', { name: '安装 FileSystem' })).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-  fireEvent.click(screen.getByRole('button', { name: /^Extensions/ }));
+  fireEvent.click(screen.getByRole('button', { name: '活动' }));
+  fireEvent.click(screen.getByRole('button', { name: /^扩展/ }));
   fireEvent.mouseDown(screen.getByRole('tab', { name: 'MCP 服务' }));
   expect(screen.getByRole('switch', { name: '启用 github' })).toHaveAttribute('data-state', 'checked');
   expect(ipc.invoke).not.toHaveBeenCalled();

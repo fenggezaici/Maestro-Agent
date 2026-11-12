@@ -14,10 +14,10 @@ export const defaultShortcuts: Record<ShortcutAction, string> = {
   settings: 'Mod+Comma', activity: 'Mod+Shift+KeyA', extensions: 'Mod+Shift+KeyX', review: 'Mod+Shift+KeyD', search: 'Mod+KeyK',
 };
 export const shortcutLabels: Record<ShortcutAction, string> = {
-  settings: 'Open Settings', activity: 'Open Activity', extensions: 'Open Extensions', review: 'Toggle Review', search: 'Command Center',
+  settings: '打开设置', activity: '打开活动', extensions: '打开扩展', review: '切换右侧面板', search: '命令面板',
 };
 export const defaultUiPreferences: UiPreferences = {
-  language: 'en', startupView: 'agents', theme: 'dark', editorFont: 'Cascadia Code', editorFontSize: 12, fontScale: '100', reasoningDisplay: 'collapsed',
+  language: 'zh-CN', startupView: 'agents', theme: 'dark', editorFont: 'Cascadia Code', editorFontSize: 12, fontScale: '100', reasoningDisplay: 'collapsed',
   contextWindow: 8192, temperature: 0.7, provider: 'openai', previewModel: 'deepseek-chat', shortcuts: defaultShortcuts,
 };
 

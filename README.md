@@ -38,15 +38,16 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
 | Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；真实模型的写文件/命令调用会生成工具级审批卡片 |
-| IDE 工作台 | 默认两栏（侧栏 + 主舞台），侧栏像素宽度 280（220-360）可拖拽并持久化；打开文件/Diff 时才插入右侧 Review 栏；会话搜索、项目分组、Settings、快捷键 |
+| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），Diff 默认行内/上下；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
-| 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip（`596K / 1M context used`），80% 变黄、90% 变红 |
-| 底部状态栏 | 轮次/步数、tok/s、tokens + 缓存命中率、细线 Context 圆环，统一灰色等宽数字排版 |
+| 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip，80% 变黄、90% 变红 |
+| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/tok/s；总 tokens/缓存命中），点击查看输入、缓存读取、未缓存输入、输出明细；缓存命中严格按 provider usage，缺失时显示 — |
 | 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
-| 国际化 | 中英切换覆盖 Header、设置、计划卡、Activity、Explorer、工具状态、审批与欢迎页 |
+| 品牌 / 图标 | 双色 M MaestroLogo；Tauri 桌面图标由 `app-icon.svg` 生成（ico/icns/png/Square/StoreLogo） |
+| 国际化 | 默认 zh-CN；英文切换目前覆盖基础导航与设置标签，完整 i18n 仍在后续 |
 | Command Center | `Ctrl/Cmd+K` 顶部快速面板：命令 / 会话 / 文件模糊搜索、方向键导航、本地搜索历史 |
-| 会话列表 | 本地置顶与本日分组（今天 / 昨天 / 7 天内 / 更早）；置顶仅存 localStorage，不同步后端 |
-| 计划卡片 | 待审批默认展开、已结案折叠为摘要行；审批仍只记录决定 |
+| 会话列表 | 单行极简：状态点 + 标题 + 相对时间；轮数/#id/完整标题在 tooltip 与 aria-label；本地置顶与日期分组；置顶仅存 localStorage |
+| 计划 / 任务 | 计划卡待审批展开、已结案折叠；`update_plan` 任务步骤实时进入右侧 Tasks Tab，聊天区顶部显示“任务 N/M”胶囊；已完成步骤灰化+删除线 |
 | 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
 | 模型能力 / 会话统计 | 动态思考选项与目录上下文上限，Provider usage/计时；缺失用量明确标为估算 |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |

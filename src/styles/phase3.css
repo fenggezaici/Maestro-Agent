@@ -1,0 +1,101 @@
+/* Phase 3: chat typography and color tokens only. No layout, DOM or event
+   changes — scrolling, folding, tool expansion and approvals must behave
+   exactly as before. */
+.agent-copy,
+.user-message > p {
+  color: var(--color-foreground);
+  font-size: var(--text-ui-reading);
+  line-height: 1.9;
+}
+.message-meta { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+.message-meta strong { color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.user-avatar { background: var(--color-selected); color: var(--color-foreground-subtle); }
+.message-actions .message-action { color: var(--color-foreground-subtlest); }
+.message-actions .message-action:hover,
+.message-actions .message-action[aria-pressed="true"] { background: var(--color-hover); color: var(--color-foreground); }
+.message-actions-time { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+
+.markdown-message p { line-height: 1.9; }
+.markdown-message h1,
+.markdown-message h2,
+.markdown-message h3 { color: var(--color-foreground); font-size: var(--text-ui-lg); }
+.markdown-message a { color: var(--color-primary); }
+.markdown-message :not(pre) > code { background: var(--color-hover); color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.markdown-message table { font-size: var(--text-ui-caption); }
+.markdown-message th { background: var(--color-hover); color: var(--color-foreground); border-color: var(--color-border); }
+.markdown-message td { color: var(--color-foreground-subtle); border-color: var(--color-border); }
+.markdown-message pre { background: var(--color-card); border-color: var(--color-border-subtle); }
+.message-code-block { background: var(--color-card); border: 1px solid var(--color-border-subtle); }
+.message-code-block header { background: var(--color-panel-alt); color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+
+.tool-call-summary { color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); }
+.tool-call-verb { color: var(--color-foreground-subtle); }
+.tool-call-target { color: var(--color-foreground-subtle); }
+.tool-call-target strong { color: var(--color-foreground); }
+.tool-call-dir { color: var(--color-foreground-subtlest); }
+.tool-call-panel {
+  background: var(--color-panel-alt);
+  color: var(--color-foreground-subtle);
+  font-size: var(--text-ui-sm);
+}
+.tool-call-row.allowed:not(.pending) .tool-call-summary,
+.tool-call-row.allowed:not(.pending) .tool-call-verb,
+.tool-call-row.allowed:not(.pending) .tool-call-target,
+.tool-call-row.allowed:not(.pending) .tool-call-target strong,
+.tool-call-row.allowed:not(.pending) .tool-call-dir { color: var(--color-foreground-subtlest); }
+.tool-call-row.allowed:not(.pending) .tool-call-summary:hover,
+.tool-call-row.allowed:not(.pending) .tool-call-summary:hover .tool-call-verb,
+.tool-call-row.allowed:not(.pending) .tool-call-summary:hover .tool-call-target,
+.tool-call-row.allowed:not(.pending) .tool-call-summary:hover .tool-call-target strong,
+.tool-call-row.allowed:not(.pending) .tool-call-summary:hover .tool-call-dir { color: var(--color-foreground); }
+.tool-call-status { font-size: var(--text-ui-xs); }
+.tool-call-detail { color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
+.tool-approval { background: var(--color-warning-soft); border-color: var(--color-warning); }
+.tool-approval-head { color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.tool-approval-badge { background: var(--color-warning-soft); color: var(--color-warning); font-size: var(--text-ui-xs); }
+.tool-approval-path { color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
+.tool-approval-command code { color: var(--color-foreground); font-size: var(--text-ui-caption); }
+
+.execution-summary { color: var(--color-foreground-subtlest); font-size: var(--text-ui-caption); }
+.execution-row { color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); }
+.execution-row svg { color: var(--color-foreground-subtlest); }
+.reasoning-content p { color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); }
+.collapsible-title { color: var(--color-foreground); }
+.collapsible-subtitle { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+
+.approval-card { background: var(--color-card); border: 1px solid var(--color-border-subtle); }
+.approval-heading h3 { color: var(--color-foreground); font-size: var(--text-ui-base); }
+.plan-status { font-size: var(--text-ui-xs); }
+.plan-summary { color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); }
+.plan-steps p { color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.step-number { background: var(--color-hover); color: var(--color-foreground-subtle); font-size: var(--text-ui-xs); }
+.step-label { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+.approval-footnote { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); }
+
+.task-plan-panel.is-card { background: var(--color-popover); border-color: var(--color-border); box-shadow: var(--shadow-overlay); }
+.task-plan-title { color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.task-plan-count { color: var(--color-foreground-subtle); font-size: var(--text-ui-xs); }
+.task-plan-current { color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
+.task-plan-text { font-size: var(--text-ui-caption); }
+.task-plan-step.completed .task-plan-text { color: var(--color-foreground-subtlest); }
+.task-plan-step.in-progress .task-plan-text { color: var(--color-foreground); }
+.task-plan-step.pending .task-plan-text { color: var(--color-foreground-subtle); }
+.task-plan-icon.completed { color: var(--color-success); }
+.task-plan-icon.in-progress { color: var(--color-foreground); }
+.task-plan-icon.pending { color: var(--color-foreground-subtlest); }
+.task-plan-progress { background: var(--color-border); }
+.task-plan-progress-fill { background: var(--color-success); }
+
+/* Task tracker card: floating overlay, collapsed by default, never reflows chat. */
+.task-plan-panel.is-card {
+  position: absolute;
+  top: 84px;
+  right: 24px;
+  width: 280px;
+  margin: 0;
+  z-index: 15;
+  align-self: auto;
+}
+@media (max-width: 760px) {
+  .task-plan-panel.is-card { right: 12px; left: auto; width: min(280px, calc(100vw - 24px)); }
+}

@@ -72,7 +72,7 @@
 [data-theme="light"] .composer textarea, [data-theme="light"] .session-search input, [data-theme="light"] .shortcut-search input { color: #353535; }
 [data-theme="light"] .composer-area { background: linear-gradient(transparent,#fff 18%); }
 [data-theme="light"] .resizable-handle { background: #efeff1; }
-[data-theme="light"] .brand-mark, [data-theme="light"] .project-icon, [data-theme="light"] .welcome-icon { background: #e5e0ec; color: #78618c; }
+[data-theme="light"] .project-icon, [data-theme="light"] .welcome-icon { background: #e5e0ec; color: #78618c; }
 [data-theme="light"] .error-toast { background: #f7eaea; color: #8f5555; }
 [data-theme="light"] .error-toast strong { color: #673636; }
 [data-theme="light"] .thinking-fixed { color: #6a537e; background: #8b5cf60a; }
@@ -128,7 +128,6 @@
 .review-pane { background: #1b1b1b; }
 .brand { display: flex; align-items: center; gap: 9px; padding: 22px 8px 20px; }
 .brand h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 620; letter-spacing: -.35px; }
-.brand-mark { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 8px; background: #303030; color: #dedede; }
 .brand-version { margin-left: auto; font-size: 9px; padding: 2px 5px; border-radius: 4px; background: #ffffff06; color: #6e6e6e; }
 .project-switcher { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 10px; background: #252525; border-radius: 10px; text-align: left; }
 .project-switcher > svg { margin-left: auto; color: #7f7f7f; }

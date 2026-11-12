@@ -1,0 +1,103 @@
+/* Phase 1 design tokens: semantic colors, a fixed UI type scale, radii,
+   control heights, spacing and overlay shadows. Existing index.css remains
+   the layout source; Phase 1 regions consume these variables through
+   phase1.css so chat styling can be migrated separately. */
+:root {
+  --ui-font-size: 14px;
+  --text-ui-xl: 18px;
+  --text-ui-lg: 16px;
+  --text-ui-base: 14px;
+  --text-ui-caption: 13px;
+  --text-ui-sm: 12px;
+  --text-ui-xs: 10px;
+  --text-ui-reading: 15px;
+
+  --color-canvas: #171717;
+  --color-panel: #1e1e1e;
+  --color-panel-alt: #1b1b1b;
+  --color-card: #222222;
+  --color-card-hover: #262626;
+  --color-popover: #242424;
+  --color-menu: #292929;
+  --color-input: #242424;
+  --color-hover: #ffffff0a;
+  --color-selected: #2a2a2d;
+  --color-border: #ffffff14;
+  --color-border-subtle: #ffffff0d;
+  --color-foreground: #ededed;
+  --color-foreground-subtle: #a1a1aa;
+  --color-foreground-subtlest: #8a8a8a;
+  --color-primary: #8b5cf6;
+  --color-primary-foreground: #f4efff;
+  --color-primary-soft: #8b5cf61c;
+  --color-success: #4ade80;
+  --color-success-soft: #34d3991c;
+  --color-warning: #fcd34d;
+  --color-warning-soft: #fbbf2424;
+  --color-destructive: #f87171;
+  --color-destructive-foreground: #1f1111;
+  --color-destructive-soft: #f871711c;
+  --color-info: #93c5fd;
+  --color-info-soft: #3b82f624;
+  --color-diff-added: #4ade80;
+  --color-diff-removed: #f87171;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-pill: 999px;
+
+  --control-xs: 20px;
+  --control-sm: 24px;
+  --control-md: 28px;
+  --control-lg: 32px;
+  --control-xl: 36px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  --shadow-overlay: 0 12px 32px #00000055;
+  --shadow-popover: 0 10px 40px #00000055, inset 0 0 0 1px #ffffff09;
+  --shadow-composer: 0 8px 28px #00000024, inset 0 1px #ffffff08;
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+}
+
+[data-theme="light"] {
+  --color-canvas: #ffffff;
+  --color-panel: #f4f4f5;
+  --color-panel-alt: #f1f1f3;
+  --color-card: #f1f1f3;
+  --color-card-hover: #ececf0;
+  --color-popover: #ffffff;
+  --color-menu: #ffffff;
+  --color-input: #f4f4f5;
+  --color-hover: #00000008;
+  --color-selected: #e7e1ef;
+  --color-border: #00000014;
+  --color-border-subtle: #0000000a;
+  --color-foreground: #27272a;
+  --color-foreground-subtle: #52525b;
+  --color-foreground-subtlest: #71717a;
+  --color-primary: #7c3aed;
+  --color-primary-foreground: #ffffff;
+  --color-primary-soft: #8b5cf614;
+  --color-success: #16a34a;
+  --color-success-soft: #16a34a14;
+  --color-warning: #b45309;
+  --color-warning-soft: #f59e0b20;
+  --color-destructive: #dc2626;
+  --color-destructive-foreground: #ffffff;
+  --color-destructive-soft: #dc262614;
+  --color-info: #2563eb;
+  --color-info-soft: #2563eb14;
+  --shadow-overlay: 0 12px 32px #00000020;
+  --shadow-popover: 0 10px 40px #00000018, inset 0 0 0 1px #00000008;
+  --shadow-composer: 0 8px 28px #00000010, inset 0 1px #00000006;
+}

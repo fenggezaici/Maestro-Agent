@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import type { editor } from 'monaco-editor';
 import type { ExplorerFile } from './workbenchMock';
 
-function language(path: string) { return /\.(h|cpp|hpp)$/.test(path) ? 'cpp' : /\.(ts|tsx|js)$/.test(path) ? 'typescript' : /\.md$/.test(path) ? 'markdown' : 'plaintext'; }
+function language(path: string) {
+  if (/\.(h|cpp|hpp|cc|c)$/.test(path)) return 'cpp';
+  if (/\.(ts|tsx|js|jsx)$/.test(path)) return 'typescript';
+  if (/\.py$/.test(path)) return 'python';
+  if (/\.md$/.test(path)) return 'markdown';
+  return 'plaintext';
+}
 
 export default function MonacoCode({ file, fontSize, fontFamily }: { file: ExplorerFile; fontSize: number; fontFamily: string }) {
   const host = useRef<HTMLDivElement>(null);

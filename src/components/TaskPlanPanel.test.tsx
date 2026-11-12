@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it } from 'vitest';
 
 import type { PlanStep } from '../api/types';
@@ -43,4 +43,11 @@ it('shows the all-done summary once every step is completed', () => {
 it('renders nothing without steps', () => {
   const { container } = render(<TaskPlanPanel steps={[]} running variant="card" />);
   expect(container).toBeEmptyDOMElement();
+});
+
+it('starts the floating card collapsed and expands on click', () => {
+  const view = render(<TaskPlanPanel steps={steps} running variant="card" />);
+  expect(screen.queryByText('分析项目')).not.toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: /任务计划/ }));
+  expect(screen.getByText('分析项目')).toBeVisible();
 });

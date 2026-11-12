@@ -31,6 +31,7 @@ export default function ModelPicker({ model, provider, capability, thinking, row
           {rows.length === 0 && <p className="model-picker-empty">暂无模型，到 Settings→模型 添加或拉取。</p>}
           {rows.map((row) => <button type="button" key={row.id} className="model-picker-row" onClick={() => onModel(row.id)}>
             <span className="model-picker-id">{row.id}</span>
+            {row.context != null && <span className="model-picker-context">{row.context >= 1000000 ? `${(row.context / 1000000).toFixed(1)}M` : `${Math.round(row.context / 1000)}k`}</span>}
             {row.id === model && <Check size={13} aria-label="当前模型" />}
           </button>)}
         </div>

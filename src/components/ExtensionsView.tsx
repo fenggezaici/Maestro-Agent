@@ -155,7 +155,7 @@ function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: R
 
 export default function ExtensionsView({ controller: c }: { controller: ExtensionsController }) {
   const t = useT();
-  return <section aria-label="Extensions 工作区" className="extensions-view">
+  return <section aria-label="扩展工作区" className="extensions-view">
     <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">{t.workspaceCapabilities}</p><h3>{t.extensions}</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
     <Tabs.Root defaultValue="skills" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
       <Tabs.Trigger value="skills">技能</Tabs.Trigger>
