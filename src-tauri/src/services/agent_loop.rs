@@ -15,7 +15,10 @@ use crate::{
     services::kernel::Kernel,
 };
 
-const MAX_TOOL_ROUNDS: usize = 32;
+/// Safety cap for one run; can be raised with MAESTRO_MAX_TOOL_ROUNDS.
+fn max_tool_rounds() -> usize {
+    std::env::var("MAESTRO_MAX_TOOL_ROUNDS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| *value >= 8).unwrap_or(64)
+}
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -33,7 +36,7 @@ const TASK_PLAN_HINT: &str = "在执行涉及多个文件或步骤的复杂任�
 pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
     let policy = match run.mode {
         Mode::Plan => "你处于只读计划模式。仅可使用列表中提供的只读工具进行分析；写操作与命令执行不会出现在工具列表中，也不得声称已应用变更。",
-        Mode::Code => "你处于 Code 模式。读操作直接执行；写文件与命令类工具调用会挂起并展示给用户，经批准后才真实执行——你收到的工具结果才是真实执行结果，不得声称已应用未被批准的修改。",
+        Mode::Code => "你处于 Code 模式。读操作和写文件/补丁直接执行；只有危险命令会挂起等待批准，安全命令直接执行——以工具结果为准，不得声称已应用未成功的修改。",
         Mode::Confirm => "你处于 Confirm 模式。每个工具调用（含只读）都会挂起等待用户逐项确认后才执行；以工具结果为准，不得声称已执行未经确认的操作。",
         Mode::Execute => "你处于历史 execute 模式（遗留记录）。仅可使用实际开放且授权的能力。",
         Mode::Auto => "你处于 Auto 策略。已开放的工具调用会直接执行；以工具结果为准，不得声称拥有未提供的能力。",
@@ -150,6 +153,86 @@ async fn stream_turn(
     outcome
 }
 
+/// Read-only research subagent. It never writes files or runs commands; its
+/// final text is returned to the parent model as a tool result.
+async fn run_subagent(
+    kernel: Arc<Kernel>,
+    config: &ChatConfig,
+    arguments_json: &str,
+    mut cancel: watch::Receiver<bool>,
+    run_id: i64,
+) -> AppResult<String> {
+    let arguments: serde_json::Value =
+        serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+    let description = arguments.get("description").and_then(|v| v.as_str()).unwrap_or("研究子任务").trim().to_string();
+    let prompt = arguments.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if prompt.is_empty() || prompt.len() > 8192 {
+        return Err("spawn_subagent 需要 1–8192 字节的 prompt".into());
+    }
+    let provider = kernel.llm_provider(config);
+    let tools: Vec<_> = kernel
+        .agent_tools(Mode::Plan)
+        .await
+        .into_iter()
+        .filter(|tool| tool.name != "spawn_subagent")
+        .collect();
+    let mut messages = vec![
+        ChatMessage::text("system", "你是只读研究子智能体。只使用提供的只读工具分析，不写文件、不执行命令；完成后用简洁中文给出结论、证据路径和风险。"),
+        ChatMessage::text("user", prompt),
+    ];
+    for _ in 0..8 {
+        if *cancel.borrow() {
+            return Err("子智能体已取消".into());
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outcome = provider
+            .clone()
+            .stream(config, &messages, &tools, &mut cancel, tx)
+            .await?;
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Token(token) = event {
+                text.push_str(&token);
+            }
+        }
+        if !outcome.done {
+            return Err("子智能体已取消".into());
+        }
+        if outcome.tool_calls.is_empty() {
+            return Ok(format!("【子智能体 {description}】
+{}", text.trim()));
+        }
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: text,
+            tool_calls: Some(outcome.tool_calls.clone()),
+            tool_call_id: None,
+            name: None,
+            images: None,
+        });
+        let calls: Vec<(String, String)> = outcome
+            .tool_calls
+            .iter()
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect();
+        let results = kernel.execute_tool_calls(run_id, &calls).await;
+        for (call, result) in outcome.tool_calls.iter().zip(results) {
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: match result {
+                    Ok(value) => value.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
+                    Err(error) => format!("子智能体工具失败：{error}"),
+                },
+                tool_call_id: Some(call.id.clone()),
+                name: Some(call.name.clone()),
+                tool_calls: None,
+                images: None,
+            });
+        }
+    }
+    Ok(format!("【子智能体 {description}】达到工具轮次上限，未完成全部研究"))
+}
+
 pub(crate) async fn run(
     kernel: Arc<Kernel>,
     run: RunView,
@@ -164,7 +247,8 @@ pub(crate) async fn run(
         let mut messages = conversation(&detail, &run);
         let tools = kernel.agent_tools(run.mode).await;
         let provider = kernel.llm_provider(&config);
-        for _round in 0..MAX_TOOL_ROUNDS {
+        let max_rounds = max_tool_rounds();
+        for _round in 0..max_rounds {
             if kernel.is_cancelled(run.id).await {
                 return Ok(false);
             }
@@ -200,14 +284,27 @@ pub(crate) async fn run(
             });
             // Authorization, audit and tool_call events all happen inside the
             // kernel; suspended calls share ONE approval for the whole turn.
-            let calls: Vec<(String, String)> = outcome
-                .tool_calls
-                .iter()
-                .map(|call| (call.name.clone(), call.arguments.clone()))
-                .collect();
-            let results = kernel.execute_tool_calls(run.id, &calls).await;
+            let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
+            let mut normal_calls: Vec<(String, String)> = Vec::new();
+            let mut normal_indices: Vec<usize> = Vec::new();
+            for (index, call) in outcome.tool_calls.iter().enumerate() {
+                if call.name == "spawn_subagent" {
+                    results[index] = Some(
+                        run_subagent(kernel.clone(), &config, &call.arguments, cancel.clone(), run.id).await,
+                    );
+                } else {
+                    normal_calls.push((call.name.clone(), call.arguments.clone()));
+                    normal_indices.push(index);
+                }
+            }
+            if !normal_calls.is_empty() {
+                let normal_results = kernel.execute_tool_calls(run.id, &normal_calls).await;
+                for (index, result) in normal_indices.into_iter().zip(normal_results) {
+                    results[index] = Some(result);
+                }
+            }
             for (call, result) in outcome.tool_calls.iter().zip(results) {
-                let text = match result {
+                let text = match result.unwrap_or_else(|| Err("missing tool result".into())) {
                     Ok(text) => text,
                     Err(error) => format!("工具调用失败：{error}"),
                 };
@@ -225,7 +322,7 @@ pub(crate) async fn run(
         // summarize what it already gathered instead of failing the run.
         messages.push(ChatMessage::text(
             "user",
-            "工具调用预算已用尽。请基于已收集的信息直接给出最终结论，不要再调用工具。",
+            &format!("本轮工具调用达到上限（{max_rounds} 轮），任务可能未完成。请基于已收集的信息总结，并提示用户发送「继续」开始新一轮；本轮不要再调用工具。"),
         ));
         let mut final_cancel = cancel.clone();
         let final_turn = tokio::select! {

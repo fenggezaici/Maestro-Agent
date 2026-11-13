@@ -24,7 +24,7 @@ pub enum ToolGate {
 pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     Ok(match tool {
         "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file"
-        | "update_plan" => ToolEffect::ReadOnly,
+        | "update_plan" | "spawn_subagent" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
@@ -32,25 +32,56 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     })
 }
 
+/// Conservative command risk classification for Code mode. Everything not
+/// matching a destructive pattern is treated as safe, per the product choice
+/// "only dangerous commands require approval".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRisk {
+    Safe,
+    Dangerous,
+}
+
+pub fn classify_command(command: &str) -> CommandRisk {
+    let lower = command.to_ascii_lowercase();
+    const DANGEROUS: &[&str] = &[
+        "rm -rf", "rm -fr", "del /f", "del /s", "format ", "diskpart", "shutdown",
+        "reg delete", "takeown", "icacls", "runas", "sudo ", "powershell -enc",
+        "curl | bash", "curl|bash", "git reset --hard", "git clean -fdx",
+        "npm publish", "mkfs", "dd if=",
+    ];
+    if DANGEROUS.iter().any(|pattern| lower.contains(pattern)) {
+        CommandRisk::Dangerous
+    } else {
+        CommandRisk::Safe
+    }
+}
+
 /// Mode gate applied to a resolved effect; shared by named and MCP tools.
-/// - Plan: read-only only — side-effect tools are denied and must also be
-///   stripped from the advertised tool list.
-/// - Code: reads execute; writes and process execution suspend for approval.
+/// - Plan: read-only only.
+/// - Code: reads and workspace writes execute; dangerous commands suspend,
+///   safe commands execute.
 /// - Confirm: every tool call suspends for per-call confirmation.
 /// - Auto/Execute: everything allowed.
-pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
+pub fn gate_with_args(mode: Mode, effect: ToolEffect, command: Option<&str>) -> ToolGate {
     match mode {
         Mode::Plan => match effect {
             ToolEffect::ReadOnly => ToolGate::Allow,
             _ => ToolGate::Deny,
         },
         Mode::Code => match effect {
-            ToolEffect::ReadOnly => ToolGate::Allow,
-            _ => ToolGate::RequireApproval,
+            ToolEffect::ReadOnly | ToolEffect::WorkspaceWrite => ToolGate::Allow,
+            ToolEffect::ProcessExecution => match command {
+                Some(command) if classify_command(command) == CommandRisk::Safe => ToolGate::Allow,
+                _ => ToolGate::RequireApproval,
+            },
         },
         Mode::Confirm => ToolGate::RequireApproval,
         Mode::Auto | Mode::Execute => ToolGate::Allow,
     }
+}
+
+pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
+    gate_with_args(mode, effect, None)
 }
 
 /// Legacy helper kept for callers that only need allow/deny semantics:
@@ -91,18 +122,19 @@ mod tests {
         assert_eq!(gate(Mode::Plan, ToolEffect::WorkspaceWrite), Deny);
         assert_eq!(gate(Mode::Plan, ToolEffect::ProcessExecution), Deny);
         assert_eq!(gate(Mode::Code, ToolEffect::ReadOnly), Allow);
-        assert_eq!(gate(Mode::Code, ToolEffect::WorkspaceWrite), RequireApproval);
+        assert_eq!(gate(Mode::Code, ToolEffect::WorkspaceWrite), Allow);
         assert_eq!(gate(Mode::Code, ToolEffect::ProcessExecution), RequireApproval);
+        assert_eq!(gate_with_args(Mode::Code, ToolEffect::ProcessExecution, Some("ls -la")), Allow);
+        assert_eq!(gate_with_args(Mode::Code, ToolEffect::ProcessExecution, Some("rm -rf build")), RequireApproval);
     }
 
     #[test]
-    fn code_mode_authorizes_but_does_not_run_side_effects_directly() {
+    fn code_mode_auto_applies_writes_but_gates_dangerous_commands() {
         assert_eq!(authorize(Mode::Code, "write_file").unwrap(), ToolEffect::WorkspaceWrite);
         assert_eq!(authorize(Mode::Code, "read_file").unwrap(), ToolEffect::ReadOnly);
-        assert_eq!(
-            gate(Mode::Code, authorize(Mode::Code, "write_file").unwrap()),
-            ToolGate::RequireApproval
-        );
+        assert_eq!(gate(Mode::Code, ToolEffect::WorkspaceWrite), ToolGate::Allow);
+        assert_eq!(gate_with_args(Mode::Code, ToolEffect::ProcessExecution, Some("ls -la")), ToolGate::Allow);
+        assert_eq!(gate_with_args(Mode::Code, ToolEffect::ProcessExecution, Some("rm -rf build")), ToolGate::RequireApproval);
     }
 
     #[test]

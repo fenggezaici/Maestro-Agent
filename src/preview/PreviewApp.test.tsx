@@ -72,7 +72,6 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
-  fireEvent.keyDown(screen.getByRole('tab', { name: '行内差异' }), { key: 'Enter' });
   const activity = screen.getByRole('button', { name: '活动' });
   expect(activity).toHaveTextContent('今日 120 行');
   fireEvent.click(activity);
@@ -84,7 +83,6 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   expect(within(dashboard).getByLabelText('Plans Approved（Mock）')).toHaveTextContent('45');
   expect(within(dashboard).getByLabelText('Tokens Used（Mock）')).toHaveTextContent('1.2M');
   expect(within(dashboard).getByLabelText('Cost（Mock）')).toHaveTextContent('$3.50');
-  expect(screen.getByRole('tab', { name: '行内差异' })).toHaveAttribute('data-state', 'active');
   expect(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' })).toHaveAttribute('aria-pressed', 'true');
   const today = dashboard.querySelector('[data-heatmap-day="2026-11-08"]')!;
   fireEvent.focus(today);

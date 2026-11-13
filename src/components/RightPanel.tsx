@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
-import * as Tabs from '@radix-ui/react-tabs';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, PanelsTopLeft, Plus, RefreshCw, Rows3, X } from 'lucide-react';
+import { Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
 import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
@@ -13,9 +12,10 @@ import { useKernelStore } from '../stores/useKernelStore';
 import { mockExplorerFiles, type ExplorerFile } from './workbenchMock';
 import type { ExplorerViewState } from './ExplorerPanel';
 import { countChanges } from './MiniDiff';
-import MonacoDiff from './MonacoDiff';
+import LightweightDiffPreview from './LightweightDiffPreview';
 import MonacoCode from './MonacoCode';
 import TaskPlanPanel from './TaskPlanPanel';
+import { preloadMonaco } from '../editor/loader';
 
 export type ListTab = 'explorer' | 'changes' | 'tasks';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
@@ -122,7 +122,6 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   explorerView: ExplorerViewState; onExplorerViewChange: (view: ExplorerViewState) => void;
   scope: string; fontSize: number; fontFamily: string;
 }) {
-  const [split, setSplit] = useState(false);
   const t = useT();
   // Agent write/command side effects bump this tick — coalesce bursts into one
   // refresh so a long tool loop cannot keep the tree permanently "loading".
@@ -178,10 +177,8 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   };
   const noTabs = openTabs.length === 0;
 
-  return <aside aria-label="右侧工作区" className="right-pane">
-    <PanelGroup orientation="horizontal" className="right-split">
-      <Panel defaultSize={240} minSize={160} maxSize="50%" className="right-list-pane">
-        <div className="list-header">
+  return <aside aria-label="右侧工作区" className="right-pane" onMouseEnter={preloadMonaco} onFocusCapture={preloadMonaco}>
+        <div className="right-tabs-toolbar">
           <div className="right-tabs-shell">
             <div className="right-tabs" role="tablist" aria-label="右侧面板视图">
               {openTabs.map((tab) => <div key={tab} className="right-tab-wrap">
@@ -207,6 +204,8 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             </DropdownMenu.Root>
           </div>
         </div>
+    <PanelGroup orientation="horizontal" className="right-split">
+      <Panel defaultSize={240} minSize={160} maxSize="50%" className="right-list-pane">
         <div className="list-body">
           {noTabs ? <div className="right-tabs-empty"><p>点击右侧 + 添加视图</p></div> : listTab === 'explorer' ? <>
             {!preview && <>
@@ -241,12 +240,6 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
               {noTabs ? '' : listTab === 'tasks' ? '任务计划' : previewPath ? previewPath.split('/').map((part, index, all) => <span key={`${part}-${index}`}
                 className={index === all.length - 1 ? 'preview-path-leaf' : 'preview-path-dir'}>{part}{index < all.length - 1 ? ' / ' : ''}</span>) : ''}
             </span>
-            {!noTabs && listTab !== 'tasks' && change && <Tabs.Root value={split ? 'split' : 'inline'} onValueChange={(value) => setSplit(value === 'split')}>
-              <Tabs.List aria-label="Diff 布局" className="segmented-tabs">
-                <Tabs.Trigger value="split" aria-label="并排差异" className="segmented-tab"><PanelsTopLeft size={13} /></Tabs.Trigger>
-                <Tabs.Trigger value="inline" aria-label="行内差异" className="segmented-tab"><Rows3 size={13} /></Tabs.Trigger>
-              </Tabs.List>
-            </Tabs.Root>}
             {!noTabs && listTab !== 'tasks' && <span className="readonly-label"><LockKeyhole size={11} />只读</span>}
           </div>
           {noTabs
@@ -254,7 +247,7 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             : listTab === 'tasks'
             ? <div className="editor-empty"><ListTodo size={34} strokeWidth={1} /><h3>任务计划</h3><p>左侧列出当前会话的步骤与进度。</p></div>
             : (() => {
-              if (change) return <MonacoDiff diff={{ path: change.path, before: change.before, after: change.after }} split={split} fontSize={fontSize} fontFamily={fontFamily} />;
+              if (change) return <LightweightDiffPreview key={`${change.path}:${change.before}:${change.after}`} path={change.path} before={change.before} after={change.after} fontSize={fontSize} />;
               if (previewFile) return <MonacoCode file={previewFile} fontSize={fontSize} fontFamily={fontFamily} />;
               if (liveFile) return <MonacoCode file={liveFile} fontSize={fontSize} fontFamily={fontFamily} />;
               if (!preview && workspacePath) {

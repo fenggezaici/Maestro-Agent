@@ -229,6 +229,45 @@ const MAX_OUTPUT_BYTES: usize = 1048576;
 /// Shared HTTP/SSE transport: send the request, feed frames through the
 /// provider's parser, forward normalized events, honor cancellation and the
 /// output size cap.
+const RETRY_MAX_RETRIES: usize = 5;
+const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
+const RETRY_MAX_DELAY_MS: u64 = 30_000;
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504 | 524)
+}
+
+fn retryable_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
+fn retry_after_ms(response: &reqwest::Response) -> Option<u64> {
+    let headers = response.headers();
+    if let Some(value) = headers.get("retry-after-ms").and_then(|value| value.to_str().ok()) {
+        if let Ok(ms) = value.parse::<f64>() {
+            return Some(ms.max(0.0) as u64);
+        }
+    }
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|seconds| (seconds.max(0.0) * 1000.0) as u64)
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<u64>) -> Duration {
+    if let Some(ms) = retry_after {
+        return Duration::from_millis(ms.min(RETRY_MAX_DELAY_MS));
+    }
+    let base = RETRY_INITIAL_DELAY_MS.saturating_mul(1u64 << attempt.min(4));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.subsec_nanos())
+        .unwrap_or(0);
+    let jitter = (base as f64 * 0.25 * (nanos as f64 / 1_000_000_000.0)) as u64;
+    Duration::from_millis((base + jitter).min(RETRY_MAX_DELAY_MS))
+}
+
 pub(crate) async fn stream_common(
     config: &ChatConfig,
     request: reqwest::RequestBuilder,
@@ -244,21 +283,53 @@ pub(crate) async fn stream_common(
         .and_then(|builder| builder.build().ok())
         .and_then(|request| request.url().host_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
-    let response = tokio::select! {
-        biased;
-        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
-        response = request.send() => response.map_err(|error| {
-            eprintln!("LLM request failed: host={host} error={error}");
-            if error.is_timeout() {
-                format!("模型连接超时（{host}）")
-            } else if error.is_connect() {
-                format!("无法连接模型服务（{host}）：连接被拒绝或不可达")
-            } else if error.is_request() {
-                format!("无法连接模型服务（{host}）：TLS/请求错误")
-            } else {
-                format!("无法连接模型服务（{host}）：{error}")
+    let mut attempt = 0usize;
+    let response = loop {
+        let Some(builder) = request.try_clone() else {
+            return Err("模型请求无法重试".into());
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+            response = builder.send() => response,
+        };
+        match result {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if response.status().is_success() || !retryable_status(status) || attempt >= RETRY_MAX_RETRIES {
+                    break response;
+                }
+                let delay = retry_delay(attempt, retry_after_ms(&response));
+                eprintln!("LLM retry {}/{} host={host} status={status} delay={}ms", attempt + 1, RETRY_MAX_RETRIES, delay.as_millis());
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                }
+                attempt += 1;
             }
-        })?,
+            Err(error) => {
+                if attempt < RETRY_MAX_RETRIES && retryable_error(&error) {
+                    let delay = retry_delay(attempt, None);
+                    eprintln!("LLM retry {}/{} host={host} error={error} delay={}ms", attempt + 1, RETRY_MAX_RETRIES, delay.as_millis());
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                eprintln!("LLM request failed: host={host} error={error}");
+                return Err(if error.is_timeout() {
+                    format!("模型连接超时（{host}）")
+                } else if error.is_connect() {
+                    format!("无法连接模型服务（{host}）：连接被拒绝或不可达")
+                } else if error.is_request() {
+                    format!("无法连接模型服务（{host}）：TLS/请求错误")
+                } else {
+                    format!("无法连接模型服务（{host}）：{error}")
+                });
+            }
+        }
     };
     if !response.status().is_success() {
         let code = response.status().as_u16();

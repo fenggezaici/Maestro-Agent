@@ -70,3 +70,11 @@ R1/context correction: **70 frontend tests**, production TypeScript/Vite build a
 - Stop sends `abort_chat` and immediately seals the visible reasoning/tool state; there is no custom "stopping" pill. The final cancelled state is driven by the backend terminal event. The Rust kernel keeps a `cancelled_run` flag and a 250ms stream poll so cancellation does not depend on a single watch notification.
 
 Composer stats follow the DeepSeek Harness pattern: two centered pills below the composer, provider-reported usage when available, and an explicit `est.` marker for live output estimates. Cache hit is cache-read tokens over billed prompt input; output tokens are excluded, and a missing provider cache bucket shows `—` rather than an invented value.
+
+A run is capped at 64 model→tool→model rounds by default (`MAESTRO_MAX_TOOL_ROUNDS`, minimum 8). When the cap is reached, the next turn is tool-free and explicitly asks the user to send “继续” to start a new run; this prevents silent partial completion.
+
+Code mode treats workspace writes as normal work; only a conservative dangerous-command list requires approval. Read-only tool calls in one batch run concurrently, while writes and commands stay serial. `spawn_subagent` runs a read-only research child loop and returns its summary to the parent model.
+
+Model reasoning levels come from the models.dev catalog (`reasoning_options[type=effort].values`); the model config dialog defaults to smart config and only shows the composer slider when more than one level is resolved. Advanced config can override input types, capabilities, ordered levels, and the reasoning mapping JSON.
+
+Provider requests retry before the first token using the opencode policy: 5 attempts, 2s initial delay, x2 backoff, 25% jitter, 30s cap, honoring Retry-After; 401/403/404/400 are not retried, and a stream that already emitted tokens is not replayed.

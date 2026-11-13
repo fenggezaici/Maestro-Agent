@@ -1,7 +1,7 @@
 export type ProviderId = 'openai' | 'deepseek' | 'anthropic' | 'ollama';
-export type ThinkingLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface ModelCapability { context: number | null; referenceContext?: number; thinking: ThinkingLevel[]; reasoning: 'effort' | 'budget' | 'fixed' | 'none'; vision: boolean }
-export const thinkingLabels: Record<ThinkingLevel, string> = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' };
+export const thinkingLabels: Record<ThinkingLevel, string> = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max' };
 export const providers = {
   openai: { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', models: ['gpt-5', 'gpt-5.2'] },
   deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'] },

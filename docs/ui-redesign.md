@@ -12,7 +12,7 @@
 - Activity 采用单行导航入口，点击后只切换中间工作区，不打开 Modal 或覆盖右侧 Diff。
 - Dashboard 包含四项 KPI、六个月 GitHub 风格热力图与 Recharts 30 日 Token 折线图；所有统计明确为 Mock。
 - 本地 Inter 字体、Lucide 细线图标、Radix Select / Tabs / Tooltip / DropdownMenu / Dialog。
-- 圆角输入区、低对比消息、分步计划卡片、实心 Approve 与幽灵 Reject；Composer 下方为两枚统计 Pill（轮/步/tok/s、tokens/缓存命中）。
+- 圆角输入区、低对比消息、分步计划卡片、实心 Approve 与幽灵 Reject；Composer 下方为两枚统计 Pill（轮/步/tok/s、tokens/缓存命中）；右侧变更使用 ZCode 轻量统一 Diff 的真实行背景/色条。
 - 侧栏会话为单行（状态点 + 标题 + 相对时间），完整元信息放在 tooltip/aria-label；任务步骤通过 `update_plan` 进入右侧 Tasks Tab。
 - 侧栏与桌面图标使用双色 M 品牌标；Tauri 图标由 `app-icon.svg` 生成。
 - Monaco 真正只读，支持文件标签、并排/行内视图和柔和红绿高亮；切换与卸载时释放编辑器及模型。

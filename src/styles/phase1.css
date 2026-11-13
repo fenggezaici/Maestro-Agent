@@ -549,3 +549,21 @@ button:disabled {
 .project-children { padding-left: 10px; }
 .session-group-label { padding: 6px var(--space-2) 2px; font-size: var(--text-ui-xs); letter-spacing: 0.3px; }
 .project-node { margin-bottom: 0; }
+
+/* Right-panel tab toolbar: separate row above a full-width divider. */
+.list-header { min-height: 36px; padding: 0 6px; border-bottom: 1px solid var(--color-border); overflow: visible; }
+.right-tabs-shell { min-width: 0; width: 100%; padding-right: 2px; }
+.right-tabs { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
+.right-tab-add { flex: 0 0 auto; margin-left: 2px; }
+
+/* Tab toolbar spans the whole right panel, above the list/preview split. */
+.right-pane { display: flex; flex-direction: column; min-height: 0; }
+.right-tabs-toolbar { flex: 0 0 36px; display: flex; align-items: center; min-width: 0; padding: 0 8px; border-bottom: 1px solid var(--color-border); background: var(--color-panel); }
+.right-tabs-shell { flex: 1 1 auto; min-width: 0; width: auto; }
+.right-split { flex: 1 1 auto; min-height: 0; }
+.model-advanced { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+.model-chip-row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:12px; color:var(--color-foreground-subtle); }
+.model-chip { height:24px; padding:0 8px; border:1px solid var(--color-border); border-radius:999px; background:transparent; color:var(--color-foreground-subtle); font-size:11px; cursor:pointer; }
+.model-chip.active { border-color:var(--color-primary); background:var(--color-primary-soft); color:var(--color-foreground); }
+.model-level-input { min-width:140px; height:24px; padding:0 8px; border:1px solid var(--color-border); border-radius:6px; background:transparent; color:var(--color-foreground); font-size:11px; }
+.model-mapping-input { width:100%; padding:8px; border:1px solid var(--color-border); border-radius:8px; background:var(--color-panel-alt); color:var(--color-foreground); font-family:Consolas,monospace; font-size:11px; resize:vertical; }

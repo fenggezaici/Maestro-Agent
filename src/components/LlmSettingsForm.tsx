@@ -8,16 +8,6 @@ import { contextLabel, providers, type ProviderId } from '../modelCapabilities';
 import { fetchModelsApi } from '../api/models';
 import { readFetchedModels, saveFetchedModels, type FetchedModel } from '../modelFetch';
 import { clearRemoved, mergeFetched, readProviderModels, removeProviderModel, saveProviderModels, type ProviderModel } from '../providerModels';
-import type { ReasoningKind } from '../modelCatalog';
-import { Choice } from './ui';
-
-const REASONING_OPTIONS: { value: ReasoningKind | 'auto'; label: string }[] = [
-  { value: 'auto', label: '跟随自动（目录 / 静态表）' },
-  { value: 'none', label: '无思考参数' },
-  { value: 'fixed', label: '固定推理（模型内置）' },
-  { value: 'effort', label: '可调强度 reasoning_effort' },
-  { value: 'budget', label: '预算式 thinking budget' },
-];
 
 export default function LlmSettingsForm({ preview, onSaved, onChanged, provider = 'openai' }: { preview: boolean; onSaved: () => void; onChanged?: () => void; provider?: ProviderId | (string & {}) }) {
   const load = (): LlmSettings => preview ? { apiKey: '', baseUrl: getProvider(provider).baseUrl, model: getProvider(provider).model, provider } : readLlmSettings();
@@ -122,7 +112,34 @@ function ModelEditDialog({ editing, onClose, onSave }: {
           <input id="model-edit-output" autoComplete="off" inputMode="numeric" spellCheck={false}
             value={draft.output ?? ''} placeholder="如 384000"
             onChange={(event) => { const digits = event.target.value.replace(/[^\d]/g, ''); setDraft({ ...draft, output: digits ? Number(digits) : undefined }); }} />
-          <Choice label="思考类型" value={draft.reasoning ?? 'auto'} onChange={(value) => setDraft({ ...draft, reasoning: value === 'auto' ? undefined : value as ReasoningKind })} options={REASONING_OPTIONS} />
+          <div className="preference-row"><div><strong>智能配置</strong><p>按模型目录自动匹配上下文、输出与推理等级</p></div>
+            <Switch.Root className="settings-switch" aria-label="智能配置" checked={draft.followRecommended !== false}
+              onCheckedChange={(checked) => setDraft({ ...draft, followRecommended: checked })}><Switch.Thumb /></Switch.Root></div>
+          {draft.followRecommended === false && <div className="model-advanced">
+            <label>高级配置</label>
+            <div className="model-chip-row"><span>输入类型</span>
+              {['text', 'image', 'video', 'pdf'].map((type) => <button key={type} type="button"
+                className={`model-chip${(draft.inputTypes ?? ['text']).includes(type) ? ' active' : ''}`}
+                onClick={() => setDraft({ ...draft, inputTypes: (draft.inputTypes ?? ['text']).includes(type) ? (draft.inputTypes ?? ['text']).filter((item) => item !== type) : [...(draft.inputTypes ?? ['text']), type] })}>{type}</button>)}
+            </div>
+            <div className="model-chip-row"><span>模型能力</span>
+              {[['structuredOutput', '结构化输出'], ['nativeWebSearch', '原生联网搜索'], ['systemMessages', '系统消息']].map(([key, label]) => <button key={key} type="button"
+                className={`model-chip${draft.capabilities?.[key] ? ' active' : ''}`}
+                onClick={() => setDraft({ ...draft, capabilities: { ...(draft.capabilities ?? {}), [key]: !draft.capabilities?.[key] } })}>{label}</button>)}
+            </div>
+            <div className="model-chip-row"><span>推理等级（从低到高）</span>
+              {(draft.reasoningLevels ?? []).map((level) => <button key={level} type="button" className="model-chip active"
+                onClick={() => setDraft({ ...draft, reasoningLevels: (draft.reasoningLevels ?? []).filter((item) => item !== level) })}>{level} ×</button>)}
+              <input className="model-level-input" placeholder="low / high / max，回车添加" onKeyDown={(event) => {
+                if (event.key !== 'Enter') return; event.preventDefault();
+                const level = event.currentTarget.value.trim(); if (!level) return;
+                setDraft({ ...draft, reasoningLevels: [...new Set([...(draft.reasoningLevels ?? []), level])] }); event.currentTarget.value = '';
+              }} />
+            </div>
+            <label htmlFor="model-edit-mapping">推理参数映射</label>
+            <textarea id="model-edit-mapping" className="model-mapping-input" value={draft.reasoningMapping ?? '{"reasoning_effort": reasoningLevel}'}
+              onChange={(event) => setDraft({ ...draft, reasoningMapping: event.target.value })} rows={3} spellCheck={false} />
+          </div>}
           <div className="dialog-actions">
             <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
             <button type="submit" className="button-approve" disabled={!(draft.id ?? '').trim()}>保存</button>

@@ -7,7 +7,7 @@ vi.mock('../editor/monaco', () => ({ monaco: { editor: { create: fake.create, cr
 
 it('creates a folding-enabled readonly file viewer, updates appearance and releases resources', async () => {
   fake.createModel.mockImplementation(() => ({ dispose: fake.disposeModel }));
-  fake.create.mockImplementation(() => ({ dispose: fake.disposeEditor, updateOptions: fake.update }));
+  fake.create.mockImplementation(() => ({ dispose: fake.disposeEditor, updateOptions: fake.update, setModel: vi.fn() }));
   const file = { id: 'mock-file', path: 'src/File.cpp', content: 'void test() {}', source: 'mock' as const };
   const view = render(<MonacoCode file={file} fontSize={12} fontFamily="Consolas" />);
   await waitFor(() => expect(fake.create).toHaveBeenCalledTimes(1));
@@ -17,5 +17,5 @@ it('creates a folding-enabled readonly file viewer, updates appearance and relea
   expect(fake.create).toHaveBeenCalledTimes(1);
   view.unmount();
   expect(fake.disposeEditor).toHaveBeenCalledTimes(1);
-  expect(fake.disposeModel).toHaveBeenCalledTimes(1);
+  expect(fake.disposeModel).toHaveBeenCalledTimes(2);
 });

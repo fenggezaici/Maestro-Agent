@@ -10,6 +10,11 @@ export interface ProviderModel {
   context?: number;
   output?: number;
   reasoning?: ReasoningKind;
+  followRecommended?: boolean;
+  reasoningLevels?: string[];
+  reasoningMapping?: string;
+  inputTypes?: string[];
+  capabilities?: Record<string, boolean>;
   enabled: boolean;
 }
 

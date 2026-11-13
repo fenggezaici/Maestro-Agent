@@ -449,7 +449,7 @@ describe('desktop IPC interface', () => {
     } }));
     fireEvent.click(await screen.findByRole('button', { name: /任务 1\/2/ }));
     expect((await screen.findAllByText('任务计划')).length).toBeGreaterThan(0);
-    expect(screen.getByText('重构核心文件')).toBeInTheDocument();
+    expect(screen.getAllByText('重构核心文件').length).toBeGreaterThan(0);
 
     act(() => receive({ payload: {
       type: 'task_plan_updated', runId: 7, sessionId: 1, sequence: 3,
@@ -459,7 +459,7 @@ describe('desktop IPC interface', () => {
       ],
     } }));
     expect(await screen.findByRole('button', { name: /任务 2\/2/ })).toBeInTheDocument();
-    expect(await screen.findByText('全部完成')).toBeInTheDocument();
+    expect((await screen.findAllByText('全部完成')).length).toBeGreaterThan(0);
   });
 
   it('switches right-panel views with tabs and shows Tasks only when a plan exists', async () => {

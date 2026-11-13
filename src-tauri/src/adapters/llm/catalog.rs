@@ -103,6 +103,7 @@ pub struct CatalogModel {
     pub id: String,
     pub context: Option<u64>,
     pub reasoning: bool,
+    pub reasoning_levels: Vec<String>,
 }
 
 /// Fetch the public models.dev catalog (same source opencode and similar tools
@@ -127,10 +128,17 @@ pub async fn model_catalog() -> AppResult<Vec<CatalogModel>> {
         for provider in providers.values() {
             if let Some(entries) = provider["models"].as_object() {
                 for (id, meta) in entries {
+                    let reasoning_levels = meta["reasoning_options"]
+                        .as_array()
+                        .and_then(|options| options.iter().find(|option| option["type"].as_str() == Some("effort")))
+                        .and_then(|option| option["values"].as_array())
+                        .map(|values| values.iter().filter_map(|value| value.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
                     models.push(CatalogModel {
                         id: id.clone(),
                         context: meta["limit"]["context"].as_u64(),
                         reasoning: meta["reasoning"].as_bool().unwrap_or(false),
+                        reasoning_levels,
                     });
                 }
             }

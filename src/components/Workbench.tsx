@@ -6,6 +6,8 @@ import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCi
 import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
 import MaestroLogo from './MaestroLogo';
+import TaskPlanPanel from './TaskPlanPanel';
+import { preloadMonaco } from '../editor/loader';
 import PlanCard from './PlanCard';
 import ToolCallBlocks from './ToolCallBlocks';
 import type { ActiveFile, ListTab } from './RightPanel';
@@ -53,6 +55,8 @@ export interface WorkbenchController {
   currentPlan?: PlanStep[];
   /** Presentation override for the preview build; live derives it from the run. */
   planRunning?: boolean;
+  /** Latest applied write path for live diff following. */
+  lastChangedPath?: string | null;
   detail: SessionDetail | null; runs: RunView[]; loadingSession: boolean; pending: boolean; error: string | null;
   metrics?: Record<number, RunMetrics>;
   selectSession: (id: number | null) => void;
@@ -119,6 +123,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [toastError, setToastError] = useState<string | null>(null);
   const dismissToast = useCallback(() => setToastError(null), []);
   const [activeFile, setActiveFile] = useState<ActiveFile | null>(null);
+  const autoFollowChanges = useRef(true);
   const togglePin = useCallback((sessionId: number, pinned: boolean) => {
     setPinnedIds((current) => {
       const next = pinned ? [...current, sessionId] : current.filter((id) => id !== sessionId);
@@ -141,6 +146,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const plans = c.detail?.plans ?? [];
   const planSteps = c.currentPlan ?? EMPTY_PLAN;
   const planCompleted = planSteps.filter((step) => step.status === 'completed').length;
+  const lastChangedPath = c.lastChangedPath ?? null;
   const planRunning = c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId);
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
@@ -196,6 +202,12 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   };
 
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
+  useEffect(() => { autoFollowChanges.current = true; }, [c.state.activeRun?.id]);
+  useEffect(() => {
+    if (!reviewOpen || listTab !== 'changes' || !autoFollowChanges.current || !lastChangedPath) return;
+    setActiveFile({ kind: 'change', path: lastChangedPath });
+  }, [lastChangedPath, reviewOpen, listTab]);
+  useEffect(() => { const timer = window.setTimeout(preloadMonaco, 1200); return () => window.clearTimeout(timer); }, []);
 
   const paletteCommands = useMemo<PaletteCommand[]>(() => {
     const themeIcon = preferences.theme === 'light' ? <Sun size={14} /> : preferences.theme === 'system' ? <Monitor size={14} /> : <Moon size={14} />;
@@ -266,7 +278,7 @@ ${item.text}\`\`\``).join('');
   }
 
 function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); setReviewOpen(true); }
-  function selectReviewFile(path: string) { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }
+  function selectReviewFile(path: string) { autoFollowChanges.current = false; setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }
   function openWorkspaceFile(rawPath: string) {
     const path = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
     if (!path) return;
@@ -348,6 +360,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
           ? <div className="session-context-strip"><span><ChartNoAxesColumnIncreasing size={12} />Mock analytics</span><span>{dashboardData.start} — {dashboardData.end}</span></div>
           : <div className="session-context-strip"><span><GitBranch size={12} />{preview ? 'refactor/session-lifecycle' : 'local / planning'}</span><span><ShieldCheck size={12} />{MODE_LABEL[c.state.mode]}</span>{planSteps.length > 0 && <button type="button" className="task-progress-chip" onClick={openTasks}><ListTodo size={12} />任务 {planCompleted}/{planSteps.length}</button>}{preview && <span className="preview-tag">示例数据 · 无 Rust IPC</span>}</div>}
         {c.error && <div className="error-message">{c.error}</div>}
+        {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
           <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>

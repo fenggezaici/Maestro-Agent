@@ -38,6 +38,8 @@ export interface KernelStore {
   taskPlans: Record<number, PlanStep[]>;
   /** Projection of `taskPlans` for the selected session. */
   currentPlan: PlanStep[];
+  /** Latest applied write path, used to follow the live diff. */
+  lastChangedPath: string | null;
   /** true while the agent stream connection is mounted. */
   connected: boolean;
 
@@ -177,6 +179,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     stoppingRunId: null,
     taskPlans: {},
     currentPlan: [],
+    lastChangedPath: null,
     connected: false,
 
     dispatch: (action) => {
@@ -199,6 +202,12 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
       if (event.type === 'tool_call') {
         if (get().stoppingRunId === event.runId) return;
+        if (event.phase === 'finished') {
+          try {
+            const value = JSON.parse(event.detail) as { kind?: string; path?: string };
+            if (value.kind === 'write_result' && typeof value.path === 'string') set({ lastChangedPath: value.path });
+          } catch { /* Non-write result. */ }
+        }
         set((s) => {
           const { next, index } = applyToolEventIndexed(s.liveTools, event);
           return {
@@ -291,6 +300,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         stoppingRunId: null,
         taskPlans: {},
         currentPlan: [],
+        lastChangedPath: null,
         connected: false,
       });
     },
@@ -368,6 +378,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     }),
 
     start: (prompt, images) => command(async () => {
+      set({ lastChangedPath: null });
       const settings = validateLlmSettings(readLlmSettings());
       let id = selectedRef;
       if (id === null) {

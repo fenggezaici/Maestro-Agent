@@ -99,7 +99,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
 
       <Choice label="由 Rust 强制执行" value={mode} disabled={!preview && (blocked || running)} onChange={(value) => onSetMode(value as Mode)} options={[
         { value: 'plan', label: <span className="choice-item-stack"><span className="choice-item-main"><ListChecks size={13} />计划</span><span className="choice-item-desc">只读分析，不修改文件</span></span> },
-        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件/命令会挂起，批准后真实执行</span></span> },
+        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件直接执行；危险命令需批准</span></span> },
         { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />确认</span><span className="choice-item-desc">每个工具/命令都需确认，批准后执行</span></span> },
         { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />自动</span><span className="choice-item-desc">已开放工具直接执行（含写入/命令）</span></span> },
       ]} />

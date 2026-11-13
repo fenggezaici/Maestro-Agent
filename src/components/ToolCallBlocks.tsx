@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Database, FileEdit, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import { Bot, ChevronDown, ChevronRight, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
 import { useState } from 'react';
 import type { ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
@@ -28,6 +28,7 @@ const TOOL_META: Record<string, { icon: LucideIcon; verb: string }> = {
   run_command: { icon: SquareTerminal, verb: '执行' },
   load_skill: { icon: Puzzle, verb: '加载技能' },
   update_plan: { icon: ListTodo, verb: '更新计划' },
+  spawn_subagent: { icon: Bot, verb: '子智能体' },
   read_session: { icon: Database, verb: '读取会话' },
   list_sessions: { icon: Database, verb: '列出会话' },
 };
@@ -39,13 +40,26 @@ function meta(tool: string): { icon: LucideIcon; verb: string; short: string } {
   return { icon: tool.startsWith('mcp__') ? Puzzle : Wrench, verb: '调用', short };
 }
 
-/// Row target: path basename bold, directory prefix gray; plain text otherwise.
-function Target({ text }: { text: string }) {
+function FileTypeIcon({ name }: { name: string }) {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  if (['ts','tsx','js','jsx','rs','py','cpp','cc','c','h','hpp','cs','go','java'].includes(ext)) return <FileCode2 size={12} />;
+  if (['json','toml','yaml','yml'].includes(ext)) return <FileJson size={12} />;
+  if (['md','txt','log','csv'].includes(ext)) return <FileText size={12} />;
+  return <File size={12} />;
+}
+
+/// Row target: directory prefix gray, filename a separate clickable link.
+function Target({ text, clickable, onOpen }: { text: string; clickable: boolean; onOpen: () => void }) {
   if (!text) return null;
   const slash = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
   const dir = slash >= 0 ? text.slice(0, slash + 1) : '';
   const name = slash >= 0 ? text.slice(slash + 1) : text;
-  return <span className="tool-call-target">{dir && <span className="tool-call-dir">{dir}</span>}<strong>{name}</strong></span>;
+  return <span className="tool-call-target">{dir && <span className="tool-call-dir">{dir}</span>}
+    <FileTypeIcon name={name} />
+    {clickable
+      ? <button type="button" className="tool-call-file-link" onClick={(event) => { event.stopPropagation(); onOpen(); }}>{name}</button>
+      : <strong>{name}</strong>}
+  </span>;
 }
 
 function targetOf(call: ToolCallView): string {
@@ -73,15 +87,17 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval 
     if (writePath) onSelectFile?.(writePath);
   };
   return <div className={`tool-call-row ${call.allowed ? 'allowed' : 'blocked'}${pending ? ' pending' : ''}`} role="listitem">
-    <button type="button" className="tool-call-summary" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+    <div role="button" tabIndex={0} className="tool-call-summary" aria-expanded={expanded}
+      onClick={() => setExpanded((value) => !value)}
+      onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setExpanded((value) => !value); } }}>
       {pending ? <Loader2 size={12} className="tool-call-spinner" /> : <Icon size={12} className={call.allowed ? 'tool-call-ok-icon' : 'tool-call-fail-icon'} />}
       <span className="tool-call-verb">{verb}</span>
-      <span className="tool-call-target-link" onClick={(event) => { event.stopPropagation(); openFile(); }}><Target text={target || short} /></span>
+      <span className="tool-call-target-link"><Target text={target || short} clickable={Boolean(target) && call.tool !== 'run_command'} onOpen={openFile} /></span>
       {delta && <span className="tool-call-delta"><em className="add">+{delta.added}</em><em className="del">−{delta.removed}</em></span>}
       {expanded ? <ChevronDown size={12} className="tool-call-chevron" /> : <ChevronRight size={12} className="tool-call-chevron" />}
       <span className="tool-call-spacer" />
       {(!call.allowed || pending) && <span className={`tool-call-status ${statusClass}`}>{status}</span>}
-    </button>
+    </div>
     {call.awaitingApproval && onResolveApproval && (() => {
       const preview = parseApprovalPreview(call.detail);
       return <div className="tool-approval-inline" role="alert">

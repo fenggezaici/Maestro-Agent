@@ -13,6 +13,7 @@ export interface CatalogModel {
   id: string;
   context: number | null;
   reasoning: boolean;
+  reasoningLevels: string[];
 }
 
 /// Ask the provider for its real model list (live Tauri only).

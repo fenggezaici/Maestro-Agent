@@ -15,7 +15,7 @@ use crate::{
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
         ToolPhase, ToolSpec,
     },
-    services::{agent_loop, extensions::ExtensionManager, tool_router::ToolRouter},
+    services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
 };
 
 pub const EVENT_NAME: &str = "kernel-event";
@@ -453,7 +453,7 @@ impl Kernel {
             self.emit_tool(run_id, tool, ToolPhase::Started, &target).await;
             let gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool(run_id, tool, reason).await),
-                Ok(effect) => match policy::gate(run.mode, effect) {
+                Ok(effect) => match policy::gate_with_args(run.mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
                     ToolGate::Deny => Gate::Denied(
                         self.block_tool(
                             run_id,
@@ -497,6 +497,27 @@ impl Kernel {
             }
             waiting && rx.await.unwrap_or(false)
         };
+        // Pure read-only batches run concurrently. Started events were already
+        // emitted in call order; Finished events are emitted in the same order,
+        // so the UI can match pending rows without extra call ids.
+        if suspended.is_empty() && !calls.is_empty()
+            && gates.iter().all(|gate| matches!(gate, Gate::Allow(ToolEffect::ReadOnly)))
+        {
+            let outcomes = futures_util::future::join_all(
+                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json)),
+            )
+            .await;
+            let mut results = Vec::with_capacity(calls.len());
+            for ((tool, arguments_json), outcome) in calls.iter().zip(outcomes) {
+                let target = ToolRouter::call_target(tool, arguments_json);
+                results.push(
+                    self.finish_tool_outcome(run_id, run.session_id, tool, &target, "extension", ToolEffect::ReadOnly, outcome)
+                        .await,
+                );
+            }
+            return results;
+        }
+
         // Phase 3: execute (or reject) each call in order.
         let mut results = Vec::with_capacity(calls.len());
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
@@ -547,7 +568,22 @@ impl Kernel {
         audit: &str,
         effect: ToolEffect,
     ) -> AppResult<String> {
-        match self.router.execute(session_id, tool, arguments_json).await {
+        let outcome = self.router.execute(session_id, tool, arguments_json).await;
+        self.finish_tool_outcome(run_id, session_id, tool, target, audit, effect, outcome)
+            .await
+    }
+
+    async fn finish_tool_outcome(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        tool: &str,
+        target: &str,
+        audit: &str,
+        effect: ToolEffect,
+        outcome: AppResult<ToolOutcome>,
+    ) -> AppResult<String> {
+        match outcome {
             Ok(outcome) => {
                 let detail = if target.is_empty() {
                     audit.to_string()
@@ -557,8 +593,6 @@ impl Kernel {
                 self.database
                     .record_tool(run_id, tool.into(), detail, true)
                     .await?;
-                // Task-tracker steps are UI state, not workspace content: emit
-                // the dedicated plan event before the generic tool row settles.
                 if let Some(steps) = &outcome.plan {
                     let mut state = self.state.lock().await;
                     if Self::active_run_locked(&state, run_id).is_ok() {
@@ -572,8 +606,6 @@ impl Kernel {
                         );
                     }
                 }
-                // Write tools send a structured payload the UI diffs; every
-                // other tool sends the bounded result text.
                 let event_detail = match &outcome.write {
                     Some(report) => serde_json::json!({
                         "kind": "write_result",
@@ -585,7 +617,6 @@ impl Kernel {
                     None => outcome.text.chars().take(2048).collect::<String>(),
                 };
                 self.emit_tool(run_id, tool, ToolPhase::Finished, &event_detail).await;
-                // Any side-effecting success may have changed the tree.
                 if effect != ToolEffect::ReadOnly {
                     let mut state = self.state.lock().await;
                     self.emit_locked(&mut state, EventData::WorkspaceChanged);
@@ -1358,7 +1389,7 @@ mod tests {
         kernel
             .set_workspace_root(Some(workspace.path().to_path_buf()))
             .await;
-        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker
@@ -1383,7 +1414,7 @@ mod tests {
         kernel
             .set_workspace_root(Some(workspace.path().to_path_buf()))
             .await;
-        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker
@@ -1433,7 +1464,7 @@ mod tests {
         kernel
             .set_workspace_root(Some(workspace.path().to_path_buf()))
             .await;
-        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker
@@ -1454,7 +1485,7 @@ mod tests {
         kernel
             .set_workspace_root(Some(workspace.path().to_path_buf()))
             .await;
-        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker

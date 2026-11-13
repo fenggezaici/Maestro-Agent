@@ -73,13 +73,9 @@ impl LlmProvider for OpenAiProvider {
             payload["stream_options"] = json!({ "include_usage": true });
             if let Some(level) = &config.reasoning {
                 if !matches!(config.provider, super::Provider::Openai)
-                    || !(config.model.starts_with("o3") || config.model.starts_with("gpt-5"))
-                    || !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh")
+                    || !matches!(level.as_str(), "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
                 {
                     return Err("Unsupported reasoning strength for this provider/model".into());
-                }
-                if level == "xhigh" && !config.model.starts_with("gpt-5.2") {
-                    return Err("Extra High is not supported by this model mapping".into());
                 }
                 payload["reasoning_effort"] = level.clone().into();
             }

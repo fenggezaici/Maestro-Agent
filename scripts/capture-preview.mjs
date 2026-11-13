@@ -43,7 +43,7 @@ try {
   await page.getByText('前端预览', { exact: true }).waitFor({ timeout: 30_000 });
   await page.getByRole('button', { name: '切换右侧面板' }).click();
   await page.locator('.right-pane').waitFor({ timeout: 10_000 });
-  await page.locator('[data-editor-ready="true"]').waitFor({ timeout: 30_000 });
+  await page.locator('[data-lightweight-diff-preview]').waitFor({ timeout: 30_000 });
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: path.join(output, 'maestro-workbench.png'), animations: 'disabled' });
 

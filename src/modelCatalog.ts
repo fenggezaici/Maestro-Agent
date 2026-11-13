@@ -49,10 +49,13 @@ export function catalogLookup(model: string): CatalogModel | null {
   const trimmed = (model ?? '').trim();
   if (!trimmed) return null;
   const list = readCatalog();
-  const exact = list.find((item) => item.id === trimmed);
-  if (exact) return exact;
+  const exact = list.filter((item) => item.id === trimmed);
+  const withLevels = exact.find((item) => (item.reasoningLevels?.length ?? 0) > 0);
+  if (withLevels) return withLevels;
+  if (exact.length) return exact[0];
   const suffix = trimmed.split('/').pop();
-  return list.find((item) => item.id === suffix) ?? null;
+  const suffixMatches = list.filter((item) => item.id === suffix);
+  return suffixMatches.find((item) => (item.reasoningLevels?.length ?? 0) > 0) ?? suffixMatches[0] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +65,8 @@ export type ReasoningKind = 'none' | 'fixed' | 'effort' | 'budget';
 export interface CapabilityOverride {
   context?: number;
   reasoning?: ReasoningKind;
+  reasoningLevels?: string[];
+  reasoningMapping?: string;
 }
 
 export function capabilityOverrides(provider: ProviderId | (string & {})): Record<string, CapabilityOverride> {
@@ -70,7 +75,7 @@ export function capabilityOverrides(provider: ProviderId | (string & {})): Recor
   const map: Record<string, CapabilityOverride> = {};
   for (const item of readProviderModels(provider)) {
     if (item.enabled && (item.context !== undefined || item.reasoning !== undefined)) {
-      map[item.id] = { context: item.context, reasoning: item.reasoning };
+      map[item.id] = { context: item.context, reasoning: item.reasoning, reasoningLevels: item.reasoningLevels, reasoningMapping: item.reasoningMapping };
     }
   }
   return map;
@@ -99,17 +104,23 @@ export function resolveCapability(model: string, provider: ProviderId | (string 
   const fetched = fetchedContext(model, provider);
   const catalog = catalogLookup(model);
 
+  const overrideLevels = (override?.reasoningLevels ?? []).filter((level): level is ThinkingLevel => ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(level));
+  const catalogLevels = (catalog?.reasoningLevels ?? []).filter((level): level is ThinkingLevel => ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(level));
   const reasoning: ModelCapability['reasoning'] = override?.reasoning
-    ?? (catalog?.reasoning
+    ?? (catalogLevels.length > 0 ? 'effort' : catalog?.reasoning
       ? provider === 'anthropic' ? 'budget' : provider === 'openai' ? 'effort' : 'fixed'
       : base.reasoning);
-  const thinking = override?.reasoning !== undefined
-    ? override.reasoning === 'effort' ? EFFORT_LEVELS
+  const thinking = overrideLevels.length > 0
+    ? overrideLevels
+    : override?.reasoning !== undefined
+    ? override.reasoning === 'effort' ? (catalogLevels.length ? catalogLevels : EFFORT_LEVELS)
       : override.reasoning === 'budget' ? BUDGET_LEVELS
       : []
-    : catalog?.reasoning && !base.thinking.length
-      ? reasoning === 'budget' ? BUDGET_LEVELS : reasoning === 'effort' ? EFFORT_LEVELS : []
-      : base.thinking;
+    : catalogLevels.length > 0
+      ? catalogLevels
+      : catalog?.reasoning && !base.thinking.length
+        ? reasoning === 'budget' ? BUDGET_LEVELS : reasoning === 'effort' ? EFFORT_LEVELS : []
+        : base.thinking;
 
   return {
     context: override?.context ?? fetched ?? catalog?.context ?? base.context,

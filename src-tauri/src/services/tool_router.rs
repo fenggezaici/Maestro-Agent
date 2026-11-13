@@ -190,6 +190,18 @@ impl ToolRouter {
             }),
         });
         tools.push(ToolSpec {
+            name: "spawn_subagent".into(),
+            description: "启动一个只读研究子智能体，并行读取/分析代码并返回摘要（不写文件、不执行命令）。description 是短标题，prompt 是具体研究任务。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string" },
+                    "prompt": { "type": "string" }
+                },
+                "required": ["description", "prompt"]
+            }),
+        });
+        tools.push(ToolSpec {
             name: "update_plan".into(),
             description: "更新当前任务的步骤计划（仅 UI 状态，无文件/命令副作用）。执行涉及多个文件或步骤的复杂任务前必须先调用本工具列出计划；之后每完成一步，必须重新提交完整的 steps 列表并更新各步状态。".into(),
             parameters: json!({

@@ -99,3 +99,55 @@
 @media (max-width: 760px) {
   .task-plan-panel.is-card { right: 12px; left: auto; width: min(280px, calc(100vw - 24px)); }
 }
+
+/* Long-command approval: keep the status badge out of the command text. */
+.tool-call-summary { min-width: 0; overflow: hidden; }
+.tool-call-target-link { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.tool-call-target { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-call-target strong { display: block; overflow: hidden; text-overflow: ellipsis; }
+.tool-call-status { flex-shrink: 0; margin-left: auto; position: relative; z-index: 1; }
+.tool-approval-inline { min-width: 0; overflow: hidden; }
+.tool-approval-command { display: block; margin: 0; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 160px; overflow: auto; }
+
+/* ZCode-style inline tool summary: content width, chevron next to text. */
+.tool-call-summary {
+  display: inline-flex;
+  width: auto;
+  max-width: 100%;
+  align-self: flex-start;
+  overflow: hidden;
+}
+.tool-call-target-link {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(70ch, 100%);
+  overflow: hidden;
+}
+.tool-call-spacer { display: none; }
+.tool-call-status { flex-shrink: 0; margin-left: 2px; }
+.tool-call-chevron { opacity: 0; transition: opacity 120ms ease; }
+.tool-call-summary:hover .tool-call-chevron,
+.tool-call-summary[aria-expanded="true"] .tool-call-chevron { opacity: 1; }
+
+/* Final ZCode-style inline tool row: no wrapping between dir and filename. */
+.tool-call-summary { display:inline-flex; width:auto; max-width:100%; align-self:flex-start; align-items:center; gap:6px; overflow:hidden; }
+.tool-call-target-link { display:inline-flex; align-items:center; flex:0 1 auto; min-width:0; max-width:min(70ch,100%); overflow:hidden; white-space:nowrap; }
+.tool-call-target { display:inline-flex; align-items:baseline; gap:4px; min-width:0; overflow:hidden; white-space:nowrap; }
+.tool-call-target strong { display:inline; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tool-call-dir { display:inline; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tool-call-file-link { display:inline; padding:0; border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tool-call-file-link:hover { color:var(--color-foreground); text-decoration:underline; }
+.tool-call-file-link:focus-visible { outline:1px solid var(--color-primary); outline-offset:1px; border-radius:2px; }
+.tool-call-spacer { display:none; }
+.tool-call-verb, .tool-call-chevron, .tool-call-status { flex-shrink:0; }
+.tool-call-chevron { opacity:0; transition:opacity 120ms ease; margin-left:2px; }
+.tool-call-summary:hover .tool-call-chevron, .tool-call-summary[aria-expanded="true"] .tool-call-chevron { opacity:1; }
+.reasoning-toggle, .execution-row { width:auto; max-width:100%; align-self:flex-start; }
+.reasoning-toggle svg:last-child { margin-left:2px; }
+
+/* ZCode lightweight diff */
+.lightweight-diff { width: 100%; min-width: 0; overflow: auto; background: var(--color-background); }
+.lightweight-diff-scroll { min-width: 100%; font-family: "Cascadia Code", Consolas, monospace; line-height: 1.55; color: var(--color-foreground); }
+.lightweight-diff-row { display: flex; min-width: 100%; width: 100%; }
+.lightweight-diff-gutter { position: sticky; left: 0; z-index: 1; width: 48px; flex: 0 0 48px; padding: 0 8px; text-align: right; user-select: none; border-right: 1px solid var(--color-border); color: var(--color-foreground-subtlest); background: var(--color-background); font-variant-numeric: tabular-nums; }
+.lightweight-diff-code { display: block; flex: 1; padding: 0 12px; white-space: pre; }

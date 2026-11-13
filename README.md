@@ -37,11 +37,11 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
-| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；真实模型的写文件/命令调用会生成工具级审批卡片 |
-| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），Diff 默认行内/上下；会话搜索、项目分组、Settings、快捷键 |
+| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批 |
+| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff（真实增删行背景/色条）；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
 | 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip，80% 变黄、90% 变红 |
-| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/tok/s；总 tokens/缓存命中），点击查看输入、缓存读取、未缓存输入、输出明细；缓存命中严格按 provider usage，缺失时显示 — |
+| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/实时 tok/s；总 tokens/缓存命中），tok/s 只累计实际输出 burst 的解码时间；缓存命中严格按 provider usage，缺失时显示 — |
 | 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
 | 品牌 / 图标 | 双色 M MaestroLogo；Tauri 桌面图标由 `app-icon.svg` 生成（ico/icns/png/Square/StoreLogo） |
 | 国际化 | 默认 zh-CN；英文切换目前覆盖基础导航与设置标签，完整 i18n 仍在后续 |
@@ -49,15 +49,15 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 会话列表 | 单行极简：状态点 + 标题 + 相对时间；轮数/#id/完整标题在 tooltip 与 aria-label；本地置顶与日期分组；置顶仅存 localStorage |
 | 计划 / 任务 | 计划卡待审批展开、已结案折叠；`update_plan` 任务步骤实时进入右侧 Tasks Tab，聊天区顶部显示“任务 N/M”胶囊；已完成步骤灰化+删除线 |
 | 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
-| 模型能力 / 会话统计 | 动态思考选项与目录上下文上限，Provider usage/计时；缺失用量明确标为估算 |
+| 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算 |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
 | MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效 |
-| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计 |
+| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体 MVP；模型连接按 opencode retry 策略自动退避重试 |
 | 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
 | Activity | Dashboard 仍为 Mock 演示数据 |
 
-**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code and Confirm suspend write/patch/command tools until the user approves, then execute them for real; Auto executes already-authorized tools directly. Approving a plan only records intent — it never applies a diff by itself. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
+**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code applies write/patch directly and only suspends dangerous commands (rm -rf, format, git reset --hard, etc.), safe commands execute; Confirm suspends every tool call; Auto executes already-authorized tools directly. Approving a plan only records intent — it never applies a diff by itself. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
 
 ## 快速开始
 
