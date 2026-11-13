@@ -11,7 +11,7 @@ it('creates a folding-enabled readonly file viewer, updates appearance and relea
   const file = { id: 'mock-file', path: 'src/File.cpp', content: 'void test() {}', source: 'mock' as const };
   const view = render(<MonacoCode file={file} fontSize={12} fontFamily="Consolas" />);
   await waitFor(() => expect(fake.create).toHaveBeenCalledTimes(1));
-  expect(fake.create).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ readOnly: true, folding: true, automaticLayout: true }));
+  expect(fake.create).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ readOnly: true, folding: true, automaticLayout: false }));
   view.rerender(<MonacoCode file={file} fontSize={16} fontFamily="Cascadia Code" />);
   await waitFor(() => expect(fake.update).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 16 })));
   expect(fake.create).toHaveBeenCalledTimes(1);

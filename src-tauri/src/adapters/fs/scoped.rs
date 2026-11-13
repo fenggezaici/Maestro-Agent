@@ -116,6 +116,13 @@ pub struct WriteReport {
     pub after: String,
 }
 
+/// Remove a workspace file; used only by the explicit undo command.
+pub fn remove_file(root: &Path, rel: &str) -> AppResult<()> {
+    let file = scoped_write_path(root, rel)?;
+    if file.is_file() { std::fs::remove_file(&file).map_err(|_| "文件删除失败".to_string())?; }
+    Ok(())
+}
+
 /// `write_file` tool body: create or overwrite a text file inside the workspace.
 pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<WriteReport> {
     if content.len() > MAX_FILE_BYTES as usize {

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
-import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from 'react-resizable-panels';
+import SplitDivider, { STORAGE_KEY } from './SplitDivider';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
 import type { PlanCard, PlanStep } from '../api/types';
@@ -176,6 +176,10 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
     tasks: { label: '任务', icon: <ListTodo size={12} /> },
   };
   const noTabs = openTabs.length === 0;
+  const [listWidth, setListWidth] = useState(() => { try { return Number(localStorage.getItem(STORAGE_KEY)) || 240; } catch { return 240; } });
+  const splitRef = useRef<HTMLDivElement>(null);
+  const commitWidth = (width: number) => { setListWidth(width); try { localStorage.setItem(STORAGE_KEY, String(width)); } catch { /* quota */ } };
+  useEffect(() => { splitRef.current?.style.setProperty('--right-list-width', `${listWidth}px`); }, [listWidth]);
 
   return <aside aria-label="右侧工作区" className="right-pane" onMouseEnter={preloadMonaco} onFocusCapture={preloadMonaco}>
         <div className="right-tabs-toolbar">
@@ -204,8 +208,8 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             </DropdownMenu.Root>
           </div>
         </div>
-    <PanelGroup orientation="horizontal" className="right-split">
-      <Panel defaultSize={240} minSize={160} maxSize="50%" className="right-list-pane">
+    <div ref={splitRef} className="right-split">
+      <div className="right-list-pane">
         <div className="list-body">
           {noTabs ? <div className="right-tabs-empty"><p>点击右侧 + 添加视图</p></div> : listTab === 'explorer' ? <>
             {!preview && <>
@@ -231,9 +235,9 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             <ChangesList files={reviewFiles} activePath={change?.path ?? null} onPick={(picked) => onActiveFile({ kind: 'change', path: picked })} />
           </nav>}
         </div>
-      </Panel>
-      <PanelResizeHandle aria-label="调整文件列表宽度" className="resizable-handle"><span /></PanelResizeHandle>
-      <Panel minSize={200} className="right-preview-pane">
+      </div>
+      <SplitDivider containerRef={splitRef} onCommit={commitWidth} />
+      <div className="right-preview-pane">
         <div className="preview-stack">
           <div className="preview-toolbar">
             <span className="preview-toolbar-path" title={previewPath}>
@@ -258,7 +262,7 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
               return <div className="editor-empty"><Braces size={34} strokeWidth={1} /><h3>你的下一次变更，从这里开始</h3><p>选择左侧文件以查看内容或差异。</p></div>;
             })()}
         </div>
-      </Panel>
-    </PanelGroup>
+      </div>
+    </div>
   </aside>;
 }

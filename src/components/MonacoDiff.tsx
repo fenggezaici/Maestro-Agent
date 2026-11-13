@@ -30,6 +30,22 @@ export default function MonacoDiff({ diff, split, fontSize = 12, fontFamily = 'C
   }, []);
 
   useEffect(() => {
+    const element = host.current;
+    if (!element) return;
+    let raf: number | null = null;
+    const layout = () => {
+      if (document.body.dataset.panelDragging === 'true') return;
+      if (raf !== null) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => { raf = null; instance.current?.layout(); });
+    };
+    const observer = new ResizeObserver(layout);
+    observer.observe(element);
+    const settle = () => { if (raf !== null) cancelAnimationFrame(raf); instance.current?.layout(); };
+    window.addEventListener('maestro-panel-resize-end', settle);
+    return () => { observer.disconnect(); if (raf !== null) cancelAnimationFrame(raf); window.removeEventListener('maestro-panel-resize-end', settle); };
+  }, []);
+
+  useEffect(() => {
     let disposed = false;
     setError(false);
     void loadMonaco().then(({ monaco }) => {
@@ -37,7 +53,7 @@ export default function MonacoDiff({ diff, split, fontSize = 12, fontFamily = 'C
       if (!instance.current) {
         const created = monaco.editor.createDiffEditor(host.current, {
           theme: document.documentElement.dataset.theme === 'light' ? 'maestro-light' : 'maestro-dark',
-          readOnly: true, originalEditable: false, renderSideBySide: split, automaticLayout: true,
+          readOnly: true, originalEditable: false, renderSideBySide: split, automaticLayout: false,
           minimap: { enabled: false }, fontFamily: `"${fontFamily}", Consolas, monospace`,
           fontSize, lineHeight: 23, padding: { top: 20, bottom: 24 },
           scrollBeyondLastLine: false, renderLineHighlight: 'none',

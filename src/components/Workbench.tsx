@@ -14,7 +14,12 @@ import type { ActiveFile, ListTab } from './RightPanel';
 import { Choice, IconButton } from './ui';
 import WorkbenchLayout from './WorkbenchLayout';
 import ProjectSessions from './ProjectSessions';
-import { createMockDashboard } from './activityMock';
+import { createEmptyDashboard, createMockDashboard, type DashboardData } from './activityMock';
+import { activitySnapshotApi } from '../api/activity';
+import { previewRevertRunChangesApi, revertRunChangesApi, runChangeSummaryApi, runChangesApi, type RevertPreview, type RunChangeSummary, type RunFileChange } from '../api/changes';
+import ChangeSummaryCard from './ChangeSummaryCard';
+import RevertChangesDialog from './RevertChangesDialog';
+import { lineDiff } from '../lib/lineDiff';
 import type { WorkbenchProject } from './workspace';
 import SettingsPanel from './SettingsPanel';
 import { NewProjectDialog, DeleteProjectDialog } from './NewProjectDialog';
@@ -57,6 +62,8 @@ export interface WorkbenchController {
   planRunning?: boolean;
   /** Latest applied write path for live diff following. */
   lastChangedPath?: string | null;
+  /** Bumped on workspace_changed; refreshes live change summaries. */
+  workspaceTick?: number;
   detail: SessionDetail | null; runs: RunView[]; loadingSession: boolean; pending: boolean; error: string | null;
   metrics?: Record<number, RunMetrics>;
   selectSession: (id: number | null) => void;
@@ -72,9 +79,50 @@ export interface WorkbenchController {
   deleteSession?: (sessionId: number) => unknown;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (id: number) => unknown;
+  queueStart?: (prompt: string, images?: string[]) => void;
   resolveApproval?: (runId: number, approved: boolean) => unknown;
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
+}
+
+function fallbackChanges(files: { path: string; before: string; after: string }[]): RunFileChange[] {
+  return files.map((file) => {
+    const lines = lineDiff(file.before, file.after);
+    return {
+      path: file.path,
+      added: lines.filter((line) => line.kind === 'added').length,
+      removed: lines.filter((line) => line.kind === 'removed').length,
+      before: file.before,
+      after: file.after,
+      createdAt: 0,
+    };
+  });
+}
+
+function mergeRunChanges(changes: RunFileChange[]): RunFileChange[] {
+  const order: string[] = [];
+  const merged = new Map<string, RunFileChange>();
+  for (const change of changes) {
+    const existing = merged.get(change.path);
+    if (existing) {
+      existing.added += change.added;
+      existing.removed += change.removed;
+      existing.after = change.after;
+    } else {
+      order.push(change.path);
+      merged.set(change.path, { ...change });
+    }
+  }
+  return order.map((path) => merged.get(path)!);
+}
+
+function summarizeChanges(changes: RunFileChange[]): RunChangeSummary {
+  return {
+    files: changes.length,
+    additions: changes.reduce((total, change) => total + change.added, 0),
+    deletions: changes.reduce((total, change) => total + change.removed, 0),
+    state: 'applied',
+  };
 }
 
 export default function Workbench({ controller: c, source = 'live', projects: suppliedProjects, onCreateProjectSession, sessionActions, extensions: suppliedExtensions }: {
@@ -123,6 +171,16 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [toastError, setToastError] = useState<string | null>(null);
   const dismissToast = useCallback(() => setToastError(null), []);
   const [activeFile, setActiveFile] = useState<ActiveFile | null>(null);
+  const [runSummary, setRunSummary] = useState<RunChangeSummary | null>(null);
+  const [runChanges, setRunChanges] = useState<RunFileChange[]>([]);
+  const [runChangesLoaded, setRunChangesLoaded] = useState(false);
+  const [runChangesLoading, setRunChangesLoading] = useState(false);
+  const [runChangesError, setRunChangesError] = useState<string | null>(null);
+  const [revertOpen, setRevertOpen] = useState(false);
+  const [revertPreview, setRevertPreview] = useState<RevertPreview | null>(null);
+  const [revertLoading, setRevertLoading] = useState(false);
+  const [reverting, setReverting] = useState(false);
+  const [revertError, setRevertError] = useState<string | null>(null);
   const autoFollowChanges = useRef(true);
   const togglePin = useCallback((sessionId: number, pinned: boolean) => {
     setPinnedIds((current) => {
@@ -147,11 +205,13 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const planSteps = c.currentPlan ?? EMPTY_PLAN;
   const planCompleted = planSteps.filter((step) => step.status === 'completed').length;
   const lastChangedPath = c.lastChangedPath ?? null;
-  const planRunning = c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId);
+  const stoppingActiveRun = c.stoppingRunId != null;
+  const planRunning = !stoppingActiveRun && (c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId));
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
   const stepCount = useMemo(() => Math.max(c.detail?.tools?.length ?? 0, Object.values(c.liveTools ?? {}).reduce((total, calls) => total + calls.length, 0)), [c.detail?.tools, c.liveTools]);
-  const status = agentStatus({ running: c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running'), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval) });
+  const panelReviewFiles = useMemo(() => reviewFileList.length ? reviewFileList : runChanges.map((change) => ({ path: change.path, before: change.before, after: change.after, status: 'applied' as const, tool: 'write_file' })), [reviewFileList, runChanges]);
+  const status = agentStatus({ running: !stoppingActiveRun && (c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running')), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval) });
   // Surface suspended tool calls in the Review pane the moment they appear —
   // the diff/command preview is what the user actually approves.
   useEffect(() => {
@@ -177,8 +237,94 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const archivedProjects = (suppliedProjects ?? []).filter((project) => project.archived).map((project) => ({ key: project.id, numeric: null as number | null, name: project.name }))
     .concat(suppliedProjects ? [] : (c.projects ?? []).filter((project) => project.archived).map((project) => ({ key: String(project.id), numeric: project.id, name: project.name })));
   const currentProject = projects.find((project) => project.sessions.some((item) => item.id === c.selectedSessionId)) ?? projects[0] ?? { id: 'local', name: 'Maestro-Agent', sessions: [] };
-  const dashboardData = useMemo(() => createMockDashboard(currentProject), [currentProject.id, currentProject.today?.changedLines, currentProject.today?.completedPlans]);
-  const running = c.state.activeRun?.status === 'running';
+  const [liveDashboard, setLiveDashboard] = useState<DashboardData | null>(null);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  useEffect(() => {
+    if (preview || navigation !== 'activity') return;
+    let cancelled = false;
+    const numeric = Number(currentProject.id);
+    setActivityError(null);
+    void activitySnapshotApi(Number.isFinite(numeric) ? numeric : undefined)
+      .then((snapshot) => { if (!cancelled) setLiveDashboard(snapshot); })
+      .catch((reason) => { if (!cancelled) setActivityError(reason instanceof Error ? reason.message : String(reason)); });
+    return () => { cancelled = true; };
+  }, [preview, navigation, currentProject.id]);
+  const summaryRun = c.state.activeRun ?? c.state.lastRun ?? c.runs.at(-1);
+  const summaryRunId = summaryRun?.id ?? null;
+  const panelReviewFilesRef = useRef(panelReviewFiles);
+  useEffect(() => { panelReviewFilesRef.current = panelReviewFiles; }, [panelReviewFiles]);
+  const summaryRunRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (summaryRunRef.current === summaryRunId) return;
+    summaryRunRef.current = summaryRunId;
+    setRunSummary(null); setRunChanges([]); setRunChangesLoaded(false); setRunChangesError(null);
+  }, [summaryRunId, c.selectedSessionId]);
+  useEffect(() => {
+    if (preview) return;
+    if (!summaryRun || summaryRun.sessionId !== c.selectedSessionId) return;
+    let cancelled = false;
+    const terminal = summaryRun.status !== 'running';
+    const fallback = () => {
+      if (cancelled || !terminal) return;
+      const rows = fallbackChanges(panelReviewFilesRef.current);
+      if (rows.length) {
+        setRunSummary(summarizeChanges(rows));
+        setRunChanges(rows);
+        setRunChangesLoaded(true);
+        setRunChangesError('后端未返回变更记录，显示当前会话内存中的文件列表；撤销不可用。');
+      }
+    };
+    void runChangeSummaryApi(summaryRun.id)
+      .then((summary) => {
+        if (cancelled) return;
+        if (summary.files > 0) {
+          setRunSummary(summary);
+          setRunChangesLoaded(false);
+        } else if (terminal) fallback();
+      })
+      .catch(() => { if (terminal) fallback(); });
+    return () => { cancelled = true; };
+  }, [preview, summaryRun?.id, summaryRun?.status, summaryRun?.sessionId, c.selectedSessionId, c.lastChangedPath, c.workspaceTick ?? 0]);
+
+  const loadRunChanges = () => {
+    if (!summaryRun || runChangesLoaded || runChangesLoading) return;
+    setRunChangesLoading(true); setRunChangesError(null);
+    void runChangesApi(summaryRun.id)
+      .then((rows) => { setRunChanges(mergeRunChanges(rows)); setRunChangesLoaded(true); })
+      .catch(() => {
+        const rows = fallbackChanges(panelReviewFilesRef.current);
+        setRunChanges(rows); setRunChangesLoaded(true);
+        setRunChangesError('读取变更明细失败，显示当前会话内存中的文件列表；撤销不可用。');
+      })
+      .finally(() => setRunChangesLoading(false));
+  };
+
+  const previewRevert = () => {
+    if (!summaryRun) return;
+    setRevertOpen(true); setRevertLoading(true); setRevertError(null); setRevertPreview(null);
+    void previewRevertRunChangesApi(summaryRun.id)
+      .then(setRevertPreview)
+      .catch((reason) => setRevertError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setRevertLoading(false));
+  };
+
+  const applyRevert = () => {
+    if (!summaryRun || c.selectedSessionId == null) return;
+    setReverting(true); setRevertError(null);
+    void revertRunChangesApi(summaryRun.id, c.selectedSessionId)
+      .then((result) => {
+        setRunSummary((current) => current ? { ...current, state: 'reverted' } : current);
+        setRunChangesLoaded(false);
+        if (result.conflicts.length) setToastError(`以下文件未撤销：${result.conflicts.join('、')}`);
+        setRevertOpen(false); setRevertPreview(null);
+        void workspace.refresh();
+      })
+      .catch((reason) => setRevertError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setReverting(false));
+  };
+
+  const dashboardData = useMemo(() => preview ? createMockDashboard(currentProject) : liveDashboard ?? createEmptyDashboard(), [preview, currentProject, liveDashboard]);
+  const running = !stoppingActiveRun && c.state.activeRun?.status === 'running';
   const blocked = preview || !c.state.ready || c.pending;
 
   const addTab = (tab: ListTab) => {
@@ -271,6 +417,13 @@ ${item.text}\`\`\``).join('');
       const vision = resolveCapability(capability.model, capability.provider).vision;
       if (!vision) { setToastError('当前模型不支持视觉输入，请先移除图片附件'); return; }
     }
+    if (c.stoppingRunId != null) {
+      if (images.length) { setToastError('等待上一轮停止后再发送图片'); return; }
+      c.queueStart?.(submitted + texts);
+      setPrompt(''); setAttachments([]);
+      setToastError('已排队，等待上一轮停止…');
+      return;
+    }
     setPrompt('');
     const runId = await c.start(submitted + texts, images.length ? images : undefined);
     if (runId === undefined) setPrompt((current) => current || submitted);
@@ -357,12 +510,12 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
             <IconButton label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></IconButton></div>
         </header>
         {navigation === 'activity'
-          ? <div className="session-context-strip"><span><ChartNoAxesColumnIncreasing size={12} />Mock analytics</span><span>{dashboardData.start} — {dashboardData.end}</span></div>
+          ? <div className="session-context-strip"><span><ChartNoAxesColumnIncreasing size={12} />{preview ? 'Mock analytics' : '本地真实聚合'}</span><span>{dashboardData.start} — {dashboardData.end}</span></div>
           : <div className="session-context-strip"><span><GitBranch size={12} />{preview ? 'refactor/session-lifecycle' : 'local / planning'}</span><span><ShieldCheck size={12} />{MODE_LABEL[c.state.mode]}</span>{planSteps.length > 0 && <button type="button" className="task-progress-chip" onClick={openTasks}><ListTodo size={12} />任务 {planCompleted}/{planSteps.length}</button>}{preview && <span className="preview-tag">示例数据 · 无 Rust IPC</span>}</div>}
         {c.error && <div className="error-message">{c.error}</div>}
         {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
-          <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} />
+          <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} loading={!preview && !liveDashboard && !activityError} error={activityError} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
@@ -382,6 +535,11 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               }}
               onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
               onScroll={scroll.onScroll} />
+            {runSummary && runSummary.files > 0 && <ChangeSummaryCard summary={runSummary} changes={runChanges}
+              loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
+              onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
+              onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
+              onRevert={previewRevert} />}
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}
@@ -399,7 +557,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={reviewFileList} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
@@ -427,6 +585,8 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         return result?.error ?? null;
       }} />
     <ErrorToast message={toastError} onDismiss={dismissToast} />
+      <RevertChangesDialog open={revertOpen} onOpenChange={setRevertOpen} preview={revertPreview}
+        loading={revertLoading} applying={reverting} error={revertError} onApply={applyRevert} />
   </Tooltip.Provider></I18nProvider>;
 }
 

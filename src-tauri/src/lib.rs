@@ -49,6 +49,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::kernel::get_snapshot,
+            commands::activity::activity_snapshot,
+            commands::activity::run_change_summary,
+            commands::activity::run_changes,
+            commands::activity::preview_revert_run_changes,
+            commands::activity::revert_run_changes,
             commands::kernel::set_mode,
             commands::kernel::cancel_agent,
             commands::kernel::abort_chat,

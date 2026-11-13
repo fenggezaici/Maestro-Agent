@@ -37,6 +37,15 @@ beforeEach(() => {
   mocks.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     switch (command) {
       case 'get_snapshot': return structuredClone(snapshot);
+      case 'activity_snapshot': {
+        const days = Array.from({ length: 180 }, (_, index) => ({ date: `2026-01-${String((index % 28) + 1).padStart(2, '0')}`, shortDate: '01-01', lines: 0, tokens: 0, plans: 0, level: 0 }));
+        return { source: 'live', start: days[0].date, end: days.at(-1)!.date, totalLines: 0, approvedPlans: 0, totalTokens: 0, cost: null, todayLines: 0, days, trend: days.slice(-30) };
+      }
+      case 'run_change_summary': return { files: 2, additions: 3, deletions: 1, state: 'applied' };
+      case 'run_changes': return [
+        { path: 'src/a.ts', added: 2, removed: 1, before: 'old', after: 'new', createdAt: 1 },
+        { path: 'README.md', added: 1, removed: 0, before: '', after: 'docs', createdAt: 1 },
+      ];
       case 'get_workspace_info': return { name: 'Actual Project', path: 'E:/actual-project' };
       case 'select_workspace': return { name: 'Selected Project', path: args!.workspacePath };
       case 'read_directory_tree': return [
@@ -124,6 +133,41 @@ describe('desktop IPC interface', () => {
     expect(screen.getByLabelText('由 Rust 强制执行')).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '停止生成' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('abort_chat', { runId: 7 }));
+    expect(document.querySelector('.agent-status-pill')).toBeNull();
+    expect(screen.queryByRole('button', { name: '停止生成' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /2 个文件已更改/ })).toBeInTheDocument();
+  });
+
+
+  it('shows a collapsed change summary after a terminal run and loads details on expand', async () => {
+    render(<App />);
+    await ready();
+    const run: RunView = { id: 11, sessionId: 1, prompt: 'change files', mode: 'code', status: 'completed', output: 'done', error: null };
+    history = [run];
+    act(() => receive({ payload: { type: 'status', run, sequence: 2 } }));
+    const toggle = await screen.findByRole('button', { name: /2 个文件已更改/ });
+    expect(screen.queryByText('src/a.ts')).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(await screen.findByText('a.ts')).toBeInTheDocument();
+    expect(mocks.invoke).toHaveBeenCalledWith('run_changes', { run_id: 11 });
+  });
+
+
+  it('queues a new prompt while the previous run is stopping and starts it after terminal status', async () => {
+    render(<App />);
+    await ready();
+    fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'first run' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: '停止生成' }));
+    fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'queued follow-up' } });
+    fireEvent.keyDown(screen.getByLabelText('发送消息'), { key: 'Enter' });
+    expect(await screen.findByText('已排队，等待上一轮停止…')).toBeInTheDocument();
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === 'stream_chat')).toHaveLength(1);
+    act(() => receive({ payload: { type: 'status', run: { id: 7, sessionId: 1, prompt: 'first run', mode: 'plan', status: 'cancelled', output: '', error: null }, sequence: 5 } }));
+    await waitFor(() => expect(mocks.invoke.mock.calls.filter(([command]) => command === 'stream_chat')).toHaveLength(2));
+    const payload = mocks.invoke.mock.calls.filter(([command]) => command === 'stream_chat')[1][1];
+    expect((payload.messages as ChatMessage[]).at(-1)?.content).toBe('queued follow-up');
   });
 
   it('refreshes persisted history after a terminal event', async () => {
@@ -266,7 +310,7 @@ describe('desktop IPC interface', () => {
     expect(screen.getByRole('button', { name: /新会话.*0 轮对话/ })).toHaveAttribute('aria-pressed', 'false');
   });
 
-  it('keeps a live connection but presents dashboard data as Mock without additional IPC', async () => {
+  it('loads the live activity snapshot without losing the composer draft', async () => {
     render(<App />);
     await ready();
     await waitFor(() => expect(screen.getByLabelText('发送消息')).toBeInTheDocument());
@@ -274,10 +318,11 @@ describe('desktop IPC interface', () => {
     const callCount = mocks.invoke.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: '活动' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
-    expect(screen.getByLabelText('Total Lines（Mock）')).toHaveTextContent('12,450');
+    expect(screen.getByLabelText('Total Lines')).toHaveTextContent('0');
     expect(screen.getByText('Rust 内核已就绪')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    expect(mocks.invoke.mock.calls.length).toBe(callCount);
+    expect(mocks.invoke.mock.calls.length).toBe(callCount + 1);
+    expect(mocks.invoke).toHaveBeenCalledWith('activity_snapshot', expect.objectContaining({ project_id: 1 }));
     fireEvent.click(screen.getByRole('button', { name: '返回对话' }));
     expect(screen.getByLabelText('发送消息')).toHaveValue('keep this draft');
   });

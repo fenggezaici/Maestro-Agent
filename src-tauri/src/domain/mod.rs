@@ -3,6 +3,8 @@ pub mod error;
 pub mod event;
 pub mod extension;
 pub mod message;
+pub mod activity;
+pub mod change;
 pub mod metrics;
 pub mod plan;
 pub mod policy;
@@ -15,6 +17,8 @@ pub use extension::{
     SkillImportOutcome, SkillSource, SkillView,
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
+pub use activity::{ActivityDay, ActivitySnapshot};
+pub use change::{RevertIssue, RevertPreview, RevertResult, RunChangeSummary, RunFileChange};
 pub use metrics::RunMetrics;
 pub use plan::{
     validate_plan_steps, PlanCard, PlanDecision, PlanDraft, PlanStatus, PlanStep, PlanStepStatus,

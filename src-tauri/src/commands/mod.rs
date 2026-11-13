@@ -1,5 +1,6 @@
 //! IPC layer: every command is a thin pass-through that validates the window,
 //! delegates to a service/adapter, and wraps errors. No business logic here.
+pub mod activity;
 pub mod extensions;
 pub mod kernel;
 pub mod models;

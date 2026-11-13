@@ -27,6 +27,22 @@ export default function MonacoCode({ file, fontSize, fontFamily }: { file: Explo
   }, []);
 
   useEffect(() => {
+    const element = host.current;
+    if (!element) return;
+    let raf: number | null = null;
+    const layout = () => {
+      if (document.body.dataset.panelDragging === 'true') return;
+      if (raf !== null) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => { raf = null; instance.current?.layout(); });
+    };
+    const observer = new ResizeObserver(layout);
+    observer.observe(element);
+    const settle = () => { if (raf !== null) cancelAnimationFrame(raf); instance.current?.layout(); };
+    window.addEventListener('maestro-panel-resize-end', settle);
+    return () => { observer.disconnect(); if (raf !== null) cancelAnimationFrame(raf); window.removeEventListener('maestro-panel-resize-end', settle); };
+  }, []);
+
+  useEffect(() => {
     let disposed = false;
     setFailed(false);
     void loadMonaco().then(({ monaco }) => {
@@ -34,7 +50,7 @@ export default function MonacoCode({ file, fontSize, fontFamily }: { file: Explo
       if (!instance.current) {
         instance.current = monaco.editor.create(host.current, {
           theme: document.documentElement.dataset.theme === 'light' ? 'maestro-light' : 'maestro-dark',
-          readOnly: true, automaticLayout: true, minimap: { enabled: false },
+          readOnly: true, automaticLayout: false, minimap: { enabled: false },
           fontSize, fontFamily: `"${fontFamily}", Consolas, monospace`, lineHeight: 23, folding: true,
           scrollBeyondLastLine: false, links: false, contextmenu: false, wordWrap: 'off',
           padding: { top: 18, bottom: 20 }, accessibilitySupport: 'on',

@@ -6,8 +6,8 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{
-    AppResult, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics,
-    RunStatus, RunView, SessionDetail, SessionView,
+    ActivityDay, ActivitySnapshot, AppResult, RunChangeSummary, RunFileChange, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus,
+    ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView,
 };
 
 /// Every pre-v4 session migrates into the seeded default project, which can
@@ -589,6 +589,104 @@ impl Database {
         }).await
     }
 
+
+    pub async fn record_file_change(&self, run_id: i64, session_id: i64, path: String, added: i64, removed: i64, before: String, after: String) -> AppResult<()> {
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO run_file_changes (run_id, session_id, project_id, path, added, removed, before, after)
+                 SELECT ?1, ?2, s.project_id, ?3, ?4, ?5, ?6, ?7 FROM sessions s WHERE s.id = ?2",
+                params![run_id, session_id, path, added, removed, before, after],
+            ).map_err(db_error)?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn run_change_summary(&self, run_id: i64) -> AppResult<RunChangeSummary> {
+        self.call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(added),0), COALESCE(SUM(removed),0),
+                        CASE WHEN COUNT(*) > 0 AND COUNT(reverted_at) = COUNT(*) THEN 'reverted' ELSE 'applied' END
+                 FROM (SELECT path, SUM(added) added, SUM(removed) removed, MAX(reverted_at) reverted_at
+                       FROM run_file_changes WHERE run_id = ?1 GROUP BY path)",
+                [run_id],
+                |row| Ok(RunChangeSummary {
+                    files: row.get(0)?, additions: row.get(1)?, deletions: row.get(2)?, state: row.get(3)?,
+                }),
+            ).map_err(db_error)
+        }).await
+    }
+
+    pub async fn mark_run_changes_reverted(&self, run_id: i64, paths: &[String]) -> AppResult<()> {
+        let paths = paths.to_vec();
+        self.call(move |connection| {
+            for path in paths {
+                connection.execute(
+                    "UPDATE run_file_changes SET reverted_at = unixepoch() WHERE run_id = ?1 AND path = ?2 AND reverted_at IS NULL",
+                    params![run_id, path],
+                ).map_err(db_error)?;
+            }
+            Ok(())
+        }).await
+    }
+
+    pub async fn run_changes(&self, run_id: i64) -> AppResult<Vec<RunFileChange>> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT path, added, removed, before, after, created_at FROM run_file_changes WHERE run_id = ?1 ORDER BY id"
+            ).map_err(db_error)?;
+            let rows = statement.query_map([run_id], |row| Ok(RunFileChange {
+                path: row.get(0)?, added: row.get(1)?, removed: row.get(2)?,
+                before: row.get(3)?, after: row.get(4)?, created_at: row.get(5)?,
+            })).map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        }).await
+    }
+
+    pub async fn activity_snapshot(&self, project_id: Option<i64>) -> AppResult<ActivitySnapshot> {
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "WITH RECURSIVE dates(d) AS (
+                    SELECT date('now','-179 days')
+                    UNION ALL SELECT date(d,'+1 day') FROM dates WHERE d < date('now')
+                 )
+                 SELECT d,
+                   COALESCE((SELECT SUM(f.added + f.removed) FROM run_file_changes f
+                     WHERE (?1 IS NULL OR f.project_id = ?1) AND date(f.created_at,'unixepoch') = d), 0),
+                   COALESCE((SELECT SUM(COALESCE(m.input_tokens,0) + COALESCE(m.output_tokens,0))
+                     FROM run_metrics m JOIN runs r ON r.id = m.run_id JOIN sessions s ON s.id = m.session_id
+                     WHERE (?1 IS NULL OR s.project_id = ?1) AND date(r.created_at,'unixepoch') = d), 0),
+                   COALESCE((SELECT COUNT(*) FROM plan_cards p JOIN sessions s ON s.id = p.session_id
+                     WHERE (?1 IS NULL OR s.project_id = ?1) AND p.status = 'approved'
+                       AND p.decided_at IS NOT NULL AND date(p.decided_at,'unixepoch') = d), 0)
+                 FROM dates",
+            ).map_err(db_error)?;
+            let rows = statement.query_map([project_id], |row| {
+                let date: String = row.get(0)?;
+                let lines: i64 = row.get(1)?;
+                Ok(ActivityDay {
+                    short_date: date.get(5..).unwrap_or(&date).to_string(),
+                    date,
+                    lines,
+                    tokens: row.get(2)?,
+                    plans: row.get(3)?,
+                    level: if lines == 0 { 0 } else if lines < 45 { 1 } else if lines < 75 { 2 } else if lines < 100 { 3 } else { 4 },
+                })
+            }).map_err(db_error)?;
+            let days = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+            let start = days.first().map(|day| day.date.clone()).unwrap_or_default();
+            let end = days.last().map(|day| day.date.clone()).unwrap_or_default();
+            let total_lines = days.iter().map(|day| day.lines).sum();
+            let total_tokens = days.iter().map(|day| day.tokens).sum();
+            let approved_plans = days.iter().map(|day| day.plans).sum();
+            let today_lines = days.last().map(|day| day.lines).unwrap_or(0);
+            let trend = days.iter().rev().take(30).rev().cloned().collect();
+            Ok(ActivitySnapshot {
+                source: "live", start, end, total_lines, approved_plans, total_tokens,
+                cost: None, today_lines, days, trend,
+            })
+        }).await
+    }
+
     pub async fn shutdown(&self) -> AppResult<()> {
         let worker = self
             .thread
@@ -752,9 +850,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 5 {
+    if version > 8 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 5"
+            "Database schema {version} is newer than supported version 8"
         ));
     }
     connection
@@ -865,6 +963,41 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             .execute_batch(
                 "ALTER TABLE run_metrics ADD COLUMN cache_hit_tokens INTEGER;
                  PRAGMA user_version = 5;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 6 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE run_file_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    project_id INTEGER REFERENCES projects(id),
+                    path TEXT NOT NULL,
+                    added INTEGER NOT NULL,
+                    removed INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX run_file_changes_project_date ON run_file_changes(project_id, created_at);
+                 PRAGMA user_version = 6;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 7 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_file_changes ADD COLUMN before TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE run_file_changes ADD COLUMN after TEXT NOT NULL DEFAULT '';
+                 PRAGMA user_version = 7;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 8 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_file_changes ADD COLUMN reverted_at INTEGER;
+                 PRAGMA user_version = 8;",
             )
             .map_err(db_error)?;
     }
@@ -1066,7 +1199,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 6)
+                    .pragma_update(None, "user_version", 9)
                     .map_err(db_error)
             })
             .await
@@ -1432,6 +1565,37 @@ mod tests {
             .iter()
             .all(|session| session.project_id == DEFAULT_PROJECT_ID && !session.archived));
         assert_eq!(database.session_detail(1).await.unwrap().runs[0].output, "answer");
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_change_summary_tracks_files_and_reverted_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("changes.sqlite3")).await.unwrap();
+        database
+            .call(|connection| {
+                connection
+                    .execute_batch(
+                        "INSERT INTO sessions(id,title,project_id) VALUES(1,'s',1);
+                         INSERT INTO runs(id,prompt,mode,status,session_id) VALUES(1,'p','code','completed',1);
+                         INSERT INTO run_file_changes(run_id,session_id,project_id,path,added,removed,before,after)
+                         VALUES(1,1,1,'a.ts',2,1,'old','new');",
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        let summary = database.run_change_summary(1).await.unwrap();
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.additions, 2);
+        assert_eq!(summary.deletions, 1);
+        assert_eq!(summary.state, "applied");
+        database
+            .mark_run_changes_reverted(1, &["a.ts".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(database.run_change_summary(1).await.unwrap().state, "reverted");
+        assert_eq!(database.run_changes(1).await.unwrap()[0].before, "old");
         database.shutdown().await.unwrap();
     }
 }

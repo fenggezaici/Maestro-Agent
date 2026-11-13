@@ -10,7 +10,7 @@
 - 窄窗口使用嵌套纵向分栏，移动端单列；Monaco 自动调整尺寸，隐藏/恢复和断点切换保留文件及 Diff 模式。
 - 会话按 Workspace 使用 Radix Accordion 分组，保留展开状态；搜索临时展开匹配组，清空后恢复。
 - Activity 采用单行导航入口，点击后只切换中间工作区，不打开 Modal 或覆盖右侧 Diff。
-- Dashboard 包含四项 KPI、六个月 GitHub 风格热力图与 Recharts 30 日 Token 折线图；所有统计明确为 Mock。
+- Dashboard 包含四项 KPI、六个月 GitHub 风格热力图与 Recharts 30 日 Token 折线图；live 使用本地 SQLite 聚合，preview 保留 Mock。修改行数仅统计接入 run_file_changes 之后的变更，历史不回填；Cost 暂显示 —。
 - 本地 Inter 字体、Lucide 细线图标、Radix Select / Tabs / Tooltip / DropdownMenu / Dialog。
 - 圆角输入区、低对比消息、分步计划卡片、实心 Approve 与幽灵 Reject；Composer 下方为两枚统计 Pill（轮/步/tok/s、tokens/缓存命中）；右侧变更使用 ZCode 轻量统一 Diff 的真实行背景/色条。
 - 侧栏会话为单行（状态点 + 标题 + 相对时间），完整元信息放在 tooltip/aria-label；任务步骤通过 `update_plan` 进入右侧 Tasks Tab。
@@ -75,3 +75,5 @@ Monaco 0.57 的 DOMPurify 依赖及内嵌副本均重定向至已修复的 3.4.1
 后续升级 Monaco 时须复核 `vite.config.ts` 中的别名及兼容性，并重新执行 npm audit、构建与真实编辑器测试。
 Monaco adds lazy-loaded assets. It is not initialized in sessions without a Diff; the previous Phase 1 installer size is no longer claimed for this UI build.
 
+
+- 对话结束/停止后显示 ZCode 风格变更卡（默认折叠、summary 先行、展开懒加载、preview/apply 撤销）；右侧分栏使用 rAF + CSS 变量拖拽，松手才提交。

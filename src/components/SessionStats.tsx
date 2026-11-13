@@ -36,60 +36,32 @@ export function sessionUsage(runs: RunView[], metrics: Record<number, RunMetrics
   const cachePct = cacheKnown ? cacheHitPercent(cacheRead, exactInput) : null;
   const uncachedInput = cacheKnown ? Math.max(0, exactInput - cacheRead) : null;
   const elapsed = reports.reduce((longest, report) => Math.max(longest, report.elapsedMs), 0);
-  const firstToken = reports.at(-1)?.firstTokenMs ?? 0;
-  const speed = elapsed > 0 && output > 0 ? (output / (Math.max(1, elapsed - firstToken) / 1000)).toFixed(1) : '—';
+  const speedReports = reports.filter((report) => report.outputTokens != null && report.elapsedMs > 0);
+  const decodeTokens = speedReports.reduce((total, report) => total + (report.outputTokens ?? 0), 0);
+  const decodeMs = speedReports.reduce((total, report) => total + Math.max(0, report.elapsedMs - (report.firstTokenMs ?? 0)), 0);
+  const speed = decodeTokens > 0 && decodeMs > 0 ? (decodeTokens / (decodeMs / 1000)).toFixed(1) : '—';
   return { current, report: reports.at(-1), known: inputKnown && !estimated, input: exactInput, output, total, used: total, cacheRead, cachePct, uncachedInput, speed, context, estimated, elapsed };
 }
 
 export default function SessionStats({ runs, metrics, context, steps = 0 }: { runs: RunView[]; metrics?: Record<number, RunMetrics>; context: number | null; steps?: number }) {
   const current = runs.at(-1);
   const [elapsed, setElapsed] = useState(0);
-  const [decodeMs, setDecodeMs] = useState(0);
   const started = useRef(performance.now());
-  const decodeStartedAt = useRef<number | null>(null);
-  const lastTokenAt = useRef<number | null>(null);
-  const decodeMsRef = useRef(0);
   const runIdRef = useRef<number | undefined>(undefined);
   useEffect(() => {
     if (runIdRef.current === current?.id) return;
     runIdRef.current = current?.id;
     started.current = performance.now();
-    decodeStartedAt.current = null;
-    lastTokenAt.current = null;
-    decodeMsRef.current = 0;
     setElapsed(0);
-    setDecodeMs(0);
   }, [current?.id]);
   useEffect(() => {
     if (current?.status !== 'running') return;
-    const timer = window.setInterval(() => {
-      const now = performance.now();
-      setElapsed(now - started.current);
-      if (decodeStartedAt.current !== null) {
-        if (lastTokenAt.current !== null && now - lastTokenAt.current > 500) {
-          decodeMsRef.current += now - decodeStartedAt.current;
-          decodeStartedAt.current = null;
-          setDecodeMs(decodeMsRef.current);
-        } else {
-          setDecodeMs(decodeMsRef.current + now - decodeStartedAt.current);
-        }
-      }
-    }, 250);
+    const timer = window.setInterval(() => setElapsed(performance.now() - started.current), 250);
     return () => window.clearInterval(timer);
   }, [current?.id, current?.status]);
-  useEffect(() => {
-    if (current?.status !== 'running' || (current.output?.length ?? 0) === 0) return;
-    const now = performance.now();
-    lastTokenAt.current = now;
-    if (decodeStartedAt.current === null) decodeStartedAt.current = now;
-  }, [current?.output, current?.status]);
   const usage = sessionUsage(runs, metrics, context);
   const liveMs = current?.status === 'running' ? Math.max(usage.elapsed, elapsed) : usage.elapsed;
-  const activeReport = current ? metrics?.[current.id] : undefined;
-  const activeOutput = current?.status === 'running'
-    ? Math.max(activeReport?.outputTokens ?? 0, estimateTokens(current.output ?? ''))
-    : activeReport?.outputTokens ?? 0;
-  const liveSpeed = decodeMs > 0 && activeOutput > 0 ? (activeOutput / (decodeMs / 1000)).toFixed(1) : '—';
+  const liveSpeed = usage.speed;
   const hasData = runs.length > 0;
 
   return <div className="session-stats" aria-label="实时会话统计">

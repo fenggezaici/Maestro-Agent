@@ -1,8 +1,8 @@
 /// Dumb composer: prompt input, attachments, mode/project pickers and the
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
-import { useEffect, useRef, type ChangeEvent, type Dispatch, type FormEvent, type RefObject, type SetStateAction } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type RefObject, type SetStateAction } from 'react';
 import * as Popover from '@radix-ui/react-popover';
-import { ArrowDown, ArrowUp, Brain, Check, ChevronDown, Code2, Cog, FileEdit, FolderGit2, ListChecks, Paperclip, Pencil, ShieldAlert, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
 import type { PendingApprovalView } from '../lib/conversation';
 
 import type { Mode, RunMetrics, RunView } from '../api/types';
@@ -14,6 +14,17 @@ import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import ComposerControls from './ComposerControls';
 import SessionStats, { sessionUsage } from './SessionStats';
 import ContextRing from './ContextRing';
+
+const AGENT_STATUS_LABEL: Record<'approval' | 'tool' | 'thinking' | 'working', string> = {
+  approval: '等待批准', tool: '执行工具中', thinking: '思考中', working: '工作中',
+};
+
+function formatStatusElapsed(ms: number) {
+  const seconds = Math.max(0, ms) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} 分 ${(seconds - minutes * 60).toFixed(1)} 秒`;
+}
 
 export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, focusRequest, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, steps = 0 }: {
   atBottom: boolean;
@@ -90,7 +101,23 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     onAttachmentsChange((current) => [...current, ...added]); event.target.value = '';
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status">{status === 'approval' ? <ShieldAlert size={11} /> : status === 'tool' ? <Cog size={11} /> : status === 'thinking' ? <Brain size={11} /> : <Pencil size={11} />}{status === 'approval' ? '等待批准…' : status === 'tool' ? '执行工具中…' : status === 'thinking' ? '思考中…' : '生成中…'}</span>}<form onSubmit={onSubmit} className="composer">
+  const currentRun = runs.at(-1);
+  const statusReport = currentRun ? metrics?.[currentRun.id] : undefined;
+  const [statusTick, setStatusTick] = useState(0);
+  const statusStarted = useRef<number | null>(null);
+  useEffect(() => {
+    if (!status) { statusStarted.current = null; setStatusTick(0); return; }
+    statusStarted.current ??= performance.now();
+    const timer = window.setInterval(() => setStatusTick(performance.now() - (statusStarted.current ?? performance.now())), 100);
+    return () => window.clearInterval(timer);
+  }, [status, currentRun?.id]);
+  const statusElapsed = Math.max(
+    statusReport?.elapsedMs ?? 0,
+    currentRun?.createdAt ? Date.now() - currentRun.createdAt * 1000 : 0,
+    statusTick,
+  );
+
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={onSubmit} className="composer">
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
     <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
     <textarea ref={promptInput} aria-label="发送消息" rows={3} value={prompt} onChange={(event) => onPromptChange(event.target.value)} placeholder="描述你的任务… Enter 发送，Shift+Enter 换行"

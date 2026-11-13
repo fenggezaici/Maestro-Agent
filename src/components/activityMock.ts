@@ -7,14 +7,14 @@ export interface DashboardDay extends ActivityDay {
   shortDate: string;
 }
 
-export interface MockDashboardData {
-  source: 'mock';
+export interface DashboardData {
+  source: 'mock' | 'live';
   start: string;
   end: string;
   totalLines: number;
   approvedPlans: number;
   totalTokens: number;
-  cost: number;
+  cost: number | null;
   todayLines: number;
   days: DashboardDay[];
   trend: DashboardDay[];
@@ -31,7 +31,7 @@ function allocate(total: number, weights: number[]): number[] {
 }
 
 // Fixed UTC mock period: never derives metrics from live session/run/controller data.
-export function createMockDashboard(project: Pick<WorkbenchProject, 'id' | 'today'>): MockDashboardData {
+export function createMockDashboard(project: Pick<WorkbenchProject, 'id' | 'today'>): DashboardData {
   const start = Date.UTC(2026, 4, 9);
   const end = Date.UTC(2026, 10, 8);
   const count = Math.round((end - start) / 86400000) + 1;
@@ -64,3 +64,14 @@ export function heatmapWeeks(days: DashboardDay[]): (DashboardDay | null)[][] {
   return Array.from({ length: cells.length / 7 }, (_, index) => cells.slice(index * 7, index * 7 + 7));
 }
 
+
+
+/// Zero-filled live placeholder while the Rust snapshot is loading.
+export function createEmptyDashboard(): DashboardData {
+  const end = new Date();
+  const days: DashboardDay[] = Array.from({ length: 180 }, (_, index) => {
+    const date = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate() - 179 + index)).toISOString().slice(0, 10);
+    return { date, shortDate: date.slice(5), lines: 0, tokens: 0, plans: 0, level: 0 };
+  });
+  return { source: 'live', start: days[0].date, end: days.at(-1)!.date, totalLines: 0, approvedPlans: 0, totalTokens: 0, cost: null, todayLines: 0, days, trend: days.slice(-30) };
+}

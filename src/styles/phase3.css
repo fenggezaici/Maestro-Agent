@@ -151,3 +151,22 @@
 .lightweight-diff-row { display: flex; min-width: 100%; width: 100%; }
 .lightweight-diff-gutter { position: sticky; left: 0; z-index: 1; width: 48px; flex: 0 0 48px; padding: 0 8px; text-align: right; user-select: none; border-right: 1px solid var(--color-border); color: var(--color-foreground-subtlest); background: var(--color-background); font-variant-numeric: tabular-nums; }
 .lightweight-diff-code { display: block; flex: 1; padding: 0 12px; white-space: pre; }
+.change-summary-card { margin: 10px 0 2px; border: 1px solid var(--color-border); border-radius: 10px; background: var(--color-card); overflow: hidden; }
+.change-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; }
+.change-summary-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--color-foreground); cursor: pointer; font-size: var(--text-ui-caption); }
+.change-summary-toggle strong { font-weight: 600; }
+.change-add { color: var(--color-diff-added); font-variant-numeric: tabular-nums; }
+.change-del { color: var(--color-diff-removed); font-variant-numeric: tabular-nums; }
+.change-revert { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); cursor: pointer; }
+.change-revert:disabled { opacity: .45; cursor: not-allowed; }
+.change-summary-list { border-top: 1px solid var(--color-border-subtle); }
+.change-summary-row { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 5px 10px; color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); }
+.change-summary-row strong { color: var(--color-foreground); white-space: nowrap; }
+.change-dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.change-actions { margin-left: auto; display: inline-flex; gap: 2px; }
+.change-actions .button-ghost { height: 22px; padding: 0 6px; font-size: var(--text-ui-sm); }
+.revert-preview { max-height: 50vh; overflow: auto; display: grid; gap: 4px; margin: 10px 0; font-size: var(--text-ui-sm); color: var(--color-foreground-subtle); }
+.revert-preview p { display: flex; align-items: center; gap: 6px; margin: 0 0 4px; }
+.revert-file { display: flex; justify-content: space-between; gap: 12px; padding: 4px 8px; border: 1px solid var(--color-border-subtle); border-radius: 6px; }
+.revert-file span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-foreground); }
+.revert-file em { flex-shrink: 0; font-style: normal; color: var(--color-foreground-subtlest); }

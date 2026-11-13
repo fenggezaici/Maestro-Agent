@@ -556,6 +556,27 @@ impl Kernel {
         results
     }
 
+fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
+    let a: Vec<&str> = before.split('\n').collect();
+    let b: Vec<&str> = after.split('\n').collect();
+    if a.len() * b.len() > 4_000_000 {
+        return (b.len() as i64, a.len() as i64);
+    }
+    let mut dp = vec![vec![0u16; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+        }
+    }
+    let (mut i, mut j, mut added, mut removed) = (0, 0, 0i64, 0i64);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] { i += 1; j += 1; }
+        else if dp[i + 1][j] >= dp[i][j + 1] { removed += 1; i += 1; }
+        else { added += 1; j += 1; }
+    }
+    (added + (b.len() - j) as i64, removed + (a.len() - i) as i64)
+}
+
     /// Execute the routed call, audit the terminal result, emit
     /// Finished/Failed and refresh the workspace on any side effect.
     async fn finish_tool(
@@ -585,6 +606,10 @@ impl Kernel {
     ) -> AppResult<String> {
         match outcome {
             Ok(outcome) => {
+                if let Some(report) = &outcome.write {
+                    let (added, removed) = Self::line_change_counts(&report.before, &report.after);
+                    let _ = self.database.record_file_change(run_id, session_id, report.path.clone(), added, removed, report.before.clone(), report.after.clone()).await;
+                }
                 let detail = if target.is_empty() {
                     audit.to_string()
                 } else {
@@ -632,6 +657,34 @@ impl Kernel {
                 Err(reason)
             }
         }
+    }
+
+    pub async fn run_change_summary(&self, run_id: i64) -> AppResult<crate::domain::RunChangeSummary> {
+        self.database.run_change_summary(run_id).await
+    }
+
+    pub async fn run_changes(&self, run_id: i64) -> AppResult<Vec<crate::domain::RunFileChange>> {
+        self.database.run_changes(run_id).await
+    }
+
+    pub async fn preview_revert_run_changes(&self, run_id: i64) -> AppResult<crate::domain::RevertPreview> {
+        let changes = self.database.run_changes(run_id).await?;
+        self.router.preview_revert_changes(&changes).await
+    }
+
+    pub async fn revert_run_changes(&self, run_id: i64, session_id: i64) -> AppResult<crate::domain::RevertResult> {
+        let changes = self.database.run_changes(run_id).await?;
+        let result = self.router.revert_changes(&changes).await?;
+        let _ = self.database.mark_run_changes_reverted(run_id, &result.reverted).await;
+        let _ = self.database.record_tool(run_id, "revert_run_changes".into(), format!("reverted {} files", result.reverted.len()), true).await;
+        let mut state = self.state.lock().await;
+        self.emit_locked(&mut state, EventData::WorkspaceChanged);
+        let _ = session_id;
+        Ok(result)
+    }
+
+    pub async fn activity_snapshot(&self, project_id: Option<i64>) -> AppResult<crate::domain::ActivitySnapshot> {
+        self.database.activity_snapshot(project_id).await
     }
 
     pub async fn create_session(&self, project_id: Option<i64>) -> AppResult<SessionView> {

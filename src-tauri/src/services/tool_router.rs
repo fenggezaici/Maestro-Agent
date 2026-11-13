@@ -2,7 +2,7 @@
 //! call — built-in workspace reads, session reads, the skill loader, and
 //! namespaced MCP tools. Authorization (mode policy) stays on the caller;
 //! the router resolves effects and executes.
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -11,7 +11,7 @@ use crate::{
     adapters::{db::Database, fs},
     domain::{
         policy::{self, ToolGate},
-        validate_plan_steps, AppResult, Mode, PlanStep, ToolEffect, ToolSpec,
+        validate_plan_steps, AppResult, Mode, PlanStep, RevertIssue, RevertPreview, RevertResult, RunFileChange, ToolEffect, ToolSpec,
     },
     services::extensions::ExtensionManager,
 };
@@ -82,6 +82,61 @@ impl ToolRouter {
 
     pub fn extensions(&self) -> &ExtensionManager {
         &self.extensions
+    }
+
+    fn merge_changes(changes: &[RunFileChange]) -> Vec<RunFileChange> {
+        let mut order: Vec<String> = Vec::new();
+        let mut merged: HashMap<String, RunFileChange> = HashMap::new();
+        for change in changes {
+            match merged.get_mut(&change.path) {
+                Some(existing) => {
+                    existing.added += change.added;
+                    existing.removed += change.removed;
+                    existing.after = change.after.clone();
+                    existing.created_at = existing.created_at.max(change.created_at);
+                }
+                None => {
+                    order.push(change.path.clone());
+                    merged.insert(change.path.clone(), change.clone());
+                }
+            }
+        }
+        order.into_iter().filter_map(|path| merged.remove(&path)).collect()
+    }
+
+    pub async fn preview_revert_changes(&self, changes: &[RunFileChange]) -> AppResult<RevertPreview> {
+        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
+        let mut safe_files = Vec::new();
+        let mut unsafe_files = Vec::new();
+        let mut ignored_files = Vec::new();
+        for change in Self::merge_changes(changes) {
+            if change.before.is_empty() && change.after.is_empty() {
+                ignored_files.push(RevertIssue { path: change.path, reason: "checkpoint_missing".into() });
+                continue;
+            }
+            match fs::read_file(&root, &change.path) {
+                Err(_) => unsafe_files.push(RevertIssue { path: change.path, reason: "file_read_failed".into() }),
+                Ok(current) if current != change.after => unsafe_files.push(RevertIssue { path: change.path, reason: "external_modified".into() }),
+                Ok(_) => safe_files.push(change.path),
+            }
+        }
+        Ok(RevertPreview { safe_files, unsafe_files, ignored_files })
+    }
+
+    pub async fn revert_changes(&self, changes: &[RunFileChange]) -> AppResult<RevertResult> {
+        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
+        let preview = self.preview_revert_changes(changes).await?;
+        let merged = Self::merge_changes(changes);
+        let mut reverted = Vec::new();
+        for path in &preview.safe_files {
+            let Some(change) = merged.iter().find(|change| &change.path == path) else { continue };
+            if change.before.is_empty() { fs::remove_file(&root, path)?; }
+            else { fs::write_file(&root, path, &change.before)?; }
+            reverted.push(path.clone());
+        }
+        let conflicts = preview.unsafe_files.into_iter().map(|issue| issue.path)
+            .chain(preview.ignored_files.into_iter().map(|issue| issue.path)).collect();
+        Ok(RevertResult { reverted, conflicts })
     }
 
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {

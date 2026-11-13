@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Archive, ArchiveRestore, ChevronRight, FolderGit2, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings2, Trash2 } from 'lucide-react';
+import { Archive, ArchiveRestore, ChevronRight, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings2, Trash2 } from 'lucide-react';
 import ConfirmDialog from './ConfirmDialog';
 import { IconButton } from './ui';
 import { groupSessionsByDate } from '../sessionGroups';
@@ -121,7 +121,6 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
             if (project.id !== currentProjectId) onSelectProject?.(project.id);
           }}>
           {expanded ? <ChevronRight size={13} className="project-chevron open" /> : <ChevronRight size={13} className="project-chevron" />}
-          <FolderGit2 size={14} className="project-folder-icon" />
           <span className="project-name">{project.name}</span>
           <span className="project-count">{project.sessions.length}</span>
         </button>

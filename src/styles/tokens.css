@@ -11,6 +11,8 @@
   --text-ui-sm: 12px;
   --text-ui-xs: 10px;
   --text-ui-reading: 15px;
+  --chat-content-width: 896px;
+  --composer-width: 960px;
 
   --color-canvas: #171717;
   --color-panel: #1e1e1e;

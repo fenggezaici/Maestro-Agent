@@ -34,6 +34,8 @@ export interface KernelStore {
   liveTimeline: Record<number, TimelineItem[]>;
   /** Run whose stop was requested but not yet acknowledged by the backend. */
   stoppingRunId: number | null;
+  /** Prompt queued while the previous run is stopping. */
+  queuedStart: { prompt: string; images?: string[] } | null;
   /** Task-tracker steps per session — the single source of truth. */
   taskPlans: Record<number, PlanStep[]>;
   /** Projection of `taskPlans` for the selected session. */
@@ -67,6 +69,7 @@ export interface KernelStore {
   deleteSession: (sessionId: number) => Promise<void>;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (runId: number) => Promise<void>;
+  queueStart: (prompt: string, images?: string[]) => void;
   resolveApproval: (runId: number, approved: boolean) => Promise<void>;
   setMode: (mode: Mode) => Promise<void>;
   decidePlan: (card: PlanCard, decision: PlanDecision) => Promise<PlanCard | undefined>;
@@ -177,6 +180,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     workspaceTick: 0,
     liveTimeline: {},
     stoppingRunId: null,
+    queuedStart: null,
     taskPlans: {},
     currentPlan: [],
     lastChangedPath: null,
@@ -239,6 +243,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
       if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
       if (event.type === 'status' && event.run.status !== 'running') {
+        const flushQueued = get().stoppingRunId === event.run.id;
         // Stream ended: seal the open thinking burst and settle pending rows.
         set((s) => {
           const calls = s.liveTools[event.run.id];
@@ -251,6 +256,14 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
             : s.liveTimeline;
           return { liveTools, liveTimeline, stoppingRunId: s.stoppingRunId === event.run.id ? null : s.stoppingRunId };
         });
+        if (flushQueued) {
+          window.setTimeout(() => {
+            const queued = get().queuedStart;
+            if (!queued) return;
+            set({ queuedStart: null });
+            void get().start(queued.prompt, queued.images);
+          }, 0);
+        }
       }
     },
 
@@ -298,6 +311,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         liveTools: {},
         liveTimeline: {},
         stoppingRunId: null,
+        queuedStart: null,
         taskPlans: {},
         currentPlan: [],
         lastChangedPath: null,
@@ -378,7 +392,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     }),
 
     start: (prompt, images) => command(async () => {
-      set({ lastChangedPath: null });
+      set({ lastChangedPath: null, queuedStart: null });
       const settings = validateLlmSettings(readLlmSettings());
       let id = selectedRef;
       if (id === null) {
@@ -394,6 +408,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       return runId;
     }),
 
+    queueStart: (prompt, images) => set({ queuedStart: { prompt, images } }),
+
     cancel: (runId) => {
       // Stop the UI immediately — seal the open thinking burst and settle
       // pending tool rows before the backend even acknowledges the abort.
@@ -406,7 +422,13 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         const liveTimeline = closed && closed !== s.liveTimeline[runId]
           ? { ...s.liveTimeline, [runId]: closed }
           : s.liveTimeline;
-        return { liveTools, liveTimeline, stoppingRunId: runId };
+        const activeRun = s.state.activeRun?.id === runId
+          ? { ...s.state.activeRun, status: 'cancelled' as const }
+          : s.state.activeRun;
+        const lastRun = s.state.lastRun?.id === runId
+          ? { ...s.state.lastRun, status: 'cancelled' as const }
+          : s.state.lastRun;
+        return { state: { ...s.state, activeRun, lastRun }, liveTools, liveTimeline, stoppingRunId: runId };
       });
       // Send the abort immediately: the generic command wrapper would wait for
       // a snapshot and can be gated by unrelated in-flight commands, leaving
@@ -418,6 +440,13 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       window.setTimeout(() => {
         if (get().state.activeRun?.id === runId) void abort();
       }, 1200);
+      // If the backend is stuck inside a long tool, settle the optimistic run
+      // after 3s but keep stoppingRunId so late tokens stay suppressed.
+      window.setTimeout(() => {
+        const current = get();
+        if (current.stoppingRunId !== runId || current.state.activeRun?.id !== runId) return;
+        set({ state: { ...current.state, activeRun: null, lastRun: { ...current.state.activeRun, status: 'cancelled' } } });
+      }, 3000);
       return Promise.resolve();
     },
     resolveApproval: (runId, approved) => command(() => kernelApi.resolveApproval(runId, approved)).then(() => undefined),

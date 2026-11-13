@@ -28,9 +28,9 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
     case 'backend_error': return { ...next, ready: false };
     case 'mode_changed': return { ...next, mode: event.mode };
     case 'status':
-      return event.run.status === 'running'
-        ? { ...next, activeRun: event.run }
-        : { ...next, activeRun: null, lastRun: event.run };
+      if (event.run.status === 'running') return { ...next, activeRun: event.run };
+      if (state.activeRun && state.activeRun.id !== event.run.id) return { ...next, lastRun: event.run };
+      return { ...next, activeRun: null, lastRun: event.run };
     case 'content':
       return state.activeRun?.id === event.runId && event.sessionId === state.activeRun.sessionId
         ? { ...next, activeRun: { ...state.activeRun, output: state.activeRun.output + event.token } }

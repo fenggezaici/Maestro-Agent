@@ -78,3 +78,9 @@ Code mode treats workspace writes as normal work; only a conservative dangerous-
 Model reasoning levels come from the models.dev catalog (`reasoning_options[type=effort].values`); the model config dialog defaults to smart config and only shows the composer slider when more than one level is resolved. Advanced config can override input types, capabilities, ordered levels, and the reasoning mapping JSON.
 
 Provider requests retry before the first token using the opencode policy: 5 attempts, 2s initial delay, x2 backoff, 25% jitter, 30s cap, honoring Retry-After; 401/403/404/400 are not retried, and a stream that already emitted tokens is not replayed.
+
+Composer tok/s uses provider-reported output tokens and provider timing only: `sum(outputTokens) / sum(elapsedMs - firstTokenMs)` across the session's runs. It never derives speed from estimated text; when usage is missing the pill shows `—`.
+The bottom agent status pill shows `等待批准 / 执行工具中 / 思考中 / 工作中` plus live elapsed time (seconds below a minute, minutes + seconds above), driven by run metrics or `createdAt`.
+
+While a run is stopping, new text is queued instead of starting a second run; the queue starts after the old run's terminal status. Late content/status events from the old run are ignored and cannot clear the new active run. Stopping also settles the UI immediately: the working pill and stop button disappear before backend acknowledgement.
+Change cards are per turn: `run_change_summary` is the header, `run_changes` loads details on expand, `preview_revert_run_changes` classifies safe/unsafe/ignored files, and `revert_run_changes` applies only safe files. A reverted turn keeps its card with a “reverted” badge.

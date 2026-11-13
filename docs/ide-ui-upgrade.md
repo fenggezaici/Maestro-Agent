@@ -53,3 +53,7 @@ Browser checks retain production CSP, local fonts/workers, resizable layouts, Ac
 
 - Model config: **智能配置** follows models.dev context/reasoning levels; advanced mode edits input types, capabilities, ordered reasoning levels and the reasoning parameter mapping JSON. The composer slider is shown only when the resolved level list has more than one entry.
 - Model transport: connect/TLS/5xx/429 failures retry with the opencode policy (5 attempts, 2s initial, x2 backoff, 25% jitter, 30s cap, Retry-After honored) before the first token.
+
+- Composer is 960px wide while the reading column is 896px; the right split uses a pointer + requestAnimationFrame CSS-variable divider and commits only on release.
+- Change cards follow the ZCode lifecycle: summary first, details on expand, preview/apply rewind with safe/unsafe/ignored files, and a retained “reverted” state.
+- Sidebar rows share the ZCode row model: 10px left / 4px right padding, 16px leading slot, 8px gap; metadata right edges align and hover actions overlay instead of reserving width.

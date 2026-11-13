@@ -33,15 +33,15 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
 | 执行时间线 | reasoning、tool_call 与正文都进入同一条时间线；连续思考/工具折叠为「已工作 X 秒」执行阶段，正文按真实事件位置穿插，不再固定堆在底部 |
 | 工具事件行 | 工具/思考行右侧 Chevron 展开详情；执行中亮色 + Loader，完成后整行与图标灰化、hover 恢复；点击文件名打开右侧 Explorer 并加载 Monaco |
-| 停止生成 | 前端封存当前段并忽略该轮后续 token；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁；不显示自定义「停止中」中间态，终态由后端事件驱动 |
+| 停止生成 | 前端乐观终结当前 run、立即隐藏“工作中”胶囊与停止按钮，并继续丢弃迟到 token；停止期间新输入进入 `queuedStart`，旧 run terminal 后自动启动；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
 | Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批 |
-| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff（真实增删行背景/色条）；会话搜索、项目分组、Settings、快捷键 |
+| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
 | 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip，80% 变黄、90% 变红 |
-| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/实时 tok/s；总 tokens/缓存命中），tok/s 只累计实际输出 burst 的解码时间；缓存命中严格按 provider usage，缺失时显示 — |
+| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/tok/s；总 tokens/缓存命中）；tok/s 只用 provider outputTokens / (elapsed−firstToken) 聚合，缺失 usage 显示 —，不用文本估算；缓存命中同样只认 provider usage |
 | 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
 | 品牌 / 图标 | 双色 M MaestroLogo；Tauri 桌面图标由 `app-icon.svg` 生成（ico/icns/png/Square/StoreLogo） |
 | 国际化 | 默认 zh-CN；英文切换目前覆盖基础导航与设置标签，完整 i18n 仍在后续 |
@@ -49,13 +49,15 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 会话列表 | 单行极简：状态点 + 标题 + 相对时间；轮数/#id/完整标题在 tooltip 与 aria-label；本地置顶与日期分组；置顶仅存 localStorage |
 | 计划 / 任务 | 计划卡待审批展开、已结案折叠；`update_plan` 任务步骤实时进入右侧 Tasks Tab，聊天区顶部显示“任务 N/M”胶囊；已完成步骤灰化+删除线 |
 | 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
-| 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算 |
+| 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算；Composer 960px、正文 896px |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
 | MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效 |
 | 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体 MVP；模型连接按 opencode retry 策略自动退避重试 |
 | 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
-| Activity | Dashboard 仍为 Mock 演示数据 |
+| Activity | 项目级真实聚合：plans approved、run_metrics tokens、每日 token 趋势；修改行数从接入后的 run_file_changes 统计，历史数据不回填；Cost 暂无真实价格显示 —；preview 仍为 Mock |
+| 变更卡 / 撤销 | 对话结束或手动停止后显示 ZCode 风格可折叠变更卡：summary 先行、展开懒加载明细、审查/打开；撤销走 preview(safe/unsafe/ignored) → apply，只回退安全文件，已撤销保留卡片 |
+| 侧栏对齐 | 导航、项目行、会话标题统一 x=46；行盒右边界 248，计数/时间戳 244；项目/会话操作按钮 absolute 悬浮，hover 不推挤内容 |
 
 **Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code applies write/patch directly and only suspends dangerous commands (rm -rf, format, git reset --hard, etc.), safe commands execute; Confirm suspends every tool call; Auto executes already-authorized tools directly. Approving a plan only records intent — it never applies a diff by itself. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
 
@@ -181,7 +183,28 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - [UI 设计、Activity 与截图](docs/ui-redesign.md)
 - [初始阶段验证记录（历史）](docs/verification.md)
 
-后续重点：明确授权的模型文件上下文、真实计划与差异生成、执行前文件基线核验、细粒度工具审批、原生 MCP/扩展，以及系统凭据保护。附件和自动任务尚未接入后端。
+## Roadmap
+
+已完成：
+
+- 真实模型聊天、工具循环、Skills/MCP、只读 Explorer、写入/命令审批
+- `update_plan` 任务追踪、Tasks Tab、任务胶囊
+- Code 模式写自动、危险命令审批
+- 只读子智能体 MVP、只读工具并发
+- 模型目录 reasoning levels、智能/高级模型配置
+- opencode 风格连接重试、provider-only tok/s
+- ZCode 轻量 Diff、变更卡、preview/apply 撤销
+- Activity 项目级真实聚合（历史行数不回填）
+- 右侧 rAF 分栏、停止后输入队列、侧栏对齐
+
+后续重点：
+
+- 完整可写子智能体、子会话目录与侧栏
+- Activity 费用估算（接入模型价格表）与历史行数回填
+- 完整中英文 i18n 与消息目录
+- 工具审批的 allow-once / allow-always / deny feedback
+- 模型文件上下文授权、执行前基线核验
+- 自动任务、附件后端与系统凭据保护
 
 ## License
 
