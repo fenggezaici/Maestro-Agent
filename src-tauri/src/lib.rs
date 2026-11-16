@@ -43,13 +43,21 @@ pub fn run() {
                 .join(".maestro");
             let kernel = tauri::async_runtime::block_on(Kernel::open(path, maestro_dir, sink))
                 .map_err(std::io::Error::other)?;
-            app.manage(kernel);
+            app.manage(kernel.clone());
             app.manage(WorkspaceService::default());
+            // Restore MCP servers in the background: a slow npx download must
+            // never delay the window or the first chat turn.
+            tauri::async_runtime::spawn(async move {
+                kernel.start_enabled_mcp().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::kernel::get_snapshot,
             commands::activity::activity_snapshot,
+            commands::agents::list_agents,
+            commands::agents::save_agent,
+            commands::agents::delete_agent,
             commands::activity::run_change_summary,
             commands::activity::run_changes,
             commands::activity::preview_revert_run_changes,
@@ -76,6 +84,9 @@ pub fn run() {
             commands::workspace::pick_file,
             commands::extensions::scan_skills,
             commands::extensions::create_skill,
+            commands::extensions::delete_skill,
+            commands::extensions::scan_commands,
+            commands::extensions::read_command,
             commands::extensions::import_skill,
             commands::extensions::import_skill_github,
             commands::extensions::list_mcp_servers,

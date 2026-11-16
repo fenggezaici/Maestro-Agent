@@ -174,6 +174,13 @@ impl ToolRouter {
     pub async fn tool_specs(&self, mode: Mode) -> Vec<ToolSpec> {
         let mut tools = self.extensions.tool_specs().await;
         let workspace_root = self.workspace.lock().await.clone();
+        // Subagent types come from disk so user-defined agents are selectable;
+        // hidden definitions stay out of the model's enum.
+        let subagents: Vec<_> =
+            crate::adapters::agents::effective(self.extensions.maestro_dir(), workspace_root.as_deref())
+                .into_iter()
+                .filter(|agent| !agent.hidden && agent.mode == "subagent")
+                .collect();
         if let Some(spec) = tools
             .iter_mut()
             .find(|tool| tool.name == "load_skill")
@@ -244,12 +251,19 @@ impl ToolRouter {
                 "required": ["path", "before", "after"]
             }),
         });
+        let subagent_names: Vec<String> = subagents.iter().map(|agent| agent.name.clone()).collect();
+        let subagent_catalogue = subagents
+            .iter()
+            .map(|agent| if agent.description.trim().is_empty() { agent.name.clone() } else { format!("{}（{}）", agent.name, agent.description) })
+            .collect::<Vec<_>>()
+            .join("；");
         tools.push(ToolSpec {
             name: "spawn_subagent".into(),
-            description: "启动一个只读研究子智能体，并行读取/分析代码并返回摘要（不写文件、不执行命令）。description 是短标题，prompt 是具体研究任务。".into(),
+            description: format!("启动一个只读研究子智能体，并行读取/分析代码并返回摘要（不写文件、不执行命令）。description 是短标题，prompt 是具体研究任务。可用：{subagent_catalogue}"),
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "subagent_type": { "type": "string", "enum": subagent_names, "description": "子智能体类型；省略时为 explore" },
                     "description": { "type": "string" },
                     "prompt": { "type": "string" }
                 },
@@ -308,6 +322,7 @@ impl ToolRouter {
             }
             "run_command" => arg("command").unwrap_or("").to_string(),
             "load_skill" => arg("name").unwrap_or("").to_string(),
+            "spawn_subagent" => arg("description").unwrap_or("研究子任务").to_string(),
             "update_plan" => arguments
                 .get("steps")
                 .cloned()

@@ -29,6 +29,17 @@ pub struct SkillImportOutcome {
     pub error: Option<String>,
 }
 
+/// A `/<name>` prompt template stored as Markdown under `commands/`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandView {
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub source: SkillSource,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedItem {
@@ -81,6 +92,7 @@ pub struct McpServerView {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
     pub disabled: bool,
     pub trust: bool,
     pub running: bool,

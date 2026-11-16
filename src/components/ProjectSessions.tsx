@@ -63,9 +63,7 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
   const [renameDraft, setRenameDraft] = useState('');
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [deleteTarget, setDeleteTarget] = useState<
-    { kind: 'session'; id: number; title: string } | { kind: 'project'; id: string; title: string } | null
-  >(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; title: string } | null>(null);
   const query = search.trim().toLowerCase();
 
   function startRename(session: SessionView) {
@@ -105,7 +103,7 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
         <span className="session-age">{age}</span>
       </button>
       <SessionMenu session={session} pinned={pinned} onTogglePin={archived ? undefined : onTogglePin} onRename={onRenameSession ? startRename : undefined} onArchive={onArchiveSession}
-        onDelete={onDeleteSession ? () => setDeleteTarget({ kind: 'session', id: session.id, title: session.title || String(session.id) }) : undefined} />
+        onDelete={onDeleteSession ? () => setDeleteTarget({ id: session.id, title: session.title || String(session.id) }) : undefined} />
     </div>;
   }
 
@@ -130,7 +128,7 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
           <DropdownMenu.Portal><DropdownMenu.Content sideOffset={4} align="end" className="dropdown-content">
             <DropdownMenu.Item className="dropdown-item" onSelect={() => { setRenamingProjectId(project.id); setProjectDraft(project.name); }}><span className="choice-item-main"><Pencil size={13} className="item-menu-icon" />编辑项目</span></DropdownMenu.Item>
             {onTogglePinProject && <DropdownMenu.Item className="dropdown-item" onSelect={() => onTogglePinProject(project.id)}><span className="choice-item-main">{pinnedProjectIds.includes(project.id) ? <PinOff size={13} className="item-menu-icon" /> : <Pin size={13} className="item-menu-icon" />}{pinnedProjectIds.includes(project.id) ? '取消置顶' : '置顶'}</span></DropdownMenu.Item>}
-            {onDeleteProject && <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => setDeleteTarget({ kind: 'project', id: project.id, title: project.name })}><span className="choice-item-main"><Trash2 size={13} className="item-menu-icon" />删除项目</span></DropdownMenu.Item>}
+            {onDeleteProject && <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => onDeleteProject(project.id)}><span className="choice-item-main"><Trash2 size={13} className="item-menu-icon" />删除项目</span></DropdownMenu.Item>}
             <DropdownMenu.Separator className="subtle-separator" />
             {onManageProject && <DropdownMenu.Item className="dropdown-item" onSelect={onManageProject}><span className="choice-item-main"><Settings2 size={13} className="item-menu-icon" />管理项目…</span></DropdownMenu.Item>}
           </DropdownMenu.Content></DropdownMenu.Portal>
@@ -172,20 +170,15 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
       {query
         ? (filtered.length ? filtered.map((session) => sessionRow(session, false)) : <p className="sidebar-empty">没有匹配的会话</p>)
         : [...projects].sort((a, b) => (pinnedProjectIds.includes(b.id) ? 1 : 0) - (pinnedProjectIds.includes(a.id) ? 1 : 0)).map(projectNode)}
-      {!query && projects.length === 0 && <p className="sidebar-empty">暂无项目</p>}
+      {!query && projects.length === 0 && <p className="sidebar-empty">暂无项目，先新建项目</p>}
     </nav>
   </div>
   <ConfirmDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
-    title={deleteTarget?.kind === 'project' ? '删除项目' : '删除会话'}
-    description={deleteTarget
-      ? deleteTarget.kind === 'project'
-        ? `删除项目「${deleteTarget.title}」及其全部会话？此操作不可撤销。`
-        : `删除会话「${deleteTarget.title}」及其全部消息记录？此操作不可撤销。`
-      : ''}
+    title="删除会话"
+    description={deleteTarget ? `删除会话「${deleteTarget.title}」及其全部消息记录？此操作不可撤销。` : ''}
     onConfirm={() => {
       if (!deleteTarget) return;
-      if (deleteTarget.kind === 'session') onDeleteSession?.(deleteTarget.id);
-      else onDeleteProject?.(deleteTarget.id);
+      onDeleteSession?.(deleteTarget.id);
       setDeleteTarget(null);
     }} />
   </>;

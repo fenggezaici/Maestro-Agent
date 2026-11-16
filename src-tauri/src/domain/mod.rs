@@ -4,6 +4,7 @@ pub mod event;
 pub mod extension;
 pub mod message;
 pub mod activity;
+pub mod agent;
 pub mod change;
 pub mod metrics;
 pub mod plan;
@@ -13,11 +14,12 @@ pub mod session;
 pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
 pub use extension::{
-    McpConfigFile, McpServerConfig, McpServerView, McpToolView, RecommendedItem,
+    CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, RecommendedItem,
     SkillImportOutcome, SkillSource, SkillView,
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use activity::{ActivityDay, ActivitySnapshot};
+pub use agent::{AgentDefinition, AgentSource};
 pub use change::{RevertIssue, RevertPreview, RevertResult, RunChangeSummary, RunFileChange};
 pub use metrics::RunMetrics;
 pub use plan::{

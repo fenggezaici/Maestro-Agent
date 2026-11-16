@@ -10,8 +10,8 @@ use crate::domain::{
     ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView,
 };
 
-/// Every pre-v4 session migrates into the seeded default project, which can
-/// neither be archived nor deleted.
+/// Seed id for the project that owns sessions migrated from pre-v4 databases.
+/// The row is a normal project: it can be archived or deleted like any other.
 pub const DEFAULT_PROJECT_ID: i64 = 1;
 
 type Operation = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -181,6 +181,22 @@ impl Database {
         .await
     }
 
+    /// First unarchived project in creation order; the fallback home for a new
+    /// session when the caller did not pin a project.
+    pub async fn first_active_project_id(&self) -> AppResult<Option<i64>> {
+        self.call(|connection| {
+            connection
+                .query_row(
+                    "SELECT id FROM projects WHERE archived_at IS NULL ORDER BY created_at, id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)
+        })
+        .await
+    }
+
     pub async fn create_project(
         &self,
         name: String,
@@ -225,9 +241,6 @@ impl Database {
         project_id: i64,
         archived: bool,
     ) -> AppResult<ProjectView> {
-        if project_id == DEFAULT_PROJECT_ID && archived {
-            return Err("The default project cannot be archived".into());
-        }
         self.call(move |connection| {
             let changed = connection
                 .execute(
@@ -273,6 +286,7 @@ impl Database {
             for statement in [
                 "DELETE FROM run_metrics WHERE session_id = ?1",
                 "DELETE FROM plan_cards WHERE session_id = ?1",
+                "DELETE FROM run_file_changes WHERE session_id = ?1",
                 "DELETE FROM runs WHERE session_id = ?1",
             ] {
                 transaction.execute(statement, [session_id]).map_err(db_error)?;
@@ -323,9 +337,6 @@ impl Database {
     }
 
     pub async fn delete_project(&self, project_id: i64) -> AppResult<()> {
-        if project_id == DEFAULT_PROJECT_ID {
-            return Err("The default project cannot be deleted".into());
-        }
         self.call(move |connection| {
             let running: bool = connection
                 .query_row(
@@ -351,6 +362,8 @@ impl Database {
                 "DELETE FROM run_metrics WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM plan_cards WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM run_file_changes WHERE project_id = ?1 OR session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM runs WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
@@ -1434,7 +1447,7 @@ mod tests {
             .unwrap()
             .archived);
 
-        // Archived projects reject new sessions; the default project is pinned.
+        // Archived projects reject new sessions.
         database
             .set_project_archived(project.id, true)
             .await
@@ -1448,12 +1461,18 @@ mod tests {
             .set_project_archived(project.id, false)
             .await
             .unwrap();
-        assert!(database
+        assert!(database.delete_project(999).await.is_err());
+
+        // The seeded project is a normal project: it can be archived and restored.
+        database
             .set_project_archived(DEFAULT_PROJECT_ID, true)
             .await
-            .is_err());
-        assert!(database.delete_project(DEFAULT_PROJECT_ID).await.is_err());
-        assert!(database.delete_project(999).await.is_err());
+            .unwrap();
+        assert!(database.list_projects().await.unwrap()[0].archived);
+        database
+            .set_project_archived(DEFAULT_PROJECT_ID, false)
+            .await
+            .unwrap();
 
         // A running run blocks archiving and project deletion.
         let run_id = database
@@ -1492,8 +1511,20 @@ mod tests {
             })
             .await
             .unwrap();
+        database
+            .record_file_change(
+                run_id,
+                moved.id,
+                "a.txt".into(),
+                1,
+                0,
+                String::new(),
+                "x".into(),
+            )
+            .await
+            .unwrap();
 
-        // Deletion cascades sessions, runs, plans, metrics and audit rows.
+        // Deletion cascades sessions, runs, plans, metrics, file changes and audit rows.
         database.delete_project(project.id).await.unwrap();
         assert!(database.session_detail(moved.id).await.is_err());
         let orphans: i64 = database
@@ -1522,6 +1553,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audit_orphans, 0);
+        let change_orphans: i64 = database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM run_file_changes WHERE session_id = ?1",
+                        [moved.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        assert_eq!(change_orphans, 0);
         assert_eq!(
             database
                 .session_detail(session.id)
@@ -1531,6 +1575,30 @@ mod tests {
                 .title,
             "重命名"
         );
+
+        // The seeded project is deletable as well, and its sessions go with it.
+        database.delete_project(DEFAULT_PROJECT_ID).await.unwrap();
+        assert!(database.session_detail(session.id).await.is_err());
+        assert!(database.list_projects().await.unwrap().is_empty());
+        assert!(database.first_active_project_id().await.unwrap().is_none());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_active_project_skips_archived_projects() {
+        let database = Database::open(":memory:".into()).await.unwrap();
+        assert_eq!(
+            database.first_active_project_id().await.unwrap(),
+            Some(DEFAULT_PROJECT_ID)
+        );
+        let side = database.create_project("Side".into(), None).await.unwrap();
+        database
+            .set_project_archived(DEFAULT_PROJECT_ID, true)
+            .await
+            .unwrap();
+        assert_eq!(database.first_active_project_id().await.unwrap(), Some(side.id));
+        database.set_project_archived(side.id, true).await.unwrap();
+        assert_eq!(database.first_active_project_id().await.unwrap(), None);
         database.shutdown().await.unwrap();
     }
 

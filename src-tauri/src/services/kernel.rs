@@ -6,7 +6,7 @@ use std::sync::Mutex as StdMutex;
 
 use crate::{
     adapters::{
-        db::{Database, DEFAULT_PROJECT_ID},
+        db::Database,
         llm::{provider_for, ChatConfig, LlmProvider, ProviderResolver},
     },
     domain::{
@@ -87,6 +87,12 @@ impl Kernel {
 
     pub fn extensions(&self) -> &ExtensionManager {
         self.router.extensions()
+    }
+
+    /// Startup restore for MCP servers the user left enabled. Failures stay
+    /// per-server and never block the app.
+    pub async fn start_enabled_mcp(&self) {
+        self.extensions().mcp.start_enabled().await;
     }
 
     /// Resolve the LLM adapter for this run's provider.
@@ -318,7 +324,7 @@ impl Kernel {
     }
 
     /// Emit one `tool_call` event while the run is still active.
-    async fn emit_tool(&self, run_id: i64, tool: &str, phase: ToolPhase, detail: &str) {
+    pub(crate) async fn emit_tool(&self, run_id: i64, tool: &str, phase: ToolPhase, detail: &str) {
         let mut state = self.state.lock().await;
         if Self::active_run_locked(&state, run_id).is_ok() {
             self.emit_locked(
@@ -432,6 +438,18 @@ impl Kernel {
         run_id: i64,
         calls: &[(String, String)],
     ) -> Vec<AppResult<String>> {
+        self.execute_tool_calls_as(run_id, calls, None).await
+    }
+
+    /// Same batch semantics, but the caller may pin the authorization mode.
+    /// Subagents pass `Mode::Plan` so a hallucinated write/command is denied
+    /// instead of inheriting the parent run's mode.
+    pub(crate) async fn execute_tool_calls_as(
+        &self,
+        run_id: i64,
+        calls: &[(String, String)],
+        mode: Option<Mode>,
+    ) -> Vec<AppResult<String>> {
         enum Gate {
             Denied(AppResult<String>),
             Allow(ToolEffect),
@@ -444,6 +462,7 @@ impl Kernel {
                 Err(reason) => return calls.iter().map(|_| Err(reason.clone())).collect(),
             }
         };
+        let mode = mode.unwrap_or(run.mode);
         // Phase 1: classify + gate every call before any execution so the
         // whole batch can share one approval wait.
         let mut gates = Vec::with_capacity(calls.len());
@@ -453,7 +472,7 @@ impl Kernel {
             self.emit_tool(run_id, tool, ToolPhase::Started, &target).await;
             let gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool(run_id, tool, reason).await),
-                Ok(effect) => match policy::gate_with_args(run.mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
+                Ok(effect) => match policy::gate_with_args(mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
                     ToolGate::Deny => Gate::Denied(
                         self.block_tool(
                             run_id,
@@ -659,6 +678,21 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         }
     }
 
+    pub async fn list_agents(&self, scope: String) -> AppResult<Vec<crate::domain::AgentDefinition>> {
+        let workspace = self.router.workspace_root().await;
+        Ok(crate::adapters::agents::list(self.router.extensions().maestro_dir(), workspace.as_deref(), &scope))
+    }
+
+    pub async fn save_agent(&self, scope: String, agent: crate::domain::AgentDefinition) -> AppResult<()> {
+        let workspace = self.router.workspace_root().await;
+        crate::adapters::agents::save(self.router.extensions().maestro_dir(), workspace.as_deref(), &scope, &agent)
+    }
+
+    pub async fn delete_agent(&self, scope: String, name: String) -> AppResult<()> {
+        let workspace = self.router.workspace_root().await;
+        crate::adapters::agents::delete(self.router.extensions().maestro_dir(), workspace.as_deref(), &scope, &name)
+    }
+
     pub async fn run_change_summary(&self, run_id: i64) -> AppResult<crate::domain::RunChangeSummary> {
         self.database.run_change_summary(run_id).await
     }
@@ -696,9 +730,17 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         if unavailable {
             return Err("Application is shutting down or storage is unavailable".into());
         }
+        let project_id = match project_id {
+            Some(id) => id,
+            None => self
+                .database
+                .first_active_project_id()
+                .await?
+                .ok_or_else(|| "请先新建项目".to_string())?,
+        };
         let session = self
             .database
-            .create_session_in_project(project_id.unwrap_or(DEFAULT_PROJECT_ID))
+            .create_session_in_project(project_id)
             .await?;
         self.emit_locked(&mut *self.state.lock().await, EventData::SessionsChanged);
         Ok(session)
@@ -1326,6 +1368,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_session_falls_back_to_the_first_active_project() {
+        let (kernel, _events) = test_kernel().await;
+        let seeded = kernel.create_session(None).await.unwrap();
+        assert_eq!(seeded.project_id, 1);
+
+        let side = kernel.create_project("Side".into(), None).await.unwrap();
+        kernel.set_project_archived(1, true).await.unwrap();
+        let fallback = kernel.create_session(None).await.unwrap();
+        assert_eq!(fallback.project_id, side.id);
+
+        kernel.set_project_archived(side.id, true).await.unwrap();
+        assert_eq!(
+            kernel.create_session(None).await.unwrap_err(),
+            "请先新建项目"
+        );
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn persistent_storage_failure_keeps_the_run_gate_and_disables_new_work() {
         let (kernel, events) = test_kernel().await;
         let (id, _receiver) = seed_run(&kernel).await;
@@ -1457,6 +1518,25 @@ mod tests {
             "hello"
         );
         kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_plan_mode_denies_writes_even_when_the_run_is_in_code_mode() {
+        let (kernel, _events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let calls = [(
+            "write_file".to_string(),
+            r#"{"path":"pinned.txt","content":"x"}"#.to_string(),
+        )];
+        let results = kernel.execute_tool_calls_as(id, &calls, Some(Mode::Plan)).await;
+        assert!(results[0].is_err());
+        assert!(!workspace.path().join("pinned.txt").exists());
+        kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
 

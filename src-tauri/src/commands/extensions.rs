@@ -6,11 +6,29 @@ use crate::{
     adapters::fs::workspace::WorkspaceService,
     commands::require_main,
     domain::{
-        AppResult, McpServerConfig, McpServerView, RecommendedItem, SkillImportOutcome,
-        SkillView,
+        AppResult, CommandView, McpServerConfig, McpServerView, RecommendedItem,
+        SkillImportOutcome, SkillSource, SkillView,
     },
     services::kernel::Kernel,
 };
+
+/// Resolve the skills root for a scope; project scope needs a selected workspace.
+fn skill_root(
+    maestro_dir: &std::path::Path,
+    workspace: Option<&std::path::Path>,
+    scope: &str,
+) -> AppResult<(std::path::PathBuf, SkillSource)> {
+    match scope {
+        "project" => {
+            let root = workspace.ok_or("未选择工作区")?;
+            Ok((
+                root.join(".maestro").join("skills"),
+                SkillSource::Project,
+            ))
+        }
+        _ => Ok((maestro_dir.join("skills"), SkillSource::Global)),
+    }
+}
 
 #[tauri::command]
 pub async fn scan_skills(
@@ -28,14 +46,69 @@ pub async fn scan_skills(
 pub async fn create_skill(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
     name: String,
     description: String,
+    scope: Option<String>,
 ) -> AppResult<SkillView> {
     require_main(&window)?;
-    kernel.extensions().skills.create_new(
+    let root = workspace.current_root();
+    let (skills_dir, source) = skill_root(
         kernel.extensions().maestro_dir(),
+        root.as_deref(),
+        scope.as_deref().unwrap_or("global"),
+    )?;
+    kernel
+        .extensions()
+        .skills
+        .create_new(&skills_dir, &name, &description, source)
+}
+
+#[tauri::command]
+pub async fn delete_skill(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
+    name: String,
+    scope: Option<String>,
+) -> AppResult<()> {
+    require_main(&window)?;
+    let root = workspace.current_root();
+    let (skills_dir, _source) = skill_root(
+        kernel.extensions().maestro_dir(),
+        root.as_deref(),
+        scope.as_deref().unwrap_or("global"),
+    )?;
+    kernel.extensions().skills.delete(&skills_dir, &name)
+}
+
+#[tauri::command]
+pub async fn scan_commands(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
+) -> AppResult<Vec<CommandView>> {
+    require_main(&window)?;
+    let root = workspace.current_root();
+    Ok(crate::adapters::commands::scan(
+        kernel.extensions().maestro_dir(),
+        root.as_deref(),
+    ))
+}
+
+#[tauri::command]
+pub async fn read_command(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
+    name: String,
+) -> AppResult<String> {
+    require_main(&window)?;
+    let root = workspace.current_root();
+    crate::adapters::commands::read(
+        kernel.extensions().maestro_dir(),
+        root.as_deref(),
         &name,
-        &description,
     )
 }
 
@@ -82,6 +155,7 @@ pub async fn add_mcp_server(
     name: String,
     command: String,
     args: Option<Vec<String>>,
+    env: Option<std::collections::BTreeMap<String, String>>,
     trust: Option<bool>,
 ) -> AppResult<()> {
     require_main(&window)?;
@@ -90,7 +164,7 @@ pub async fn add_mcp_server(
         McpServerConfig {
             command,
             args: args.unwrap_or_default(),
-            env: Default::default(),
+            env: env.unwrap_or_default(),
             disabled: false,
             trust: trust.unwrap_or(false),
         },
@@ -125,7 +199,7 @@ pub async fn start_mcp_server(
     name: String,
 ) -> AppResult<McpServerView> {
     require_main(&window)?;
-    kernel.extensions().mcp.start(&name).await
+    kernel.extensions().mcp.enable(&name).await
 }
 
 #[tauri::command]
@@ -133,9 +207,9 @@ pub async fn stop_mcp_server(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
     name: String,
-) -> AppResult<()> {
+) -> AppResult<McpServerView> {
     require_main(&window)?;
-    kernel.extensions().mcp.stop(&name).await
+    kernel.extensions().mcp.disable(&name).await
 }
 
 #[tauri::command]

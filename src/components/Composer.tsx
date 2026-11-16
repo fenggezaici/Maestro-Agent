@@ -2,10 +2,11 @@
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
 import { useEffect, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type RefObject, type SetStateAction } from 'react';
 import * as Popover from '@radix-ui/react-popover';
-import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, Search, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
 import type { PendingApprovalView } from '../lib/conversation';
 
 import type { Mode, RunMetrics, RunView } from '../api/types';
+import type { CommandView, SkillView } from '../api/extensions';
 import type { UiPreferences } from '../uiPreferences';
 import type { ProviderId } from '../modelCapabilities';
 import type { WorkbenchProject } from './workspace';
@@ -14,6 +15,8 @@ import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import ComposerControls from './ComposerControls';
 import SessionStats, { sessionUsage } from './SessionStats';
 import ContextRing from './ContextRing';
+import SlashPanel from './SlashPanel';
+import { buildSlashGroups, skillDirective, slashQuery, type SlashAction, type SlashItem } from '../slashCommands';
 
 const AGENT_STATUS_LABEL: Record<'approval' | 'tool' | 'thinking' | 'working', string> = {
   approval: '等待批准', tool: '执行工具中', thinking: '思考中', working: '工作中',
@@ -26,7 +29,7 @@ function formatStatusElapsed(ms: number) {
   return `${minutes} 分 ${(seconds - minutes * 60).toFixed(1)} 秒`;
 }
 
-export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, focusRequest, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, steps = 0 }: {
+export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, focusRequest, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, steps = 0, slash }: {
   atBottom: boolean;
   onScrollBottom: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -60,6 +63,13 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
   modelLabel: string;
   status?: 'approval' | 'tool' | 'thinking' | 'working' | null;
   steps?: number;
+  slash?: {
+    actions: SlashAction[];
+    skills: SkillView[];
+    commands: CommandView[];
+    onRefresh: () => void;
+    onRunCommand: (name: string, args: string) => void;
+  };
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const promptInput = useRef<HTMLTextAreaElement>(null);
@@ -104,6 +114,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
   const currentRun = runs.at(-1);
   const statusReport = currentRun ? metrics?.[currentRun.id] : undefined;
   const [statusTick, setStatusTick] = useState(0);
+  const [projectQuery, setProjectQuery] = useState('');
   const statusStarted = useRef<number | null>(null);
   useEffect(() => {
     if (!status) { statusStarted.current = null; setStatusTick(0); return; }
@@ -117,11 +128,59 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     statusTick,
   );
 
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const slashState = slash ? slashQuery(prompt, slashDismissed) : null;
+  const slashGroups = slash && slashState ? buildSlashGroups(slash.actions, slash.skills, slash.commands, slashState.query) : [];
+  const slashItems = slashGroups.flatMap((group) => group.items);
+  useEffect(() => { setSlashIndex(0); }, [slashState?.query]);
+  useEffect(() => {
+    setSlashIndex((current) => Math.min(current, Math.max(0, slashItems.length - 1)));
+  }, [slashItems.length]);
+
+  function selectSlash(item: SlashItem) {
+    const args = slashState?.args ?? '';
+    if (item.kind === 'action') {
+      item.action.run();
+      onPromptChange('');
+    } else if (item.kind === 'skill') {
+      onPromptChange(skillDirective(item.name, args));
+    } else {
+      onPromptChange('');
+      slash?.onRunCommand(item.name, args);
+    }
+    setSlashDismissed(true);
+    promptInput.current?.focus();
+  }
+
   return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={onSubmit} className="composer">
+    {slashState && <SlashPanel groups={slashGroups} index={slashIndex} onHover={setSlashIndex} onSelect={selectSlash} />}
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
     <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
-    <textarea ref={promptInput} aria-label="发送消息" rows={3} value={prompt} onChange={(event) => onPromptChange(event.target.value)} placeholder="描述你的任务… Enter 发送，Shift+Enter 换行"
-      disabled={blocked} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+    <textarea ref={promptInput} aria-label="发送消息" rows={3} value={prompt} onChange={(event) => {
+      const value = event.target.value;
+      setSlashDismissed(false);
+      onPromptChange(value);
+      if (slash && value === '/') slash.onRefresh();
+    }} placeholder="描述你的任务… 输入 / 打开命令；Enter 发送，Shift+Enter 换行"
+      disabled={blocked} onKeyDown={(event) => {
+        if (slashState && !event.nativeEvent.isComposing) {
+          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            if (slashItems.length === 0) return;
+            setSlashIndex((current) => event.key === 'ArrowDown' ? Math.min(current + 1, slashItems.length - 1) : Math.max(current - 1, 0));
+            return;
+          }
+          if (event.key === 'Escape') { event.preventDefault(); setSlashDismissed(true); return; }
+          if ((event.key === 'Enter' || event.key === 'Tab') && slashItems.length > 0) {
+            event.preventDefault();
+            const item = slashItems[slashIndex];
+            if (item && !item.disabled) selectSlash(item);
+            return;
+          }
+        }
+        if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
+      }} />
     <div className="composer-toolbar"><IconButton label="添加图片或视频" disabled={!preview && (running || pending || blocked)} onClick={() => fileInput.current?.click()}><Paperclip size={17} /></IconButton>
 
       <Choice label="由 Rust 强制执行" value={mode} disabled={!preview && (blocked || running)} onChange={(value) => onSetMode(value as Mode)} options={[
@@ -130,27 +189,27 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
         { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />确认</span><span className="choice-item-desc">每个工具/命令都需确认，批准后执行</span></span> },
         { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />自动</span><span className="choice-item-desc">已开放工具直接执行（含写入/命令）</span></span> },
       ]} />
-      <Popover.Root>
-        <Popover.Trigger asChild><button type="button" className="composer-project-chip" disabled={!preview && (blocked || running)} aria-label="当前项目"><FolderGit2 size={13} />{currentProject.name}{!currentProject.path && !preview && <small className="project-picker-no-path"> 未设目录</small>}<ChevronDown size={11} /></button></Popover.Trigger>
+      <Popover.Root onOpenChange={(open) => { if (!open) setProjectQuery(''); }}>
+        <Popover.Trigger asChild><button type="button" className="composer-project-chip" disabled={!preview && (blocked || running)} aria-label="当前项目"><FolderGit2 size={13} />{currentProject.path ? currentProject.name : '不在项目中工作'}<ChevronDown size={11} /></button></Popover.Trigger>
         <Popover.Portal><Popover.Content className="model-picker project-picker" side="top" align="start" sideOffset={8}>
-          <div className="model-picker-header"><FolderGit2 size={14} />项目<small className="model-picker-api">workspace</small></div>
+          <div className="project-picker-search"><Search size={13} /><input aria-label="搜索项目" placeholder="搜索项目或设备" value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} autoFocus /></div>
           <div className="model-picker-list" role="listbox" aria-label="项目列表">
-            {projects.map((project) => {
+            {projects.filter((project) => Boolean(project.path) && `${project.name} ${project.path}`.toLowerCase().includes(projectQuery.trim().toLowerCase())).map((project) => {
               const numeric = Number(project.id);
-              return <div key={project.id} className="model-picker-row project-picker-row" role="option" aria-selected={currentProject.id === project.id}
-                onClick={() => { if (!preview && Number.isFinite(numeric)) onSelectProject?.(numeric); }}>
-                <span className="model-picker-id">{project.name}{!project.path && <small className="project-picker-no-path"> 未设目录</small>}</span>
-                {!preview && !project.path && Number.isFinite(numeric) && onSetProjectPath && onBrowse &&
-                  <button type="button" className="project-picker-setpath" aria-label={`设置目录 ${project.name}`} onClick={async (event) => {
-                    event.stopPropagation();
-                    const dir = await onBrowse();
-                    if (dir) await onSetProjectPath(numeric, dir);
-                  }}>设置目录</button>}
-                {project.path && <span className="model-picker-context project-picker-path" title={project.path}>{project.path.split(/[\/]/).pop()}</span>}
+              const selected = currentProject.path ? currentProject.id === project.id : false;
+              return <div key={project.id} className="model-picker-row project-picker-row" role="menuitemcheckbox" aria-checked={selected}
+                onClick={() => { if (!preview && Number.isFinite(numeric)) { onSelectProject?.(numeric); } }}>
+                <FolderGit2 size={14} /><span className="model-picker-id">{project.name}</span>
+                <span className="model-picker-context project-picker-path" title={project.path ?? ''}>{project.path?.split(/[\/]/).pop() ?? ''}</span>
+                {selected && <Check size={13} className="project-picker-check" />}
               </div>;
             })}
+            {projects.filter((project) => Boolean(project.path) && `${project.name} ${project.path}`.toLowerCase().includes(projectQuery.trim().toLowerCase())).length === 0 && <p className="project-picker-empty">没有匹配的项目</p>}
           </div>
-          <button type="button" className="model-picker-level" onClick={onNewProject}>＋ 新建项目</button>
+          <div className="project-picker-footer">
+            <button type="button" className="project-picker-action" onClick={onNewProject}><span>＋ 创建项目</span></button>
+            {(() => { const noProject = projects.find((project) => !project.path); const numeric = noProject ? Number(noProject.id) : NaN; if (!noProject || !Number.isFinite(numeric)) return null; return <button type="button" className="project-picker-action" role="menuitemcheckbox" aria-checked={!currentProject.path} onClick={() => onSelectProject?.(numeric)}><span>不在项目中工作</span>{!currentProject.path && <Check size={13} />}</button>; })()}
+          </div>
         </Popover.Content></Popover.Portal>
       </Popover.Root>
       <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked || running} preferences={preferences} onPreferences={onPreferences} settingsVersion={settingsVersion} onError={onError} onCapability={onCapability} />

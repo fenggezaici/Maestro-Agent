@@ -75,6 +75,10 @@ A run is capped at 64 model→tool→model rounds by default (`MAESTRO_MAX_TOOL_
 
 Code mode treats workspace writes as normal work; only a conservative dangerous-command list requires approval. Read-only tool calls in one batch run concurrently, while writes and commands stay serial. `spawn_subagent` runs a read-only research child loop and returns its summary to the parent model.
 
+Subagent definitions are resolved from three sources with `builtin < global < project` precedence: built-ins (`explore`, `general`), `~/.maestro/agents/*.md`, and `<workspace>/.maestro/agents/*.md`. The settings panel lists the merged view with a source badge, locks the name of an existing definition, and lets a built-in be overridden by a global file (deleting that file restores the built-in). The `spawn_subagent` enum is generated from the same merged list, so a definition saved in Settings is selectable by the model without editing code; `hidden: true` and `mode` other than `subagent` stay out of the enum.
+
+The child loop never inherits the parent's authorization: its tool calls are filtered against the tools offered to that agent and executed under the Plan gate, so `write_file`/`apply_patch`/`run_command` are denied even when the parent run is in Code or Auto. A consequence is that read-only child calls do not suspend for per-call approval in Confirm mode; the parent's approval slot is not consumed by research work.
+
 Model reasoning levels come from the models.dev catalog (`reasoning_options[type=effort].values`); the model config dialog defaults to smart config and only shows the composer slider when more than one level is resolved. Advanced config can override input types, capabilities, ordered levels, and the reasoning mapping JSON.
 
 Provider requests retry before the first token using the opencode policy: 5 attempts, 2s initial delay, x2 backoff, 25% jitter, 30s cap, honoring Retry-After; 401/403/404/400 are not retried, and a stream that already emitted tokens is not replayed.
@@ -84,3 +88,20 @@ The bottom agent status pill shows `等待批准 / 执行工具中 / 思考中 /
 
 While a run is stopping, new text is queued instead of starting a second run; the queue starts after the old run's terminal status. Late content/status events from the old run are ignored and cannot clear the new active run. Stopping also settles the UI immediately: the working pill and stop button disappear before backend acknowledgement.
 Change cards are per turn: `run_change_summary` is the header, `run_changes` loads details on expand, `preview_revert_run_changes` classifies safe/unsafe/ignored files, and `revert_run_changes` applies only safe files. A reverted turn keeps its card with a “reverted” badge.
+
+Projects are ordinary rows: the project seeded on first run (`Maestro-Agent`) can be renamed, archived, restored or deleted like any other, and deleting one cascades its sessions, runs, plans, metrics and audit rows without a way to undo. A new session without an explicit project lands in the oldest unarchived project; when every project is archived or deleted the backend refuses with `请先新建项目` and the “新建会话” entry is disabled. Deleting a project asks once through the Workbench dialog; only session deletion keeps its own inline confirmation.
+
+Extensions have a persisted lifecycle. MCP servers live in `~/.maestro/mcp.json`; the UI switch writes `disabled` and start/stop the child, and app startup restores every entry with `disabled: false` in the background (a slow `npx` download never blocks the window). On Windows the launcher is resolved through `PATH`/PATHEXT so `.cmd` shims such as `npx` run under `cmd /C` instead of failing to spawn. Each entry supports `env` (edited as `KEY=VALUE` lines in the UI), and editing preserves the existing enablement and trust. Skills are scanned from `~/.maestro/skills` and `<workspace>/.maestro/skills` (project shadows global); new skills can be created in either scope and existing ones deleted from the UI.
+
+Slash commands are a composer-level palette. Typing `/` at the start of the prompt opens three groups — built-in actions, skills, and custom commands — with ↑/↓ to move, Enter/Tab to run, and Escape to dismiss for the current edit. Actions switch mode, create a session, stop the run, toggle the review panel, open settings/extensions/activity, or clear the input. Selecting a skill inserts a `load_skill` directive plus any text typed after the command. Custom commands are Markdown files in `~/.maestro/commands` and `<workspace>/.maestro/commands` (project shadows global) with optional frontmatter:
+
+```markdown
+---
+name: review
+description: 审查变更
+argumentHint: <路径>
+---
+请审查 $ARGUMENTS，并给出风险清单。
+```
+
+Selecting one reads the body, replaces `$ARGUMENTS` with the text after the command (or appends it when the template has no placeholder), and writes the result into the composer for review before sending.

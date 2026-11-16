@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Slider from '@radix-ui/react-slider';
-import { BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
+import { Bot, BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
+import AgentsSettings from './AgentsSettings';
 import LlmSettingsForm from './LlmSettingsForm';
 import ConfirmDialog from './ConfirmDialog';
 import { Button, Choice } from './ui';
@@ -10,7 +11,7 @@ import { getProvider, readCustomProviders, removeCustomProvider, saveCustomProvi
 import { providers, type ProviderId } from '../modelCapabilities';
 import { hasProviderCredential, readLlmSettings, selectLlmProvider } from '../settings';
 
-type Section = 'general' | 'appearance' | 'models' | 'shortcuts';
+type Section = 'general' | 'appearance' | 'models' | 'shortcuts' | 'agents';
 
 export default function SettingsPanel({ open, onOpenChange, preview, preferences, onPreferences, onModelsChanged }: {
   open: boolean; onOpenChange: (open: boolean) => void; preview: boolean;
@@ -28,7 +29,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
   const [deleteProvider, setDeleteProvider] = useState<{ id: string; name: string } | null>(null);
   const captureArea = useRef<HTMLDivElement>(null);
   const text = labels(preferences.language);
-  const sections = [{ id: 'general', icon: Globe2 }, { id: 'appearance', icon: Palette }, { id: 'models', icon: BrainCircuit }, { id: 'shortcuts', icon: Keyboard }] as const;
+  const sections = [{ id: 'general', icon: Globe2 }, { id: 'appearance', icon: Palette }, { id: 'models', icon: BrainCircuit }, { id: 'agents', icon: Bot }, { id: 'shortcuts', icon: Keyboard }] as const;
   const update = (patch: Partial<UiPreferences>) => onPreferences({ ...preferences, ...patch });
 
   return <>
@@ -43,11 +44,11 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
       catch (error) { setBindingError(error instanceof Error ? error.message : '无效快捷键'); }
     }}>
       <div className="settings-rail"><Dialog.Title><Settings2 size={17} />{text.settings}</Dialog.Title>
-        <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{text[id]}</button>)}</nav>
+        <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{(text as Record<string, string>)[id === 'agents' ? 'subagents' : id]}</button>)}</nav>
         <span className="settings-version">MAESTRO / 桌面版</span>
       </div>
       <div className="settings-content"><Dialog.Description className="settings-intro">{preview ? '前端预览 · 无真实配置读取或执行' : '连接配置与思考强度真实保存；上下文为模型能力参考，实际限制以服务端为准。'}</Dialog.Description>
-        <h3>{text[section]}</h3>
+        <h3>{(text as Record<string, string>)[section === 'agents' ? 'subagents' : section]}</h3>
         <div hidden={section !== 'general'}>
           <div className="preference-row"><div><strong>语言</strong><p>前端导航与设置标签</p></div><Choice label="界面语言" value={preferences.language} onChange={(value) => update({ language: value as UiPreferences['language'] })} options={[{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }]} /></div>
           <div className="preference-row"><div><strong>启动视图</strong><p>下次打开时的工作区视图，不是 OS 自启动</p></div><Choice label="启动视图" value={preferences.startupView} onChange={(value) => update({ startupView: value as UiPreferences['startupView'] })} options={[{ value: 'agents', label: '会话' }, { value: 'activity', label: '活动' }, { value: 'extensions', label: '扩展' }]} /></div>
@@ -102,6 +103,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
             </div>
           </div>
         </div>
+        <div hidden={section !== 'agents'}><AgentsSettings preview={preview} /></div>
         <div hidden={section !== 'shortcuts'}>
           <label className="shortcut-search"><Search size={14} /><input aria-label="搜索快捷键" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索快捷键…" /></label>
           <div className="shortcut-row"><div><strong>发送消息</strong><small>保留键 / 输入法安全</small></div><kbd>Ctrl / Cmd + Enter</kbd></div>

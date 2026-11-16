@@ -18,6 +18,9 @@ impl ExtensionManager {
     pub fn new(maestro_dir: PathBuf) -> AppResult<Self> {
         std::fs::create_dir_all(maestro_dir.join("skills"))
             .map_err(|_| "无法创建 ~/.maestro/skills 目录".to_string())?;
+        // Slash-command templates live next to skills; an empty dir is fine.
+        std::fs::create_dir_all(maestro_dir.join("commands"))
+            .map_err(|_| "无法创建 ~/.maestro/commands 目录".to_string())?;
         let mcp = McpManager::default();
         mcp.set_config_path(maestro_dir.join("mcp.json"));
         Ok(Self {

@@ -3,8 +3,10 @@ import {
   extensionsApi,
   type McpServerView,
   type RecommendedItem,
+  type SkillSource,
   type SkillView,
 } from '../api/extensions';
+import { workspaceApi } from '../api/workspace';
 
 export interface ExtensionsController {
   skills: SkillView[];
@@ -16,13 +18,15 @@ export interface ExtensionsController {
   pending: string | null;
   importSummary: string | null;
   real: boolean;
+  hasWorkspace: boolean;
   installErrors: Record<string, string>;
   isInstalled: (item: RecommendedItem) => boolean;
   refresh: () => Promise<void>;
-  createSkill: (name: string, description: string) => Promise<string | null>;
+  createSkill: (name: string, description: string, scope?: SkillSource) => Promise<string | null>;
+  deleteSkill: (skill: SkillView) => Promise<string | null>;
   importSkill: (path: string) => Promise<string | null>;
   importSkillGithub: (repoUrl: string) => Promise<string | null>;
-  addMcpServer: (name: string, command: string, args: string[]) => Promise<string | null>;
+  addMcpServer: (name: string, command: string, args: string[], env?: Record<string, string>, trust?: boolean) => Promise<string | null>;
   setMcpTrust: (server: McpServerView, trust: boolean) => Promise<void>;
   importMcpJson: (path: string) => Promise<string | null>;
   toggleMcpServer: (server: McpServerView, enable: boolean) => Promise<void>;
@@ -46,23 +50,26 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
   });
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
+  const [hasWorkspace, setHasWorkspace] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
     setLoading(true);
     try {
-      const [skillList, serverList, skills, mcps, config] = await Promise.all([
+      const [skillList, serverList, skills, mcps, config, info] = await Promise.all([
         extensionsApi.scanSkills(),
         extensionsApi.listMcpServers(),
         extensionsApi.recommendedSkills(),
         extensionsApi.recommendedMcps(),
         extensionsApi.readMcpConfig(),
+        workspaceApi.info().catch(() => ({ name: '', path: null })),
       ]);
       setSkills(skillList);
       setServers(serverList);
       setRecommendedSkills(skills);
       setRecommendedMcps(mcps);
       setMcpConfigText(config);
+      setHasWorkspace(Boolean(info.path));
     } catch {
       // The workbench surfaces errors through action results; listing stays empty.
     } finally {
@@ -87,12 +94,14 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
 
   return {
     skills, servers, recommendedSkills, recommendedMcps, mcpConfigText, loading, pending, refresh,
-    importSummary, real: true, installErrors,
+    importSummary, real: true, hasWorkspace, installErrors,
     isInstalled: (item) => item.kind === 'skill'
       ? installedRepos.includes(item.id) || skills.some((skill) => skill.name === item.id)
       : servers.some((server) => server.name === item.id),
-    createSkill: (name, description) =>
-      action('create', () => extensionsApi.createSkill(name, description), refresh),
+    createSkill: (name, description, scope = 'global') =>
+      action('create', () => extensionsApi.createSkill(name, description, scope), refresh),
+    deleteSkill: (skill) =>
+      action(`delete-skill-${skill.name}`, () => extensionsApi.deleteSkill(skill.name, skill.source), refresh),
     importSkill: (path) => action('import', async () => {
       const outcomes = await extensionsApi.importSkill(path);
       const imported = outcomes.filter((item) => item.status === 'imported');
@@ -106,8 +115,8 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
     }, refresh),
     importSkillGithub: (repoUrl) =>
       action('github', () => extensionsApi.importSkillGithub(repoUrl), refresh),
-    addMcpServer: (name, command, args) =>
-      action('mcp-add', () => extensionsApi.addMcpServer(name, command, args), refresh),
+    addMcpServer: (name, command, args, env = {}, trust = false) =>
+      action('mcp-add', () => extensionsApi.addMcpServer(name, command, args, env, trust), refresh),
     setMcpTrust: async (server, trust) => {
       setPending(`mcp-trust-${server.name}`);
       try {
@@ -123,7 +132,9 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
     toggleMcpServer: async (server, enable) => {
       setPending(`mcp-${server.name}`);
       try {
-        const view = await (enable ? extensionsApi.startMcpServer(server.name) : (await extensionsApi.stopMcpServer(server.name), { ...server, running: false, toolCount: 0 }));
+        const view = enable
+          ? await extensionsApi.startMcpServer(server.name)
+          : await extensionsApi.stopMcpServer(server.name);
         setServers((items) => items.map((item) => (item.name === view.name ? { ...item, ...view } : item)));
       } catch (reason) {
         setServers((items) => items.map((item) => (item.name === server.name ? { ...item, error: errorMessage(reason) } : item)));

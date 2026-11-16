@@ -29,6 +29,9 @@ import RightPanel from './RightPanel';
 import type { ExplorerViewState } from './ExplorerPanel';
 import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../hooks/useExtensions';
+import useSlashSources from '../hooks/useSlashSources';
+import { extensionsApi } from '../api/extensions';
+import { expandCommand, type SlashAction } from '../slashCommands';
 import { formatShortcut, labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
 import { useWorkspace } from '../hooks/useWorkspace';
 import { useStickyScroll } from '../hooks/useStickyScroll';
@@ -326,6 +329,26 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const dashboardData = useMemo(() => preview ? createMockDashboard(currentProject) : liveDashboard ?? createEmptyDashboard(), [preview, currentProject, liveDashboard]);
   const running = !stoppingActiveRun && c.state.activeRun?.status === 'running';
   const blocked = preview || !c.state.ready || c.pending;
+  const slashSources = useSlashSources(!preview && c.state.ready, currentProject.id);
+  const slashActions: SlashAction[] = [
+    { id: 'plan', description: '切换到 Plan 模式（只读分析）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
+    { id: 'code', description: '切换到 Code 模式（写入直接执行）', disabled: running || c.state.mode === 'code', run: () => void c.setMode('code') },
+    { id: 'confirm', description: '切换到 Confirm 模式（每个工具都需确认）', disabled: running || c.state.mode === 'confirm', run: () => void c.setMode('confirm') },
+    { id: 'auto', description: '切换到 Auto 模式（已开放工具直接执行）', disabled: running || c.state.mode === 'auto', run: () => void c.setMode('auto') },
+    { id: 'new', description: '在当前项目新建会话', disabled: projects.length === 0 || c.pending, run: () => { const numeric = Number(currentProject.id); if (Number.isFinite(numeric)) void c.createSession(numeric); } },
+    { id: 'stop', description: '停止当前生成', disabled: !running || !c.state.activeRun, run: () => { if (c.state.activeRun) c.cancel(c.state.activeRun.id); } },
+    { id: 'review', description: '切换右侧审查面板', run: () => setReviewOpen((value) => !value) },
+    { id: 'extensions', description: '打开扩展（Skills / MCP）', run: () => setNavigation('extensions') },
+    { id: 'activity', description: '打开活动面板', run: () => setNavigation('activity') },
+    { id: 'settings', description: '打开设置', run: () => setSettingsOpen(true) },
+    { id: 'clear', description: '清空输入框', disabled: promptBytes === 0, run: () => setPrompt('') },
+  ];
+  const runSlashCommand = (name: string, args: string) => {
+    if (preview) { setToastError('预览模式不支持自定义命令'); return; }
+    void extensionsApi.readCommand(name)
+      .then((body) => setPrompt(expandCommand(body, args)))
+      .catch((reason) => setToastError(reason instanceof Error ? reason.message : String(reason)));
+  };
 
   const addTab = (tab: ListTab) => {
     setOpenTabs((current) => current.includes(tab) ? current : [...current, tab]);
@@ -360,12 +383,12 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     const cycleTheme = () => updatePreferences({ ...preferences, theme: preferences.theme === 'dark' ? 'light' : preferences.theme === 'light' ? 'system' : 'dark' });
     const newSession = () => {
       setNavigation('agents');
+      if (preview) { onCreateProjectSession?.(currentProject.id); return; }
       const numeric = Number(currentProject.id);
-      if (preview) onCreateProjectSession?.(currentProject.id);
-      else void c.createSession(Number.isFinite(numeric) ? numeric : undefined);
+      if (Number.isFinite(numeric)) void c.createSession(numeric);
     };
     return [
-      { id: 'new-session', label: '新建会话', icon: <Plus size={14} />, disabled: preview ? !onCreateProjectSession : !c.state.ready || c.pending, run: newSession },
+      { id: 'new-session', label: '新建会话', icon: <Plus size={14} />, disabled: projects.length === 0 || (preview ? !onCreateProjectSession : !c.state.ready || c.pending), run: newSession },
       { id: 'new-project', label: '新建项目…', icon: <FolderGit2 size={14} />, run: () => setNewProjectOpen(true) },
       { id: 'agents', label: 'Go to Agents', icon: <Bot size={14} />, run: () => setNavigation('agents') },
       { id: 'activity', label: 'Go to Activity', hint: formatShortcut(preferences.shortcuts.activity), icon: <ChartNoAxesColumnIncreasing size={14} />, run: () => setNavigation('activity') },
@@ -379,7 +402,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       { id: 'mode-confirm', label: 'Switch to Confirm mode', icon: <ShieldCheck size={14} />, disabled: c.state.mode === 'confirm', run: () => void c.setMode('confirm') },
       { id: 'mode-auto', label: 'Switch to Auto mode', icon: <Zap size={14} />, disabled: c.state.mode === 'auto', run: () => void c.setMode('auto') },
     ];
-  }, [preferences, updatePreferences, preview, onCreateProjectSession, currentProject.id, c]);
+  }, [preferences, updatePreferences, preview, onCreateProjectSession, currentProject.id, projects.length, c]);
 
   useEffect(() => {
     if (!preview && currentProject.path) void workspace.selectWorkspace(currentProject.path);
@@ -475,7 +498,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         <nav className="primary-navigation" aria-label="核心导航">
           <button className="navigation-item" aria-current={navigation === 'agents' ? 'page' : undefined} onClick={() => setNavigation('agents')}><Bot size={17} strokeWidth={1.5} /><span>{text.agents}</span><span className="navigation-count">{c.sessions.length}</span></button>
           <button className="navigation-item" aria-current={navigation === 'automations' ? 'page' : undefined} onClick={() => setNavigation('automations')}><Zap size={17} strokeWidth={1.5} /><span>{text.automations}</span><span className="soon-label">待接入</span></button>
-          <button className="navigation-item" aria-current={navigation === 'extensions' ? 'page' : undefined} onClick={() => setNavigation('extensions')}><Puzzle size={17} strokeWidth={1.5} /><span>{text.extensions}</span><span className="soon-label">模拟</span></button>
+          <button className="navigation-item" aria-current={navigation === 'extensions' ? 'page' : undefined} onClick={() => setNavigation('extensions')}><Puzzle size={17} strokeWidth={1.5} /><span>{text.extensions}</span>{preview && <span className="soon-label">模拟</span>}</button>
         </nav>
         <button type="button" className="navigation-item activity-navigation" aria-label="活动" aria-current={navigation === 'activity' ? 'page' : undefined} onClick={() => setNavigation('activity')}>
           <ChartNoAxesColumnIncreasing size={16} strokeWidth={1.5} /><span>活动</span><span className="activity-navigation-summary">今日 {dashboardData.todayLines} 行</span>
@@ -495,7 +518,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
           onArchiveSession={preview ? sessionActions?.archive : c.setSessionArchived ? (id, archived) => void c.setSessionArchived!(id, archived) : undefined}
           onDeleteSession={preview ? sessionActions?.deleteSession : c.deleteSession ? (id) => void c.deleteSession!(id) : undefined}
           onArchiveProject={preview ? sessionActions?.archiveProject : c.setProjectArchived ? (id, archived) => void c.setProjectArchived!(Number(id), archived) : undefined}
-          onDeleteProject={preview ? sessionActions?.deleteProject : c.deleteProject ? (id) => setDeleteTarget(projects.find((project) => project.id === id) ?? null) : undefined} />
+          onDeleteProject={(preview ? Boolean(sessionActions?.deleteProject) : Boolean(c.deleteProject)) ? (id) => setDeleteTarget(projects.find((project) => project.id === id) ?? null) : undefined} />
         <div className="sidebar-bottom">
           <div className="connection-status"><span className={`status-dot ${c.state.ready && !preview ? 'connected' : ''}`} /><span role="status">{preview ? '前端预览' : c.state.ready ? 'Rust 内核已就绪' : '正在连接 Rust 内核…'}</span><span className="local-tag">{preview ? '模拟' : '本地'}</span></div>
           <span className="build-stamp" title={__BUILD_TIME__}>构建 {new Date(__BUILD_TIME__).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
@@ -544,8 +567,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}
               preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
-              status={status} steps={stepCount}
-              currentProject={currentProject} projects={projects}
+              status={status} steps={stepCount} currentProject={currentProject} projects={projects}
               onSelectProject={(id) => c.selectProject?.(id)}
               onSetProjectPath={c.updateProjectPath ? (id, dir) => c.updateProjectPath!(id, dir) : undefined}
               onBrowse={preview ? undefined : pickDirectory}
@@ -554,7 +576,8 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               onError={setToastError} onCapability={updateCapability}
               running={running} pending={c.pending}
               onCancel={() => { const run = c.state.activeRun; if (run) void c.cancel(run.id); }}
-              runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} />
+              runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model}
+              slash={{ actions: slashActions, skills: slashSources.skills, commands: slashSources.commands, onRefresh: slashSources.refresh, onRunCommand: runSlashCommand }} />
           </>}
       </main>
       } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
@@ -580,6 +603,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
       }} />
     <DeleteProjectDialog project={deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
       onConfirm={async (projectId) => {
+        if (preview) { sessionActions?.deleteProject?.(projectId); return null; }
         if (!c.deleteProject) return '后端不支持删除项目';
         const result = await c.deleteProject(Number(projectId));
         return result?.error ?? null;

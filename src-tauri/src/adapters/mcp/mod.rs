@@ -35,6 +35,39 @@ pub use tools::split_mcp_tool as split_tool_name;
 
 const MAX_SERVERS: usize = 32;
 
+/// Windows cannot CreateProcess a `.cmd`/`.bat` shim, so resolve the real
+/// launcher through PATHEXT and report whether it must run under `cmd /C`.
+#[cfg(windows)]
+fn resolve_program(command: &str, path_var: Option<&std::ffi::OsStr>) -> (PathBuf, bool) {
+    let direct = PathBuf::from(command);
+    let needs_shell = |path: &PathBuf| {
+        path.extension()
+            .map(|ext| matches!(ext.to_string_lossy().to_ascii_lowercase().as_str(), "cmd" | "bat"))
+            .unwrap_or(false)
+    };
+    if direct.extension().is_some() {
+        let shell = needs_shell(&direct);
+        return (direct, shell);
+    }
+    if let Some(path) = path_var {
+        for dir in std::env::split_paths(path) {
+            for extension in ["exe", "cmd", "bat"] {
+                let candidate = dir.join(format!("{command}.{extension}"));
+                if candidate.is_file() {
+                    let shell = needs_shell(&candidate);
+                    return (candidate, shell);
+                }
+            }
+        }
+    }
+    (direct, false)
+}
+
+#[cfg(not(windows))]
+fn resolve_program(command: &str, _path_var: Option<&std::ffi::OsStr>) -> (PathBuf, bool) {
+    (PathBuf::from(command), false)
+}
+
 #[derive(Default)]
 pub struct McpManager {
     config_path: Mutex<Option<PathBuf>>,
@@ -82,6 +115,7 @@ impl McpManager {
                     name: name.clone(),
                     command: server.command.clone(),
                     args: server.args.clone(),
+                    env: server.env.clone(),
                     disabled: server.disabled,
                     trust: server.trust,
                     running,
@@ -108,13 +142,16 @@ impl McpManager {
     }
 
     /// Merge a config entry (from UI or imported JSON) into mcp.json.
-    pub fn upsert_server(&self, name: &str, config: McpServerConfig) -> AppResult<()> {
+    pub fn upsert_server(&self, name: &str, mut config: McpServerConfig) -> AppResult<()> {
         let name = valid_server_name(name)?.to_string();
-        let config = valid_server_config(&name, &config)?;
+        config = valid_server_config(&name, &config)?;
         let mut file = self.load()?;
         if file.mcp_servers.len() >= MAX_SERVERS && !file.mcp_servers.contains_key(&name) {
             return Err("MCP 服务数量超过上限".into());
         }
+        // Editing must not silently re-enable a server the user turned off.
+        let disabled = file.mcp_servers.get(&name).map(|server| server.disabled).unwrap_or(false);
+        config.disabled = disabled;
         file.mcp_servers.insert(name, config);
         self.save(&file)
     }
@@ -171,6 +208,7 @@ impl McpManager {
                     name,
                     command: config.command,
                     args: config.args,
+                    env: config.env,
                     disabled: false,
                     trust: config.trust,
                     running: true,
@@ -189,6 +227,7 @@ impl McpManager {
                     name,
                     command: config.command,
                     args: config.args,
+                    env: config.env,
                     disabled: false,
                     trust: config.trust,
                     running: true,
@@ -204,7 +243,16 @@ impl McpManager {
     }
 
     async fn spawn(&self, name: &str, config: &McpServerConfig) -> AppResult<RunningServer> {
-        let mut child = Command::new(config.command.trim())
+        let path_var = std::env::var_os("PATH");
+        let (program, needs_shell) = resolve_program(config.command.trim(), path_var.as_deref());
+        let mut builder = if needs_shell {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(&program);
+            command
+        } else {
+            Command::new(&program)
+        };
+        let mut child = builder
             .args(&config.args)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
@@ -212,7 +260,7 @@ impl McpManager {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| format!("无法启动 MCP 服务 {name}（{}）", config.command))?;
+            .map_err(|error| format!("无法启动 MCP 服务 {name}（{}）：{error}", config.command))?;
         let stdout = child
             .stdout
             .take()
@@ -274,6 +322,53 @@ impl McpManager {
             let _ = server.child.kill().await;
         }
         Ok(())
+    }
+
+    fn set_disabled(&self, name: &str, disabled: bool) -> AppResult<()> {
+        let name = valid_server_name(name)?.to_string();
+        let mut file = self.load()?;
+        let server = file
+            .mcp_servers
+            .get_mut(&name)
+            .ok_or_else(|| format!("未配置的 MCP 服务：{name}"))?;
+        server.disabled = disabled;
+        self.save(&file)
+    }
+
+    /// Explicit enable from the UI: persist the intent, then start the child.
+    pub async fn enable(&self, name: &str) -> AppResult<McpServerView> {
+        self.set_disabled(name, false)?;
+        self.start(name).await
+    }
+
+    /// Explicit disable from the UI: persist the intent, then stop the child.
+    pub async fn disable(&self, name: &str) -> AppResult<McpServerView> {
+        self.set_disabled(name, true)?;
+        self.stop(name).await?;
+        self.list_servers()
+            .await?
+            .into_iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| format!("未配置的 MCP 服务：{name}"))
+    }
+
+    /// Startup restore: start every configured server the user left enabled.
+    /// Failures stay per-server in `errors` and never block the app.
+    pub async fn start_enabled(&self) {
+        let names: Vec<String> = match self.load() {
+            Ok(file) => file
+                .mcp_servers
+                .iter()
+                .filter(|(_, server)| !server.disabled)
+                .map(|(name, _)| name.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        for name in names {
+            if let Err(error) = self.start(&name).await {
+                eprintln!("MCP 服务 {name} 启动失败：{error}");
+            }
+        }
     }
 
     /// Every exposed tool across running servers as standard `ToolSpec`s,
@@ -399,5 +494,50 @@ mod tests {
         assert!(file.mcp_servers.contains_key("a") && file.mcp_servers.contains_key("b"));
         fs::write(&source, r#"{"mcpServers":{"bad name!":{"command":"x"}}}"#).unwrap();
         assert!(manager.import_json(source.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_cmd_shims_through_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("fake-npx.cmd"), "@echo off\r\n").unwrap();
+        let (path, needs_shell) = resolve_program("fake-npx", Some(dir.path().as_os_str()));
+        assert!(needs_shell);
+        assert!(path.ends_with("fake-npx.cmd"));
+
+        let (direct, needs_shell) = resolve_program("C:/tools/run.exe", None);
+        assert!(!needs_shell);
+        assert!(direct.ends_with("run.exe"));
+    }
+
+    #[tokio::test]
+    async fn disabling_persists_intent_and_editing_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let manager = McpManager::default();
+        manager.set_config_path(path);
+        let config = |trust: bool| McpServerConfig {
+            command: "node".into(),
+            args: vec![],
+            env: Default::default(),
+            disabled: false,
+            trust,
+        };
+        manager.upsert_server("fs", config(false)).unwrap();
+
+        let view = manager.disable("fs").await.unwrap();
+        assert!(view.disabled && !view.running);
+        assert!(manager.load().unwrap().mcp_servers["fs"].disabled);
+        assert!(manager.start("fs").await.is_err());
+
+        // Editing the entry must not re-enable it, but must apply the new trust.
+        manager.upsert_server("fs", config(true)).unwrap();
+        let file = manager.load().unwrap();
+        assert!(file.mcp_servers["fs"].disabled);
+        assert!(file.mcp_servers["fs"].trust);
+
+        // start_enabled skips disabled entries without spawning anything.
+        manager.start_enabled().await;
+        assert!(!manager.list_servers().await.unwrap()[0].running);
     }
 }

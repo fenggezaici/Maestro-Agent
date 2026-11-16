@@ -51,9 +51,10 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
 | 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算；Composer 960px、正文 896px |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
-| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建/本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
-| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效 |
-| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体 MVP；模型连接按 opencode retry 策略自动退避重试 |
+| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建（可选全局/项目）、删除、本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
+| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效；Windows 自动解析 PATH 中的 `.cmd`/`.bat`（npx/npm 可用），支持 env、编辑配置，启用状态跨重启保留并在启动时后台恢复 |
+| 斜杠命令 | 输入 `/` 打开分组面板：内置动作（模式切换、新建会话、停止、设置、扩展、活动、审查面板、清空）、技能（`/skill-name` 生成 load_skill 指令）、`.maestro/commands/*.md` 自定义命令（frontmatter + `$ARGUMENTS`，项目覆盖全局）；↑/↓/Enter/Tab/Esc 键盘操作，展开结果先写入输入框再发送 |
+| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体：`explore`/`general` 内置，`~/.maestro/agents/*.md` 与 `<workspace>/.maestro/agents/*.md` 可新增自定义 agent（项目覆盖全局、覆盖内置），子循环固定按 Plan 门禁执行，写文件与命令一律拒绝；模型连接按 opencode retry 策略自动退避重试 |
 | 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
 | Activity | 项目级真实聚合：plans approved、run_metrics tokens、每日 token 趋势；修改行数从接入后的 run_file_changes 统计，历史数据不回填；Cost 暂无真实价格显示 —；preview 仍为 Mock |
 | 变更卡 / 撤销 | 对话结束或手动停止后显示 ZCode 风格可折叠变更卡：summary 先行、展开懒加载明细、审查/打开；撤销走 preview(safe/unsafe/ignored) → apply，只回退安全文件，已撤销保留卡片 |
@@ -117,7 +118,7 @@ pnpm.cmd tauri dev
 - Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules` and `target`, and enforce path, link, scan-budget and file-size limits. The selected root is cloned before scanning, so long scans never hold the state lock; the Explorer caches the last tree and refreshes on debounced `workspace_changed`.
 - System prompt tells the model that paths outside the selected workspace cannot be read: it must ask the user to copy/move the file into the workspace instead of probing the sandbox.
 - 文件浏览不会自动把内容发送给模型。只读检查不是完整 OS 沙箱；并发恶意文件系统下的残余 TOCTOU 风险见[工作区文档](docs/workspace-filesystem.md)。
-- 扩展数据存放于 `~/.maestro/`（`skills/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，30s 调用超时，应用退出时统一回收；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
+- 扩展数据存放于 `~/.maestro/`（`skills/`、`commands/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，20s 握手/30s 调用超时，应用退出时统一回收；Windows 下 `.cmd`/`.bat` 启动器经 `cmd /C` 解析，启用状态写入 `disabled` 并在下次启动时后台恢复；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
 
 真实聊天上下文由 Rust 从指定会话的已完成记录重建，附加模式提示。前端使用带运行/会话 ID 与序号的 IPC 事件，避免串流和重复追加。
 
@@ -190,7 +191,9 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - 真实模型聊天、工具循环、Skills/MCP、只读 Explorer、写入/命令审批
 - `update_plan` 任务追踪、Tasks Tab、任务胶囊
 - Code 模式写自动、危险命令审批
-- 只读子智能体 MVP、只读工具并发
+- 只读子智能体（内置 explore/general + 自定义 agent 全局/项目双源）、只读工具并发
+- 斜杠命令（内置动作 + 技能 + `.maestro/commands` 自定义命令）
+- MCP 跨重启恢复、env 配置与 Windows `.cmd` 启动器支持
 - 模型目录 reasoning levels、智能/高级模型配置
 - opencode 风格连接重试、provider-only tok/s
 - ZCode 轻量 Diff、变更卡、preview/apply 撤销
@@ -199,7 +202,7 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 
 后续重点：
 
-- 完整可写子智能体、子会话目录与侧栏
+- 可写子智能体（按工具授权 + 独立审批）、子会话目录与侧栏
 - Activity 费用估算（接入模型价格表）与历史行数回填
 - 完整中英文 i18n 与消息目录
 - 工具审批的 allow-once / allow-always / deny feedback

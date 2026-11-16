@@ -181,13 +181,13 @@ impl SkillStore {
             .ok_or_else(|| format!("未知技能：{name}"))
     }
 
-    pub fn create_new(&self, global_dir: &Path, name: &str, description: &str) -> AppResult<SkillView> {
+    pub fn create_new(&self, skills_dir: &Path, name: &str, description: &str, source: SkillSource) -> AppResult<SkillView> {
         let name = valid_skill_name(name)?;
         let description = description.trim();
         if description.len() > MAX_DESCRIPTION_BYTES {
             return Err("技能描述超过 1KB 限制".into());
         }
-        let dir = global_dir.join("skills").join(name);
+        let dir = skills_dir.join(name);
         if dir.exists() {
             return Err(format!("技能 {name} 已存在"));
         }
@@ -200,9 +200,30 @@ impl SkillStore {
         Ok(SkillView {
             name: name.to_string(),
             description: description.to_string(),
-            source: SkillSource::Global,
+            source,
             path: path.to_string_lossy().into_owned(),
         })
+    }
+
+    /// Remove one skill directory. Only a validated kebab-case name inside the
+    /// requested root is deletable; the resolved path is re-checked after
+    /// canonicalization so links cannot escape the skills directory.
+    pub fn delete(&self, skills_dir: &Path, name: &str) -> AppResult<()> {
+        let name = valid_skill_name(name)?;
+        let dir = skills_dir.join(name);
+        if !dir.join("SKILL.md").is_file() {
+            return Err(format!("技能 {name} 不存在"));
+        }
+        let root = skills_dir
+            .canonicalize()
+            .map_err(|_| "技能目录不可用".to_string())?;
+        let canonical = dir
+            .canonicalize()
+            .map_err(|_| "无法解析技能目录".to_string())?;
+        if !canonical.starts_with(&root) || canonical == root {
+            return Err("无效技能路径".into());
+        }
+        fs::remove_dir_all(canonical).map_err(|_| "无法删除技能目录".to_string())
     }
 
     /// Copy a directory containing SKILL.md (or a SKILL.md file itself) into the
@@ -473,9 +494,9 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let global = base.path().join("global");
         let store = SkillStore::default();
-        let view = store.create_new(&global, "my-skill", "desc").unwrap();
+        let view = store.create_new(&global.join("skills"), "my-skill", "desc", SkillSource::Global).unwrap();
         assert_eq!(view.name, "my-skill");
-        assert!(store.create_new(&global, "my-skill", "x").is_err());
+        assert!(store.create_new(&global.join("skills"), "my-skill", "x", SkillSource::Global).is_err());
         let external = base.path().join("external");
         fs::create_dir_all(&external).unwrap();
         fs::write(external.join("SKILL.md"), "---\nname: imported\ndescription: ext\n---\n\nB").unwrap();
@@ -483,6 +504,20 @@ mod tests {
         assert_eq!(outcomes[0].name, "imported");
         assert_eq!(outcomes[0].status, "imported");
         assert!(store.import_from_path(&global, external.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn delete_only_removes_the_requested_skill_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let skills = base.path().join("skills");
+        let store = SkillStore::default();
+        store.create_new(&skills, "keep", "k", SkillSource::Global).unwrap();
+        store.create_new(&skills, "drop", "d", SkillSource::Global).unwrap();
+        store.delete(&skills, "drop").unwrap();
+        assert!(!skills.join("drop").exists());
+        assert!(skills.join("keep").join("SKILL.md").is_file());
+        assert!(store.delete(&skills, "drop").is_err());
+        assert!(store.delete(&skills, "../keep").is_err());
     }
 
     #[test]

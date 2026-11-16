@@ -47,6 +47,13 @@ beforeEach(() => {
         { path: 'README.md', added: 1, removed: 0, before: '', after: 'docs', createdAt: 1 },
       ];
       case 'get_workspace_info': return { name: 'Actual Project', path: 'E:/actual-project' };
+      case 'scan_skills': return [];
+      case 'scan_commands': return [];
+      case 'read_command': return '命令正文';
+      case 'list_agents': return [
+        { name: 'explore', description: '只读代码调研：并行查找文件、证据路径与风险', category: '研究', mode: 'subagent', model: null, prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, hidden: false, color: '#8B5CF6', source: 'builtin' },
+        { name: 'general', description: '只读分析总结：整理多来源信息并给出结论', category: '研究', mode: 'subagent', model: null, prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, hidden: false, color: '#22D3EE', source: 'builtin' },
+      ];
       case 'select_workspace': return { name: 'Selected Project', path: args!.workspacePath };
       case 'read_directory_tree': return [
         { name: 'empty', path: 'empty', is_dir: true, children: [] },
@@ -347,6 +354,8 @@ describe('desktop IPC interface', () => {
     await ready();
     localStorage.setItem('maestro.llm.models.openai', JSON.stringify([{ id: 'configured-model', enabled: true }]));
     fireEvent.click(screen.getByRole('button', { name: '设置' }));
+    const nav = screen.getByRole('navigation', { name: '设置分类' });
+    expect(within(nav).getAllByRole('button').map((button) => button.textContent)).toEqual(['常规', '外观', '模型', '子智能体', '快捷键']);
     fireEvent.click(screen.getByRole('button', { name: '外观' }));
     expect(screen.queryByText('Temperature')).not.toBeInTheDocument();
     expect(screen.getByText(/默认 100%/)).toBeInTheDocument();
@@ -361,6 +370,19 @@ describe('desktop IPC interface', () => {
     fireEvent.keyDown(screen.getByLabelText('发送消息'), { key: 'Enter', ctrlKey: true });
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', expect.objectContaining({ api_key: 'new-test-key', base_url: 'https://example.test/v1', model: 'configured-model' })));
     expect(screen.getByLabelText('发送消息')).toHaveValue('');
+  });
+
+  it('switches mode from the slash palette without sending a message', async () => {
+    render(<App />);
+    await ready();
+    const input = screen.getByLabelText('发送消息');
+    fireEvent.change(input, { target: { value: '/code' } });
+    expect(screen.getByRole('listbox', { name: '斜杠命令' })).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_mode', { mode: 'code' }));
+    expect(screen.queryByRole('listbox', { name: '斜杠命令' })).not.toBeInTheDocument();
+    expect(input).toHaveValue('');
+    expect(mocks.invoke).not.toHaveBeenCalledWith('stream_chat', expect.anything());
   });
 
   it('appends chat-token once and handles chat-error as one terminal Toast', async () => {

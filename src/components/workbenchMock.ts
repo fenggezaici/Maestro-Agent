@@ -46,8 +46,8 @@ export function usePreviewExtensions(): ExtensionsController {
     { name: 'pdf-tools', description: '项目级技能示例', source: 'project', path: '<workspace>/.maestro/skills/pdf-tools/SKILL.md' },
   ]);
   const [servers, setServers] = useState<McpServerView[]>([
-    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], disabled: false, trust: false, running: true, toolCount: 8, error: null },
-    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], disabled: false, trust: false, running: false, toolCount: 0, error: null },
+    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, trust: false, running: true, toolCount: 8, error: null },
+    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_preview' }, disabled: false, trust: false, running: false, toolCount: 0, error: null },
   ]);
   const [pending, setPending] = useState<string | null>(null);
   const noop = async () => null;
@@ -57,12 +57,13 @@ export function usePreviewExtensions(): ExtensionsController {
     recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
     mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
     loading: false, pending,
-    importSummary: null, real: false,
+    importSummary: null, real: false, hasWorkspace: true,
     installErrors: {}, isInstalled: () => false,
     refresh: async () => {},
-    createSkill: async (name, description) => { setSkills((items) => [...items, { name, description, source: 'global', path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
+    createSkill: async (name, description, scope = 'global') => { setSkills((items) => [...items, { name, description, source: scope, path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
+    deleteSkill: async (skill) => { setSkills((items) => items.filter((item) => !(item.name === skill.name && item.source === skill.source))); return null; },
     importSkill: noop, importSkillGithub: noop,
-    addMcpServer: async (name, command, args) => { setServers((items) => [...items, { name, command, args, disabled: false, trust: false, running: false, toolCount: 0, error: null }]); return null; },
+    addMcpServer: async (name, command, args, env = {}, trust = false) => { setServers((items) => [...items, { name, command, args, env, disabled: false, trust, running: false, toolCount: 0, error: null }]); return null; },
     setMcpTrust: async (server, trust) => { setServers((items) => items.map((item) => item.name === server.name ? { ...item, trust } : item)); },
     importMcpJson: noop,
     toggleMcpServer: async (server, enable) => {
