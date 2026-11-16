@@ -152,6 +152,10 @@ impl FrameParser for AnthropicParser {
                 cache_hit: usage
                     .get("cache_read_input_tokens")
                     .and_then(|v| v.as_u64()),
+                cache_write: usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64()),
+                reasoning: None,
             });
         }
         match value.get("type").and_then(|value| value.as_str()) {

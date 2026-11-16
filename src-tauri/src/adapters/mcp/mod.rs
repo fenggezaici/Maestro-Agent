@@ -117,6 +117,7 @@ impl McpManager {
                     args: server.args.clone(),
                     env: server.env.clone(),
                     disabled: server.disabled,
+                    auto_start: server.auto_start,
                     trust: server.trust,
                     running,
                     tool_count: 0, // Filled by the async list_servers caller.
@@ -151,7 +152,9 @@ impl McpManager {
         }
         // Editing must not silently re-enable a server the user turned off.
         let disabled = file.mcp_servers.get(&name).map(|server| server.disabled).unwrap_or(false);
+        let auto_start = file.mcp_servers.get(&name).map(|server| server.auto_start).unwrap_or(config.auto_start);
         config.disabled = disabled;
+        config.auto_start = auto_start;
         file.mcp_servers.insert(name, config);
         self.save(&file)
     }
@@ -210,6 +213,7 @@ impl McpManager {
                     args: config.args,
                     env: config.env,
                     disabled: false,
+                    auto_start: config.auto_start,
                     trust: config.trust,
                     running: true,
                     tool_count: server.tools.len(),
@@ -229,6 +233,7 @@ impl McpManager {
                     args: config.args,
                     env: config.env,
                     disabled: false,
+                    auto_start: config.auto_start,
                     trust: config.trust,
                     running: true,
                     tool_count: tools,
@@ -324,26 +329,27 @@ impl McpManager {
         Ok(())
     }
 
-    fn set_disabled(&self, name: &str, disabled: bool) -> AppResult<()> {
+    fn set_enabled(&self, name: &str, enabled: bool) -> AppResult<()> {
         let name = valid_server_name(name)?.to_string();
         let mut file = self.load()?;
         let server = file
             .mcp_servers
             .get_mut(&name)
             .ok_or_else(|| format!("未配置的 MCP 服务：{name}"))?;
-        server.disabled = disabled;
+        server.disabled = !enabled;
+        server.auto_start = enabled;
         self.save(&file)
     }
 
     /// Explicit enable from the UI: persist the intent, then start the child.
     pub async fn enable(&self, name: &str) -> AppResult<McpServerView> {
-        self.set_disabled(name, false)?;
+        self.set_enabled(name, true)?;
         self.start(name).await
     }
 
     /// Explicit disable from the UI: persist the intent, then stop the child.
     pub async fn disable(&self, name: &str) -> AppResult<McpServerView> {
-        self.set_disabled(name, true)?;
+        self.set_enabled(name, false)?;
         self.stop(name).await?;
         self.list_servers()
             .await?
@@ -359,7 +365,7 @@ impl McpManager {
             Ok(file) => file
                 .mcp_servers
                 .iter()
-                .filter(|(_, server)| !server.disabled)
+                .filter(|(_, server)| server.auto_start && !server.disabled)
                 .map(|(name, _)| name.clone())
                 .collect(),
             Err(_) => return,
@@ -521,6 +527,7 @@ mod tests {
             args: vec![],
             env: Default::default(),
             disabled: false,
+            auto_start: false,
             trust,
         };
         manager.upsert_server("fs", config(false)).unwrap();

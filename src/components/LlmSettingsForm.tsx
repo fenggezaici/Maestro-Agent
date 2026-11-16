@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
 import * as Switch from '@radix-ui/react-switch';
 import { Eye, EyeOff, KeyRound, Pencil, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { clearLlmSettings, readLlmSettings, saveLlmSettings, type LlmSettings } from '../settings';
@@ -96,10 +96,9 @@ function ModelEditDialog({ editing, onClose, onSave }: {
   const [draft, setDraft] = useState<ProviderModel>(base);
   useEffect(() => { setDraft(editing && editing !== 'new' ? editing : { id: '', enabled: true }); }, [editing]);
   const open = editing !== null;
-  return <Dialog.Root open={open} onOpenChange={(value) => !value && onClose()}>
-    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="project-dialog" aria-describedby={undefined}>
-        <Dialog.Title asChild><h3>{isNew ? '添加模型' : '编辑模型配置'}</h3></Dialog.Title>
+  return <Dialog open={open} onOpenChange={(value) => !value && onClose()}>
+    <DialogContent variant="form" className="project-dialog">
+        <DialogTitle asChild><h3>{isNew ? '添加模型' : '编辑模型配置'}</h3></DialogTitle>
         <form onSubmit={(event) => { event.preventDefault(); if ((draft.id ?? '').trim()) onSave({ ...draft, id: (draft.id ?? '').trim() }); }}>
           <label htmlFor="model-edit-id">模型 ID</label>
           <input id="model-edit-id" autoComplete="off" spellCheck={false} autoFocus value={draft.id ?? ''} maxLength={128}
@@ -141,12 +140,10 @@ function ModelEditDialog({ editing, onClose, onSave }: {
               onChange={(event) => setDraft({ ...draft, reasoningMapping: event.target.value })} rows={3} spellCheck={false} />
           </div>}
           <div className="dialog-actions">
-            <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
+            <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
             <button type="submit" className="button-approve" disabled={!(draft.id ?? '').trim()}>保存</button>
           </div>
         </form>
-        <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+    </DialogContent>
+  </Dialog>;
 }

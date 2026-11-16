@@ -6,9 +6,10 @@ import { create } from 'zustand';
 
 import { kernelApi } from '../api/kernel';
 import { sessionsApi } from '../api/sessions';
+import { subagentsApi } from '../api/subagents';
 import type {
   KernelEvent, Mode, PlanCard, PlanDecision, PlanStep, ProjectView, RunMetrics,
-  SessionDetail, SessionView, Snapshot, ToolCallView,
+  QuestionAnswer, SessionDetail, SessionView, Snapshot, SubagentView, ToolCallView, UserQuestion,
 } from '../api/types';
 import {
   appendContent, appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
@@ -27,6 +28,10 @@ export interface KernelStore {
   pending: boolean;
   metrics: Record<number, RunMetrics>;
   liveTools: Record<number, ToolCallView[]>;
+  /** Live and persisted child traces keyed by subagent id. */
+  subagents: Record<string, SubagentView>;
+  /** Active ask_user request, if any. */
+  pendingQuestion: { runId: number; requestId: string; questions: UserQuestion[] } | null;
   /// Bumped on every `workspace_changed` kernel event — workspace views
   /// subscribe and refresh their tree/preview without polling.
   workspaceTick: number;
@@ -69,6 +74,7 @@ export interface KernelStore {
   deleteSession: (sessionId: number) => Promise<void>;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (runId: number) => Promise<void>;
+  answerQuestion: (runId: number, requestId: string, answers: QuestionAnswer[]) => Promise<void>;
   queueStart: (prompt: string, images?: string[]) => void;
   resolveApproval: (runId: number, approved: boolean) => Promise<void>;
   setMode: (mode: Mode) => Promise<void>;
@@ -137,11 +143,15 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     const revision = ++detailRevision;
     set({ loadingSession: true });
     try {
-      const result = await sessionsApi.session(id);
+      const [result, traces] = await Promise.all([
+        sessionsApi.session(id),
+        subagentsApi.list(id).catch(() => [] as SubagentView[]),
+      ]);
       if (mounted && revision === detailRevision && selectedRef === id) {
         set((s) => ({
           detail: result,
           metrics: { ...s.metrics, ...Object.fromEntries((result.metrics ?? []).map((v) => [v.runId, v])) },
+          subagents: { ...Object.fromEntries(traces.map((trace) => [trace.id, trace])), ...s.subagents },
         }));
       }
     } finally {
@@ -177,6 +187,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     pending: false,
     metrics: {},
     liveTools: {},
+    subagents: {},
+    pendingQuestion: null,
     workspaceTick: 0,
     liveTimeline: {},
     stoppingRunId: null,
@@ -220,6 +232,56 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
           };
         });
       }
+      if (event.type === 'user_question') {
+        set({ pendingQuestion: { runId: event.runId, requestId: event.requestId, questions: event.questions } });
+      }
+      if (event.type === 'subagent_started') {
+        set((s) => ({ subagents: { ...s.subagents, [event.subagent.id]: { ...event.subagent, timeline: [] } } }));
+      }
+      if (event.type === 'subagent_tool') {
+        set((s) => {
+          const trace = s.subagents[event.subagentId];
+          if (!trace) return {};
+          const now = Date.now();
+          const { next, index } = applyToolEventIndexed({ [event.runId]: trace.tools }, { ...event, type: 'tool_call' as const });
+          const tools = next[event.runId] ?? trace.tools;
+          const timeline = appendTool(closeReasoning(trace.timeline, now), index, now);
+          return { subagents: { ...s.subagents, [event.subagentId]: { ...trace, tools, toolCount: tools.length, timeline } } };
+        });
+      }
+      if (event.type === 'subagent_token') {
+        set((s) => {
+          const trace = s.subagents[event.subagentId];
+          if (!trace) return {};
+          const now = Date.now();
+          if (event.kind === 'reasoning') {
+            return { subagents: { ...s.subagents, [event.subagentId]: { ...trace, reasoning: trace.reasoning + event.token, timeline: appendReasoning(trace.timeline, event.token, now) } } };
+          }
+          return { subagents: { ...s.subagents, [event.subagentId]: { ...trace, content: trace.content + event.token, timeline: appendContent(closeReasoning(trace.timeline, now), event.token) } } };
+        });
+      }
+      if (event.type === 'subagent_finished') {
+        set((s) => {
+          const trace = s.subagents[event.subagentId];
+          if (!trace) return {};
+          return {
+            subagents: {
+              ...s.subagents,
+              [event.subagentId]: {
+                ...trace,
+                status: event.status,
+                summary: event.summary,
+                error: event.error,
+                toolCount: event.toolCount,
+                inputTokens: event.inputTokens,
+                outputTokens: event.outputTokens,
+                finishedAt: event.finishedAt,
+                timeline: closeReasoning(trace.timeline, Date.now()),
+              },
+            },
+          };
+        });
+      }
       if (event.type === 'workspace_changed') {
         set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
       }
@@ -254,8 +316,25 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
           const liveTimeline = closed && closed !== s.liveTimeline[event.run.id]
             ? { ...s.liveTimeline, [event.run.id]: closed }
             : s.liveTimeline;
-          return { liveTools, liveTimeline, stoppingRunId: s.stoppingRunId === event.run.id ? null : s.stoppingRunId };
+          return {
+            liveTools,
+            liveTimeline,
+            stoppingRunId: s.stoppingRunId === event.run.id ? null : s.stoppingRunId,
+            pendingQuestion: s.pendingQuestion?.runId === event.run.id ? null : s.pendingQuestion,
+          };
         });
+        if (event.run.status === 'completed') {
+          const sessionId = event.run.sessionId;
+          set((s) => {
+            const steps = s.taskPlans[sessionId];
+            if (!steps?.length) return {};
+            const next = steps.map((step) => step.status === 'completed' ? step : { ...step, status: 'completed' as const });
+            return {
+              taskPlans: { ...s.taskPlans, [sessionId]: next },
+              currentPlan: s.selectedSessionId === sessionId ? next : s.currentPlan,
+            };
+          });
+        }
         if (flushQueued) {
           window.setTimeout(() => {
             const queued = get().queuedStart;
@@ -309,6 +388,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         pending: false,
         metrics: {},
         liveTools: {},
+        subagents: {},
+        pendingQuestion: null,
         liveTimeline: {},
         stoppingRunId: null,
         queuedStart: null,
@@ -409,6 +490,15 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     }),
 
     queueStart: (prompt, images) => set({ queuedStart: { prompt, images } }),
+
+    answerQuestion: async (runId, requestId, answers) => {
+      try {
+        await kernelApi.answerQuestion(runId, requestId, answers);
+        set({ pendingQuestion: null, error: null });
+      } catch (reason) {
+        setError(errorMessage(reason));
+      }
+    },
 
     cancel: (runId) => {
       // Stop the UI immediately — seal the open thinking burst and settle

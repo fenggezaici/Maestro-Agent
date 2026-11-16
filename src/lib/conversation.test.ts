@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { appendReasoning, appendTool, applyToolEventIndexed, closeReasoning, initialSnapshot, kernelReducer, relativeTime } from './conversation';
 
@@ -56,4 +56,12 @@ it('advances the snapshot on task_plan_updated without touching run state', () =
   expect(next.sequence).toBe(3);
   expect(next.activeRun).toBeNull();
   expect(next.ready).toBe(true);
+});
+
+describe('subagent tool rows', () => {
+  it('keeps subagentId across started and finished phases', () => {
+    const started = applyToolEventIndexed({}, { sequence: 1, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'started', detail: '调研', subagentId: 'sa-1-1' });
+    const finished = applyToolEventIndexed(started.next, { sequence: 2, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'finished', detail: 'done', subagentId: 'sa-1-1' });
+    expect(finished.next[1][0].subagentId).toBe('sa-1-1');
+  });
 });

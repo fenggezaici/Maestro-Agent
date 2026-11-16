@@ -1,8 +1,9 @@
-import { Bot, ChevronDown, ChevronRight, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
 import { useState } from 'react';
-import type { ToolCallView } from '../api/types';
+import type { SubagentView, ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
 import MiniDiff, { countChanges } from './MiniDiff';
+import { parseUserQuestionPayload, questionAnswerText } from '../lib/userQuestion';
 
 /// `write_result` payload emitted in the Finished detail for write tools —
 /// carries the before/after contents for the mini diff.
@@ -29,6 +30,7 @@ const TOOL_META: Record<string, { icon: LucideIcon; verb: string }> = {
   load_skill: { icon: Puzzle, verb: '加载技能' },
   update_plan: { icon: ListTodo, verb: '更新计划' },
   spawn_subagent: { icon: Bot, verb: '子智能体' },
+  ask_user: { icon: CircleHelp, verb: '提问' },
   read_session: { icon: Database, verb: '读取会话' },
   list_sessions: { icon: Database, verb: '列出会话' },
 };
@@ -71,7 +73,7 @@ function targetOf(call: ToolCallView): string {
 /// One collapsed tool-call row with icon + verb + target + status; expandable
 /// detail panel for results/output/failures. Exported so the reasoning timeline
 /// can interleave rows with thinking nodes in event order.
-export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, approved: boolean) => void }) {
+export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, approved: boolean) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
   const [expanded, setExpanded] = useState(false);
   const pending = Boolean(call.pending || call.awaitingApproval);
   const status = call.awaitingApproval ? '待批准' : call.pending ? '执行中' : call.allowed ? '已执行' : '已阻止';
@@ -79,8 +81,11 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval 
   const { icon: Icon, verb, short } = meta(call.tool);
   const target = targetOf(call);
   const writeResult = call.allowed ? writeResultOf(call.detail) : null;
+  const askPayload = call.tool === 'ask_user' ? parseUserQuestionPayload(call.detail) : null;
   const delta = writeResult ? countChanges(writeResult.before, writeResult.after) : null;
   const panel = call.allowed ? (writeResult ? writeResult.path : (call.detail || '读取成功')) : `失败：${call.detail || '未知原因'}`;
+  const subagentId = call.subagentId;
+  const spawn = call.tool === 'spawn_subagent' && Boolean(onOpenSubagent && subagentId);
   const openFile = () => {
     if ((call.tool === 'read_file' || call.tool === 'list_dir') && target) onOpenFile?.(target);
     const writePath = writeResult?.path ?? (call.tool === 'write_file' || call.tool === 'apply_patch' ? target : undefined);
@@ -88,13 +93,16 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval 
   };
   return <div className={`tool-call-row ${call.allowed ? 'allowed' : 'blocked'}${pending ? ' pending' : ''}`} role="listitem">
     <div role="button" tabIndex={0} className="tool-call-summary" aria-expanded={expanded}
-      onClick={() => setExpanded((value) => !value)}
-      onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setExpanded((value) => !value); } }}>
+      onClick={() => { if (spawn && subagentId) onOpenSubagent?.(subagentId); else setExpanded((value) => !value); }}
+      onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); if (spawn && subagentId) onOpenSubagent?.(subagentId); else setExpanded((value) => !value); } }}>
       {pending ? <Loader2 size={12} className="tool-call-spinner" /> : <Icon size={12} className={call.allowed ? 'tool-call-ok-icon' : 'tool-call-fail-icon'} />}
       <span className="tool-call-verb">{verb}</span>
       <span className="tool-call-target-link"><Target text={target || short} clickable={Boolean(target) && call.tool !== 'run_command'} onOpen={openFile} /></span>
       {delta && <span className="tool-call-delta"><em className="add">+{delta.added}</em><em className="del">−{delta.removed}</em></span>}
-      {expanded ? <ChevronDown size={12} className="tool-call-chevron" /> : <ChevronRight size={12} className="tool-call-chevron" />}
+      <button type="button" className="tool-call-expand tool-call-chevron" aria-label={expanded ? '收起工具明细' : '展开工具明细'}
+        onClick={(event) => { event.stopPropagation(); setExpanded((value) => !value); }}>
+        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+      </button>
       <span className="tool-call-spacer" />
       {(!call.allowed || pending) && <span className={`tool-call-status ${statusClass}`}>{status}</span>}
     </div>
@@ -110,16 +118,31 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval 
         </div>
       </div>;
     })()}
-    {expanded && !call.awaitingApproval && (writeResult
+    {expanded && !call.awaitingApproval && (spawn
+      ? <div className="tool-call-panel subagent-inline">
+        <p><strong>{subagent?.agent ?? '子智能体'}</strong> · {subagent?.status ?? (pending ? 'running' : 'completed')} · {subagent?.toolCount ?? 0} 次工具</p>
+        <pre className="tool-call-panel">{subagent?.summary || call.detail || '暂无摘要'}</pre>
+        {subagentId && onOpenSubagent && <button type="button" className="button-ghost" onClick={() => onOpenSubagent(subagentId)}>在右侧查看完整过程</button>}
+      </div>
+      : call.tool === 'ask_user'
+      ? <div className="tool-call-panel user-question-summary">
+        {askPayload
+          ? askPayload.questions.map((question) => <div key={question.id}>
+            <strong>{question.question}</strong>
+            <p>{questionAnswerText(question, askPayload.answers)}</p>
+          </div>)
+          : <pre className="tool-call-panel">{call.detail || (pending ? '等待回答…' : '已回答')}</pre>}
+      </div>
+      : writeResult
       ? <MiniDiff before={writeResult.before} after={writeResult.after} />
       : <pre className="tool-call-panel">{panel}</pre>)}
   </div>;
 }
 
 /// ZCode-style collapsed tool-call group: one row per call.
-export default function ToolCallBlocks({ calls, onSelectFile, onOpenFile }: { calls: ToolCallView[]; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void }) {
+export default function ToolCallBlocks({ calls, onSelectFile, onOpenFile, onOpenSubagent, subagentById }: { calls: ToolCallView[]; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onOpenSubagent?: (id: string) => void; subagentById?: (id: string) => SubagentView | undefined }) {
   if (!calls.length) return null;
   return <div className="tool-events" role="list" aria-label="工具调用明细">
-    {calls.map((call, index) => <ToolCallRow key={index} call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} />)}
+    {calls.map((call, index) => <ToolCallRow key={index} call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} subagent={call.subagentId ? subagentById?.(call.subagentId) : undefined} />)}
   </div>;
 }

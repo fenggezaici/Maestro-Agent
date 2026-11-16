@@ -40,8 +40,9 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批 |
 | IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
-| 上下文指示 | 输入框右侧 Context 圆环：百分比 + Tooltip，80% 变黄、90% 变红 |
-| Composer 统计 | Composer 下方居中的两枚统计 Pill（轮/步/tok/s；总 tokens/缓存命中）；tok/s 只用 provider outputTokens / (elapsed−firstToken) 聚合，缺失 usage 显示 —，不用文本估算；缓存命中同样只认 provider usage |
+| Composer 统计 | Harness 风格六枚 chip：Context / Input / Output / Hit rate / tok-s / TTFT；Context 取最新一次 prompt，Input 为计费累计（cache read+write+uncached），tok/s=Σoutput/Σdecode，TTFT 为平均首 token；点击展开详情；缺失字段显示 —，不用文本估算 |
+| 结构化提问 | 只读工具 `ask_user`：1-4 题、每题 2-4 选项、单选/多选 + 自定义输入；Kernel 挂起该轮并发出 `user_question`，UI 模态提交/跳过后把结构化答案作为 tool result 返回；停止生成会取消等待 |
+| 弹窗适配层 | `src/components/ui/dialog.tsx` 统一 Portal/Overlay/固定居中/z-index 与 default/form/panel/palette 变体；8 个弹窗全部迁移，业务类只保留内容排版 |
 | 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
 | 品牌 / 图标 | 双色 M MaestroLogo；Tauri 桌面图标由 `app-icon.svg` 生成（ico/icns/png/Square/StoreLogo） |
 | 国际化 | 默认 zh-CN；英文切换目前覆盖基础导航与设置标签，完整 i18n 仍在后续 |
@@ -52,11 +53,11 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算；Composer 960px、正文 896px |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
 | Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建（可选全局/项目）、删除、本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
-| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效；Windows 自动解析 PATH 中的 `.cmd`/`.bat`（npx/npm 可用），支持 env、编辑配置，启用状态跨重启保留并在启动时后台恢复 |
+| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效；Windows 自动解析 PATH 中的 `.cmd`/`.bat`（npx/npm 可用），支持 env、编辑配置；`auto_start` 默认 false，只有显式启用过的服务才在启动时恢复，失败只显示行内错误 |
 | 斜杠命令 | 输入 `/` 打开分组面板：内置动作（模式切换、新建会话、停止、设置、扩展、活动、审查面板、清空）、技能（`/skill-name` 生成 load_skill 指令）、`.maestro/commands/*.md` 自定义命令（frontmatter + `$ARGUMENTS`，项目覆盖全局）；↑/↓/Enter/Tab/Esc 键盘操作，展开结果先写入输入框再发送 |
-| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体：`explore`/`general` 内置，`~/.maestro/agents/*.md` 与 `<workspace>/.maestro/agents/*.md` 可新增自定义 agent（项目覆盖全局、覆盖内置），子循环固定按 Plan 门禁执行，写文件与命令一律拒绝；模型连接按 opencode retry 策略自动退避重试 |
+| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体：`explore`/`general` 内置，`~/.maestro/agents/*.md` 与 `<workspace>/.maestro/agents/*.md` 可新增自定义 agent（项目覆盖全局、覆盖内置），子循环固定按 Plan 门禁执行，写文件与命令一律拒绝；每个子智能体有独立 trace（prompt/思考/工具/正文/用量），右侧「子智能体」面板可实时下钻并在重启后回看，子工具不再混入父时间线，最近 6 份报告（≤16KB）会注入后续轮次；子智能体支持 600s 超时（`MAESTRO_SUBAGENT_TIMEOUT` 可调）、20 次工具预算、轮次耗尽保留结论与单独停止；OpenCode 网关下每个子智能体使用独立 `x-opencode-session`，默认最多 3 个并行（`MAESTRO_MAX_SUBAGENTS` 可调）；模型连接按 opencode retry 策略自动退避重试 |
 | 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
-| Activity | 项目级真实聚合：plans approved、run_metrics tokens、每日 token 趋势；修改行数从接入后的 run_file_changes 统计，历史数据不回填；Cost 暂无真实价格显示 —；preview 仍为 Mock |
+| Activity | 项目级真实聚合：plans approved、run_metrics tokens（v10 起含 cache write/reasoning/attempts/TTFT）、每日 token 趋势；修改行数从接入后的 run_file_changes 统计，历史数据不回填；Cost 暂无真实价格显示 —；preview 仍为 Mock |
 | 变更卡 / 撤销 | 对话结束或手动停止后显示 ZCode 风格可折叠变更卡：summary 先行、展开懒加载明细、审查/打开；撤销走 preview(safe/unsafe/ignored) → apply，只回退安全文件，已撤销保留卡片 |
 | 侧栏对齐 | 导航、项目行、会话标题统一 x=46；行盒右边界 248，计数/时间戳 244；项目/会话操作按钮 absolute 悬浮，hover 不推挤内容 |
 
@@ -189,10 +190,11 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 已完成：
 
 - 真实模型聊天、工具循环、Skills/MCP、只读 Explorer、写入/命令审批
-- `update_plan` 任务追踪、Tasks Tab、任务胶囊
+- `ask_user` 结构化提问（1-4 题、选项 + 自定义输入）、`update_plan` 任务追踪、Tasks Tab、任务胶囊
 - Code 模式写自动、危险命令审批
 - 只读子智能体（内置 explore/general + 自定义 agent 全局/项目双源）、只读工具并发
 - 斜杠命令（内置动作 + 技能 + `.maestro/commands` 自定义命令）
+- 子智能体 trace 持久化、右侧下钻、跨轮报告、超时/用量/单独停止
 - MCP 跨重启恢复、env 配置与 Windows `.cmd` 启动器支持
 - 模型目录 reasoning levels、智能/高级模型配置
 - opencode 风格连接重试、provider-only tok/s

@@ -10,6 +10,8 @@ pub mod metrics;
 pub mod plan;
 pub mod policy;
 pub mod session;
+pub mod subagent;
+pub mod user_question;
 
 pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
@@ -31,3 +33,5 @@ pub use session::{
     unix_now, Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
     ToolCallView,
 };
+pub use subagent::{SubagentStatus, SubagentTokenKind, SubagentView};
+pub use user_question::{format_answers, parse_questions, validate_answers, Question, QuestionAnswer, QuestionOption};

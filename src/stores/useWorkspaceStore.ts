@@ -92,19 +92,17 @@ export const useWorkspaceStore = create<WorkspaceStore>()((set, get) => ({
     if (!workspace?.path) return;
     const revision = ++fileRevision;
     set({ selectedPath: path, file: null, fileError: null, fileLoading: true });
-    let timer: number | undefined;
     try {
-      const timeout = new Promise<never>((_, reject) => {
-        timer = window.setTimeout(() => reject(new Error('读取文件超时')), 10_000);
-      });
-      const content = await Promise.race([workspaceApi.text(workspace.path, path), timeout]);
+      // No artificial deadline: the scoped reader is bounded to 1 MiB and the
+      // backend owns real errors. A 10s race used to fire while reads queued
+      // behind a directory scan, which looked like a broken file.
+      const content = await workspaceApi.text(workspace.path, path);
       if (mounted && revision === fileRevision && root?.path === workspace.path) {
         set({ file: { id: `disk:${workspace.path}:${path}`, path, content, source: 'disk' } });
       }
     } catch (reason) {
       if (mounted && revision === fileRevision) set({ fileError: errorMessage(reason) });
     } finally {
-      if (timer) window.clearTimeout(timer);
       // Always settle the spinner for the latest request, even if the root
       // changed mid-read; otherwise the right pane can hang on "loading".
       if (mounted && revision === fileRevision) set({ fileLoading: false });

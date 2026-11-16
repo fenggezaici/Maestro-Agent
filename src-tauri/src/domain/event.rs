@@ -4,6 +4,8 @@ use crate::domain::{
     metrics::RunMetrics,
     plan::{PlanCard, PlanStep},
     session::{Mode, RunView},
+    subagent::{SubagentStatus, SubagentTokenKind, SubagentView},
+    user_question::Question,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +84,59 @@ pub enum EventData {
         tool: String,
         phase: ToolPhase,
         detail: String,
+        /// Present on `spawn_subagent` rows so the UI can open its trace.
+        #[serde(rename = "subagentId", skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
+    },
+    /// A child research run was created (trace is already persisted).
+    SubagentStarted {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        subagent: SubagentView,
+    },
+    /// Child tool lifecycle; never mixed into the parent tool timeline.
+    SubagentTool {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "subagentId")]
+        subagent_id: String,
+        tool: String,
+        phase: ToolPhase,
+        detail: String,
+    },
+    /// Streamed child answer or reasoning token.
+    SubagentToken {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "subagentId")]
+        subagent_id: String,
+        kind: SubagentTokenKind,
+        token: String,
+    },
+    /// The model is waiting for a structured answer from the user.
+    UserQuestion {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "requestId")]
+        request_id: String,
+        questions: Vec<Question>,
+    },
+    SubagentFinished {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "subagentId")]
+        subagent_id: String,
+        status: SubagentStatus,
+        summary: String,
+        error: Option<String>,
+        #[serde(rename = "toolCount")]
+        tool_count: usize,
+        #[serde(rename = "inputTokens")]
+        input_tokens: Option<u64>,
+        #[serde(rename = "outputTokens")]
+        output_tokens: Option<u64>,
+        #[serde(rename = "finishedAt")]
+        finished_at: i64,
     },
 }
 
@@ -91,6 +146,7 @@ mod tests {
     use serde_json::json;
 
     use crate::domain::session::{RunStatus, Snapshot};
+    use crate::domain::{SubagentStatus, SubagentTokenKind, SubagentView};
 
     #[test]
     fn stream_event_matches_the_typescript_contract() {
@@ -123,6 +179,7 @@ mod tests {
                 tool: "read_file".into(),
                 phase: ToolPhase::Finished,
                 detail: String::new(),
+                subagent_id: None,
             },
         };
         assert_eq!(
@@ -151,6 +208,83 @@ mod tests {
                 "steps": [{ "id": "1", "description": "读取项目", "status": "in_progress" }],
             })
         );
+    }
+
+    #[test]
+    fn subagent_events_serialize_with_camel_case_ids() {
+        let view = SubagentView {
+            id: "sa-7-1".into(),
+            run_id: 7,
+            session_id: 2,
+            agent: "explore".into(),
+            description: "调研".into(),
+            prompt: "读文件".into(),
+            model: Some("m".into()),
+            status: SubagentStatus::Running,
+            summary: String::new(),
+            error: None,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: 1,
+            finished_at: None,
+            tools: Vec::new(),
+        };
+        let started = KernelEvent {
+            sequence: 9,
+            data: EventData::SubagentStarted { run_id: 7, subagent: view },
+        };
+        let value = serde_json::to_value(started).unwrap();
+        assert_eq!(value["type"], "subagent_started");
+        assert_eq!(value["runId"], 7);
+        assert_eq!(value["subagent"]["id"], "sa-7-1");
+        assert_eq!(value["subagent"]["toolCount"], 0);
+
+        let spawn = KernelEvent {
+            sequence: 10,
+            data: EventData::ToolCall {
+                run_id: 7,
+                tool: "spawn_subagent".into(),
+                phase: ToolPhase::Started,
+                detail: "调研".into(),
+                subagent_id: Some("sa-7-1".into()),
+            },
+        };
+        assert_eq!(serde_json::to_value(spawn).unwrap()["subagentId"], "sa-7-1");
+
+        let token = KernelEvent {
+            sequence: 11,
+            data: EventData::SubagentToken {
+                run_id: 7,
+                subagent_id: "sa-7-1".into(),
+                kind: SubagentTokenKind::Content,
+                token: "hi".into(),
+            },
+        };
+        let value = serde_json::to_value(token).unwrap();
+        assert_eq!(value["type"], "subagent_token");
+        assert_eq!(value["kind"], "content");
+
+        let finished = KernelEvent {
+            sequence: 12,
+            data: EventData::SubagentFinished {
+                run_id: 7,
+                subagent_id: "sa-7-1".into(),
+                status: SubagentStatus::Completed,
+                summary: "done".into(),
+                error: None,
+                tool_count: 2,
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                finished_at: 3,
+            },
+        };
+        let value = serde_json::to_value(finished).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["toolCount"], 2);
+        assert_eq!(value["finishedAt"], 3);
     }
 
     #[test]

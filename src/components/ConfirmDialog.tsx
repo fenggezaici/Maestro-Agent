@@ -1,4 +1,4 @@
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from './ui/dialog';
 import { TriangleAlert } from 'lucide-react';
 
 import { Button } from './ui';
@@ -16,17 +16,14 @@ export default function ConfirmDialog({ open, onOpenChange, title, description, 
   danger?: boolean;
   onConfirm: () => void;
 }) {
-  return <Dialog.Root open={open} onOpenChange={onOpenChange}>
-    <Dialog.Portal>
-      <Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="confirm-dialog" aria-describedby={undefined}>
-        <Dialog.Title className="confirm-dialog-title"><TriangleAlert size={18} />{title}</Dialog.Title>
-        <Dialog.Description className="confirm-dialog-description">{description}</Dialog.Description>
-        <div className="confirm-dialog-actions">
-          <Dialog.Close asChild><Button variant="ghost">{cancelLabel}</Button></Dialog.Close>
-          <Button variant={danger ? 'destructive' : 'primary'} onClick={() => { onConfirm(); onOpenChange(false); }}>{confirmLabel}</Button>
-        </div>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent variant="default" className="confirm-dialog">
+      <DialogTitle className="confirm-dialog-title"><TriangleAlert size={18} />{title}</DialogTitle>
+      <DialogDescription className="confirm-dialog-description">{description}</DialogDescription>
+      <div className="confirm-dialog-actions">
+        <DialogClose asChild><Button variant="ghost">{cancelLabel}</Button></DialogClose>
+        <Button variant={danger ? 'destructive' : 'primary'} onClick={() => { onConfirm(); onOpenChange(false); }}>{confirmLabel}</Button>
+      </div>
+    </DialogContent>
+  </Dialog>;
 }

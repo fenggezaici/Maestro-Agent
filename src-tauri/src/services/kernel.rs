@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
+};
 
 use tokio::sync::{oneshot, watch, Mutex};
 
@@ -13,7 +17,8 @@ use crate::{
         policy::{self, ToolEffect, ToolGate},
         AppResult, ChatMessage, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft,
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
-        ToolPhase, ToolSpec,
+        format_answers, parse_questions, validate_answers, Question, QuestionAnswer, SubagentStatus,
+        SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
     },
     services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
 };
@@ -29,10 +34,44 @@ struct Control {
     /// one can exist (the agent loop is serial); dropping the responder
     /// without answering counts as rejection.
     pending: Option<PendingApproval>,
+    /// `ask_user` suspension; separate from approvals so neither overwrites
+    /// the other. Dropping the responder counts as cancellation.
+    pending_question: Option<PendingQuestion>,
 }
 
 struct PendingApproval {
     responder: oneshot::Sender<bool>,
+}
+
+struct PendingQuestion {
+    request_id: String,
+    questions: Vec<Question>,
+    responder: oneshot::Sender<Option<Vec<QuestionAnswer>>>,
+}
+
+static QUESTION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Per-run metrics accumulate across model turns; the relay reports one
+/// snapshot per turn, so a single `RunMetrics` row otherwise only keeps the
+/// last turn.
+#[derive(Default)]
+struct MetricsAccumulator {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache: Option<u64>,
+    cache_write: Option<u64>,
+    reasoning: Option<u64>,
+    attempts: u32,
+    elapsed: u64,
+    first: u64,
+    current: Option<RunMetrics>,
+}
+
+fn sum_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, None) => None,
+        (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+    }
 }
 
 struct RuntimeState {
@@ -58,6 +97,11 @@ pub struct Kernel {
     sink: EventSink,
     /// Resolves a `Provider` to its adapter; tests substitute a stub.
     llm_resolver: StdMutex<ProviderResolver>,
+    /// Live child traces keyed by subagent id; persisted copies live in SQLite.
+    subagents: StdMutex<HashMap<String, SubagentView>>,
+    /// Cancellation channels for running children, so one child can stop alone.
+    subagent_cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
+    metrics_acc: StdMutex<HashMap<i64, MetricsAccumulator>>,
 }
 
 impl Kernel {
@@ -80,6 +124,9 @@ impl Kernel {
             commands: Mutex::new(()),
             sink,
             llm_resolver: StdMutex::new(Arc::new(|provider| provider_for(provider))),
+            subagents: StdMutex::new(HashMap::new()),
+            subagent_cancels: StdMutex::new(HashMap::new()),
+            metrics_acc: StdMutex::new(HashMap::new()),
         });
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
         Ok(kernel)
@@ -205,6 +252,7 @@ impl Kernel {
             .database
             .create_run_in_session(session_id, prompt.clone(), mode)
             .await?;
+        self.metrics_acc.lock().unwrap().remove(&id);
         // Workspace fallback: sessions live inside projects — use the project's
         // path so read tools work even before the user opens the Explorer.
         {
@@ -238,6 +286,7 @@ impl Kernel {
                 done: done_rx,
                 finishing: false,
                 pending: None,
+                pending_question: None,
             });
             state.cancelled_run = None;
             self.emit_locked(&mut state, EventData::Status { run: run.clone() });
@@ -269,6 +318,9 @@ impl Kernel {
         // the cancellation and finish instead of hanging on the user's answer.
         if let Some(pending) = control.pending.take() {
             let _ = pending.responder.send(false);
+        }
+        if let Some(question) = control.pending_question.take() {
+            let _ = question.responder.send(None);
         }
         // Flag after the control borrow ends: the loop polls this even if the
         // watch notification is lost.
@@ -325,6 +377,44 @@ impl Kernel {
 
     /// Emit one `tool_call` event while the run is still active.
     pub(crate) async fn emit_tool(&self, run_id: i64, tool: &str, phase: ToolPhase, detail: &str) {
+        self.emit_tool_scoped(run_id, None, tool, phase, detail).await;
+    }
+
+    /// Spawn rows carry their trace id so the UI can open the drill-down.
+    pub(crate) async fn emit_spawn(
+        &self,
+        run_id: i64,
+        subagent_id: &str,
+        phase: ToolPhase,
+        detail: &str,
+    ) {
+        let mut state = self.state.lock().await;
+        if Self::active_run_locked(&state, run_id).is_ok() {
+            self.emit_locked(
+                &mut state,
+                EventData::ToolCall {
+                    run_id,
+                    tool: "spawn_subagent".into(),
+                    phase,
+                    detail: detail.into(),
+                    subagent_id: Some(subagent_id.into()),
+                },
+            );
+        }
+    }
+
+    async fn emit_tool_scoped(
+        &self,
+        run_id: i64,
+        subagent_id: Option<&str>,
+        tool: &str,
+        phase: ToolPhase,
+        detail: &str,
+    ) {
+        if let Some(id) = subagent_id {
+            self.subagent_tool(run_id, id, tool, phase, detail).await;
+            return;
+        }
         let mut state = self.state.lock().await;
         if Self::active_run_locked(&state, run_id).is_ok() {
             self.emit_locked(
@@ -334,16 +424,217 @@ impl Kernel {
                     tool: tool.into(),
                     phase,
                     detail: detail.into(),
+                    subagent_id: None,
                 },
             );
         }
     }
 
+    pub(crate) fn register_subagent_cancel(&self, id: String, sender: watch::Sender<bool>) {
+        self.subagent_cancels.lock().unwrap().insert(id, sender);
+    }
+
+    pub(crate) fn unregister_subagent_cancel(&self, id: &str) {
+        self.subagent_cancels.lock().unwrap().remove(id);
+    }
+
+    /// Stop one child without touching its siblings or the parent run.
+    pub async fn cancel_subagent(&self, run_id: i64, subagent_id: &str) -> AppResult<()> {
+        {
+            let state = self.state.lock().await;
+            Self::active_run_locked(&state, run_id)?;
+        }
+        if let Some(sender) = self.subagent_cancels.lock().unwrap().get(subagent_id) {
+            let _ = sender.send(true);
+        }
+        Ok(())
+    }
+
+    /// Persist and announce a new child trace. Called before the first turn so
+    /// the drill-down can open immediately.
+    pub async fn start_subagent(&self, view: SubagentView) -> AppResult<()> {
+        self.database.insert_subagent_trace(view.clone()).await?;
+        self.subagents
+            .lock()
+            .unwrap()
+            .insert(view.id.clone(), view.clone());
+        let mut state = self.state.lock().await;
+        self.emit_locked(
+            &mut state,
+            EventData::SubagentStarted {
+                run_id: view.run_id,
+                subagent: view,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn subagent_token(
+        &self,
+        run_id: i64,
+        subagent_id: &str,
+        kind: SubagentTokenKind,
+        token: &str,
+    ) {
+        {
+            let mut map = self.subagents.lock().unwrap();
+            if let Some(view) = map.get_mut(subagent_id) {
+                match kind {
+                    SubagentTokenKind::Content => view.content.push_str(token),
+                    SubagentTokenKind::Reasoning => view.reasoning.push_str(token),
+                }
+            }
+        }
+        let mut state = self.state.lock().await;
+        if Self::active_run_locked(&state, run_id).is_ok() {
+            self.emit_locked(
+                &mut state,
+                EventData::SubagentToken {
+                    run_id,
+                    subagent_id: subagent_id.into(),
+                    kind,
+                    token: token.into(),
+                },
+            );
+        }
+    }
+
+    pub(crate) async fn subagent_tool(
+        &self,
+        run_id: i64,
+        subagent_id: &str,
+        tool: &str,
+        phase: ToolPhase,
+        detail: &str,
+    ) {
+        {
+            let mut map = self.subagents.lock().unwrap();
+            if let Some(view) = map.get_mut(subagent_id) {
+                Self::apply_trace_tool(view, tool, phase, detail);
+            }
+        }
+        let mut state = self.state.lock().await;
+        if Self::active_run_locked(&state, run_id).is_ok() {
+            self.emit_locked(
+                &mut state,
+                EventData::SubagentTool {
+                    run_id,
+                    subagent_id: subagent_id.into(),
+                    tool: tool.into(),
+                    phase,
+                    detail: detail.into(),
+                },
+            );
+        }
+    }
+
+    /// Persist the terminal trace state and notify the UI.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_subagent(
+        &self,
+        subagent_id: &str,
+        status: SubagentStatus,
+        summary: String,
+        error: Option<String>,
+        content: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> AppResult<()> {
+        let mut view = self
+            .subagents
+            .lock()
+            .unwrap()
+            .get(subagent_id)
+            .cloned()
+            .ok_or("Subagent trace not found")?;
+        let finished_at = crate::domain::unix_now();
+        view.status = status;
+        view.summary = summary.clone();
+        view.error = error.clone();
+        view.content = content;
+        view.tool_count = view.tools.len();
+        view.input_tokens = input_tokens.or(view.input_tokens);
+        view.output_tokens = output_tokens.or(view.output_tokens);
+        view.finished_at = Some(finished_at);
+        self.database
+            .finish_subagent_trace(
+                view.id.clone(),
+                status,
+                summary.clone(),
+                error.clone(),
+                view.content.clone(),
+                view.tools.clone(),
+                view.input_tokens,
+                view.output_tokens,
+                finished_at,
+            )
+            .await?;
+        self.subagents
+            .lock()
+            .unwrap()
+            .insert(view.id.clone(), view.clone());
+        self.unregister_subagent_cancel(subagent_id);
+        let mut state = self.state.lock().await;
+        if Self::active_run_locked(&state, view.run_id).is_ok() {
+            self.emit_locked(
+                &mut state,
+                EventData::SubagentFinished {
+                    run_id: view.run_id,
+                    subagent_id: view.id.clone(),
+                    status,
+                    summary,
+                    error,
+                    tool_count: view.tool_count,
+                    input_tokens: view.input_tokens,
+                    output_tokens: view.output_tokens,
+                    finished_at,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn list_subagent_traces(&self, session_id: i64) -> AppResult<Vec<SubagentView>> {
+        let mut traces = self.database.list_subagent_traces(session_id).await?;
+        let live = self.subagents.lock().unwrap();
+        for trace in &mut traces {
+            if let Some(view) = live.get(&trace.id) {
+                *trace = view.clone();
+            }
+        }
+        Ok(traces)
+    }
+
+    /// Bounded report block injected into later turns of the same session.
+    pub async fn recent_subagent_reports(&self, session_id: i64) -> AppResult<String> {
+        let traces = self
+            .database
+            .recent_subagent_reports(session_id, 6)
+            .await?;
+        Ok(Self::format_subagent_reports(&traces))
+    }
+
+    pub(crate) async fn record_spawn(
+        &self,
+        run_id: i64,
+        subagent_id: &str,
+        description: &str,
+    ) {
+        let _ = self
+            .database
+            .record_tool(
+                run_id,
+                "spawn_subagent".into(),
+                format!("{subagent_id} · {description}"),
+                true,
+            )
+            .await;
+    }
+
     /// The only registered tool dispatcher. No frontend-selected effect or arbitrary SQL/path.
     /// Exercised by the kernel test suite; the agent loop uses execute_model_tool.
     #[allow(dead_code)]
-    pub(crate) async fn dispatch_tool(
-        &self,
+    pub(crate) async fn dispatch_tool(        &self,
         run_id: i64,
         tool: &str,
     ) -> AppResult<serde_json::Value> {
@@ -387,13 +678,21 @@ impl Kernel {
         self.router.tool_specs(mode).await
     }
 
-    /// Record a blocked call in the audit log and emit the Blocked phase.
-    async fn block_tool(&self, run_id: i64, tool: &str, reason: String) -> AppResult<String> {
-        let _ = self
-            .database
-            .record_tool(run_id, tool.into(), reason.clone(), false)
+    async fn block_tool_scoped(
+        &self,
+        run_id: i64,
+        subagent_id: Option<&str>,
+        tool: &str,
+        reason: String,
+    ) -> AppResult<String> {
+        if subagent_id.is_none() {
+            let _ = self
+                .database
+                .record_tool(run_id, tool.into(), reason.clone(), false)
+                .await;
+        }
+        self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Blocked, &reason)
             .await;
-        self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
         Err(reason)
     }
 
@@ -412,10 +711,106 @@ impl Kernel {
         Ok(())
     }
 
+    /// Ask the user a structured question and wait for the answer. The UI
+    /// opens a modal from the `UserQuestion` event; `answer_user_question`
+    /// resolves it. Cancellation resolves the wait as an error.
+    pub async fn ask_user(
+        &self,
+        run_id: i64,
+        arguments_json: &str,
+        mut cancel: watch::Receiver<bool>,
+    ) -> AppResult<String> {
+        let arguments: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+        let questions = parse_questions(&arguments)?;
+        let request_id = format!("q-{run_id}-{}", QUESTION_SEQ.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut state = self.state.lock().await;
+            Self::active_run_locked(&state, run_id)?;
+            let control = state.control.as_mut().ok_or("Run has no control channel")?;
+            control.pending_question = Some(PendingQuestion {
+                request_id: request_id.clone(),
+                questions: questions.clone(),
+                responder: tx,
+            });
+            self.emit_locked(
+                &mut state,
+                EventData::UserQuestion {
+                    run_id,
+                    request_id: request_id.clone(),
+                    questions: questions.clone(),
+                },
+            );
+        }
+        self.emit_tool(run_id, "ask_user", ToolPhase::Started, &format!("{} 个问题", questions.len()))
+            .await;
+        let answer = tokio::select! {
+            biased;
+            result = rx => result.ok().flatten(),
+            _ = cancel.changed() => None,
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(control) = state.control.as_mut() {
+                if control
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    control.pending_question = None;
+                }
+            }
+        }
+        let Some(answers) = answer else {
+            self.emit_tool(run_id, "ask_user", ToolPhase::Failed, "用户取消了提问")
+                .await;
+            return Err("用户取消了提问".into());
+        };
+        let result = format_answers(&questions, &answers);
+        let payload = serde_json::json!({
+            "requestId": request_id,
+            "questions": questions,
+            "answers": answers,
+        })
+        .to_string();
+        let payload = payload.chars().take(8192).collect::<String>();
+        let _ = self
+            .database
+            .record_tool(run_id, "ask_user".into(), payload.clone(), true)
+            .await;
+        self.emit_tool(run_id, "ask_user", ToolPhase::Finished, &payload)
+            .await;
+        Ok(result)
+    }
+
+    /// Resolve the active `ask_user` suspension with structured answers.
+    pub async fn answer_user_question(
+        &self,
+        run_id: i64,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> AppResult<()> {
+        let mut state = self.state.lock().await;
+        Self::active_run_locked(&state, run_id)?;
+        let control = state.control.as_mut().ok_or("Run has no control channel")?;
+        let questions = control
+            .pending_question
+            .as_ref()
+            .filter(|pending| pending.request_id == request_id)
+            .map(|pending| pending.questions.clone())
+            .ok_or("没有等待回答的提问")?;
+        validate_answers(&questions, &answers)?;
+        let pending = control.pending_question.take().ok_or("没有等待回答的提问")?;
+        let _ = pending.responder.send(Some(answers));
+        Ok(())
+    }
+
     /// Execute one model-requested tool call: classify, apply the mode gate
     /// (deny / suspend-for-approval / allow), route, audit, and return bounded
     /// text for the next conversation turn. The approval wait never holds the
     /// commands lock, so cancel/resolve/shutdown can always interpose.
+    #[cfg(test)]
     pub(crate) async fn execute_model_tool(
         &self,
         run_id: i64,
@@ -438,17 +833,41 @@ impl Kernel {
         run_id: i64,
         calls: &[(String, String)],
     ) -> Vec<AppResult<String>> {
-        self.execute_tool_calls_as(run_id, calls, None).await
+        self.execute_tool_calls_scoped(run_id, calls, None, None).await
     }
 
     /// Same batch semantics, but the caller may pin the authorization mode.
     /// Subagents pass `Mode::Plan` so a hallucinated write/command is denied
     /// instead of inheriting the parent run's mode.
+    #[cfg(test)]
     pub(crate) async fn execute_tool_calls_as(
         &self,
         run_id: i64,
         calls: &[(String, String)],
         mode: Option<Mode>,
+    ) -> Vec<AppResult<String>> {
+        self.execute_tool_calls_scoped(run_id, calls, mode, None).await
+    }
+
+    /// Child-scoped batch: tool lifecycle goes to `SubagentTool`, never to the
+    /// parent timeline, and the child trace owns the persisted record.
+    pub(crate) async fn execute_subagent_tool_calls(
+        &self,
+        run_id: i64,
+        subagent_id: &str,
+        calls: &[(String, String)],
+        mode: Option<Mode>,
+    ) -> Vec<AppResult<String>> {
+        self.execute_tool_calls_scoped(run_id, calls, mode, Some(subagent_id))
+            .await
+    }
+
+    async fn execute_tool_calls_scoped(
+        &self,
+        run_id: i64,
+        calls: &[(String, String)],
+        mode: Option<Mode>,
+        subagent_id: Option<&str>,
     ) -> Vec<AppResult<String>> {
         enum Gate {
             Denied(AppResult<String>),
@@ -469,13 +888,14 @@ impl Kernel {
         let mut suspended = Vec::new();
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             let target = ToolRouter::call_target(tool, arguments_json);
-            self.emit_tool(run_id, tool, ToolPhase::Started, &target).await;
+            self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
             let gate = match self.router.classify(tool).await {
-                Err(reason) => Gate::Denied(self.block_tool(run_id, tool, reason).await),
+                Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
                 Ok(effect) => match policy::gate_with_args(mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
                     ToolGate::Deny => Gate::Denied(
-                        self.block_tool(
+                        self.block_tool_scoped(
                             run_id,
+                            subagent_id,
                             tool,
                             format!("Plan Mode blocked tool: {tool}; only read tools are allowed"),
                         )
@@ -511,7 +931,7 @@ impl Kernel {
                     .router
                     .approval_preview(&calls[index].0, &calls[index].1)
                     .await;
-                self.emit_tool(run_id, &calls[index].0, ToolPhase::AwaitingApproval, &preview)
+                self.emit_tool_scoped(run_id, subagent_id, &calls[index].0, ToolPhase::AwaitingApproval, &preview)
                     .await;
             }
             waiting && rx.await.unwrap_or(false)
@@ -530,7 +950,7 @@ impl Kernel {
             for ((tool, arguments_json), outcome) in calls.iter().zip(outcomes) {
                 let target = ToolRouter::call_target(tool, arguments_json);
                 results.push(
-                    self.finish_tool_outcome(run_id, run.session_id, tool, &target, "extension", ToolEffect::ReadOnly, outcome)
+                    self.finish_tool_outcome(run_id, run.session_id, subagent_id, tool, &target, "extension", ToolEffect::ReadOnly, outcome)
                         .await,
                 );
             }
@@ -556,7 +976,7 @@ impl Kernel {
             match &mut gates[index] {
                 Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
                 Gate::Suspended(_) if !approved => {
-                    results.push(self.block_tool(run_id, tool, "用户拒绝了该操作".into()).await);
+                    results.push(self.block_tool_scoped(run_id, subagent_id, tool, "用户拒绝了该操作".into()).await);
                 }
                 Gate::Allow(effect) | Gate::Suspended(effect) => {
                     let audit = if suspended.contains(&index) {
@@ -566,7 +986,7 @@ impl Kernel {
                     };
                     let target = ToolRouter::call_target(tool, arguments_json);
                     results.push(
-                        self.finish_tool(run_id, run.session_id, tool, arguments_json, &target, audit, *effect)
+                        self.finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, audit, *effect)
                             .await,
                     );
                 }
@@ -575,8 +995,62 @@ impl Kernel {
         results
     }
 
-fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
-    let a: Vec<&str> = before.split('\n').collect();
+fn apply_trace_tool(view: &mut SubagentView, tool: &str, phase: ToolPhase, detail: &str) {
+    let pending = view
+        .tools
+        .iter()
+        .position(|call| call.tool == tool && call.pending == Some(true));
+    let entry = ToolCallView {
+        run_id: view.run_id,
+        tool: tool.into(),
+        detail: detail.into(),
+        allowed: !matches!(phase, ToolPhase::Failed | ToolPhase::Blocked),
+        subagent_id: Some(view.id.clone()),
+        pending: matches!(phase, ToolPhase::Started | ToolPhase::AwaitingApproval).then_some(true),
+        target: (phase == ToolPhase::Started).then(|| detail.to_string()),
+    };
+    match pending {
+        Some(index) => {
+            let target = view.tools[index].target.clone().or(entry.target);
+            view.tools[index] = ToolCallView { target, ..entry };
+        }
+        None => view.tools.push(entry),
+    }
+}
+
+fn format_subagent_reports(traces: &[SubagentView]) -> String {
+    let mut body = String::new();
+    for trace in traces {
+        let summary: String = trace.summary.chars().take(4000).collect();
+        if summary.trim().is_empty() {
+            continue;
+        }
+        let indented = summary
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = format!(
+            "- [{}] {} · {} · {} 次工具\n{}\n",
+            trace.agent,
+            trace.description,
+            trace.status.label(),
+            trace.tool_count,
+            indented
+        );
+        if body.len() + block.len() > 16_000 {
+            break;
+        }
+        body.push_str(&block);
+    }
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("## 本会话此前的子智能体报告（只读证据，不要当作新任务）\n{body}")
+    }
+}
+
+fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&str> = before.split('\n').collect();
     let b: Vec<&str> = after.split('\n').collect();
     if a.len() * b.len() > 4_000_000 {
         return (b.len() as i64, a.len() as i64);
@@ -602,6 +1076,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         &self,
         run_id: i64,
         session_id: i64,
+        subagent_id: Option<&str>,
         tool: &str,
         arguments_json: &str,
         target: &str,
@@ -609,7 +1084,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         effect: ToolEffect,
     ) -> AppResult<String> {
         let outcome = self.router.execute(session_id, tool, arguments_json).await;
-        self.finish_tool_outcome(run_id, session_id, tool, target, audit, effect, outcome)
+        self.finish_tool_outcome(run_id, session_id, subagent_id, tool, target, audit, effect, outcome)
             .await
     }
 
@@ -617,6 +1092,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         &self,
         run_id: i64,
         session_id: i64,
+        subagent_id: Option<&str>,
         tool: &str,
         target: &str,
         audit: &str,
@@ -634,9 +1110,11 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
                 } else {
                     format!("{audit} · {target}")
                 };
-                self.database
-                    .record_tool(run_id, tool.into(), detail, true)
-                    .await?;
+                if subagent_id.is_none() {
+                    self.database
+                        .record_tool(run_id, tool.into(), detail, true)
+                        .await?;
+                }
                 if let Some(steps) = &outcome.plan {
                     let mut state = self.state.lock().await;
                     if Self::active_run_locked(&state, run_id).is_ok() {
@@ -660,7 +1138,8 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
                     .to_string(),
                     None => outcome.text.chars().take(2048).collect::<String>(),
                 };
-                self.emit_tool(run_id, tool, ToolPhase::Finished, &event_detail).await;
+                self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Finished, &event_detail)
+                    .await;
                 if effect != ToolEffect::ReadOnly {
                     let mut state = self.state.lock().await;
                     self.emit_locked(&mut state, EventData::WorkspaceChanged);
@@ -668,11 +1147,14 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
                 Ok(outcome.text)
             }
             Err(reason) => {
-                let _ = self
-                    .database
-                    .record_tool(run_id, tool.into(), reason.clone(), false)
+                if subagent_id.is_none() {
+                    let _ = self
+                        .database
+                        .record_tool(run_id, tool.into(), reason.clone(), false)
+                        .await;
+                }
+                self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Failed, &reason)
                     .await;
-                self.emit_tool(run_id, tool, ToolPhase::Failed, &reason).await;
                 Err(reason)
             }
         }
@@ -949,12 +1431,65 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
     /// Streaming metrics updates reach the UI as events; only the terminal
     /// report is durable in SQLite.
     pub(crate) async fn report_metrics(&self, metrics: RunMetrics, persist: bool) -> AppResult<()> {
+        let cumulative = {
+            let mut map = self.metrics_acc.lock().unwrap();
+            let acc = map.entry(metrics.run_id).or_default();
+            if persist {
+                acc.input = sum_tokens(acc.input, metrics.input_tokens);
+                acc.output = sum_tokens(acc.output, metrics.output_tokens);
+                acc.cache = sum_tokens(acc.cache, metrics.cache_hit_tokens);
+                acc.cache_write = sum_tokens(acc.cache_write, metrics.cache_write_tokens);
+                acc.reasoning = sum_tokens(acc.reasoning, metrics.reasoning_tokens);
+                acc.attempts += 1;
+                acc.elapsed += metrics.elapsed_ms;
+                acc.first += metrics.first_token_ms.unwrap_or(0);
+                acc.current = None;
+                RunMetrics {
+                    run_id: metrics.run_id,
+                    session_id: metrics.session_id,
+                    provider: metrics.provider.clone(),
+                    model: metrics.model.clone(),
+                    input_tokens: acc.input,
+                    output_tokens: acc.output,
+                    cache_hit_tokens: acc.cache,
+                    cache_write_tokens: acc.cache_write,
+                    reasoning_tokens: acc.reasoning,
+                    attempts: acc.attempts,
+                    last_input_tokens: metrics.input_tokens,
+                    last_output_tokens: metrics.output_tokens,
+                    last_elapsed_ms: metrics.elapsed_ms,
+                    last_first_token_ms: metrics.first_token_ms,
+                    elapsed_ms: acc.elapsed,
+                    first_token_ms: Some(acc.first),
+                }
+            } else {
+                acc.current = Some(metrics.clone());
+                RunMetrics {
+                    run_id: metrics.run_id,
+                    session_id: metrics.session_id,
+                    provider: metrics.provider.clone(),
+                    model: metrics.model.clone(),
+                    input_tokens: sum_tokens(acc.input, metrics.input_tokens),
+                    output_tokens: sum_tokens(acc.output, metrics.output_tokens),
+                    cache_hit_tokens: sum_tokens(acc.cache, metrics.cache_hit_tokens),
+                    cache_write_tokens: sum_tokens(acc.cache_write, metrics.cache_write_tokens),
+                    reasoning_tokens: sum_tokens(acc.reasoning, metrics.reasoning_tokens),
+                    attempts: acc.attempts + 1,
+                    last_input_tokens: metrics.input_tokens,
+                    last_output_tokens: metrics.output_tokens,
+                    last_elapsed_ms: metrics.elapsed_ms,
+                    last_first_token_ms: metrics.first_token_ms,
+                    elapsed_ms: acc.elapsed + metrics.elapsed_ms,
+                    first_token_ms: Some(acc.first + metrics.first_token_ms.unwrap_or(0)),
+                }
+            }
+        };
         if persist {
-            self.database.save_metrics(metrics.clone()).await?;
+            self.database.save_metrics(cumulative.clone()).await?;
         }
         self.emit_locked(
             &mut *self.state.lock().await,
-            EventData::Metrics { metrics },
+            EventData::Metrics { metrics: cumulative },
         );
         Ok(())
     }
@@ -1022,6 +1557,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {
         }
         state.control = None;
         state.cancelled_run = None;
+        self.metrics_acc.lock().unwrap().remove(&run_id);
         self.emit_locked(&mut state, EventData::Status { run });
         self.emit_locked(&mut state, EventData::SessionsChanged);
     }
@@ -1254,6 +1790,7 @@ mod tests {
             done,
             finishing: false,
             pending: None,
+            pending_question: None,
         });
         (id, receiver)
     }

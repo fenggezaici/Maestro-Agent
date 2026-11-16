@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from './ui/dialog';
 import * as Slider from '@radix-ui/react-slider';
 import { Bot, BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
 import AgentsSettings from './AgentsSettings';
@@ -33,8 +33,8 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
   const update = (patch: Partial<UiPreferences>) => onPreferences({ ...preferences, ...patch });
 
   return <>
-    <Dialog.Root open={open} onOpenChange={(value) => { setCapture(null); onOpenChange(value); }}>
-    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" /><Dialog.Content className="ide-settings-panel" onEscapeKeyDown={(event) => { if (capture) { event.preventDefault(); setCapture(null); } }} onKeyDown={(event) => {
+    <Dialog open={open} onOpenChange={(value) => { setCapture(null); onOpenChange(value); }}>
+    <DialogContent variant="panel" className="ide-settings-panel" showClose={false} onEscapeKeyDown={(event) => { if (capture) { event.preventDefault(); setCapture(null); } }} onKeyDown={(event) => {
       if (!capture || event.nativeEvent.isComposing) return;
       event.preventDefault(); event.stopPropagation();
       if (event.key === 'Escape') { setCapture(null); return; }
@@ -43,11 +43,11 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
       try { onPreferences(bindShortcut(preferences, capture, chord)); setCapture(null); setBindingError(null); }
       catch (error) { setBindingError(error instanceof Error ? error.message : '无效快捷键'); }
     }}>
-      <div className="settings-rail"><Dialog.Title><Settings2 size={17} />{text.settings}</Dialog.Title>
+      <div className="settings-rail"><DialogTitle><Settings2 size={17} />{text.settings}</DialogTitle>
         <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{(text as Record<string, string>)[id === 'agents' ? 'subagents' : id]}</button>)}</nav>
         <span className="settings-version">MAESTRO / 桌面版</span>
       </div>
-      <div className="settings-content"><Dialog.Description className="settings-intro">{preview ? '前端预览 · 无真实配置读取或执行' : '连接配置与思考强度真实保存；上下文为模型能力参考，实际限制以服务端为准。'}</Dialog.Description>
+      <div className="settings-content"><DialogDescription className="settings-intro">{preview ? '前端预览 · 无真实配置读取或执行' : '连接配置与思考强度真实保存；上下文为模型能力参考，实际限制以服务端为准。'}</DialogDescription>
         <h3>{(text as Record<string, string>)[section === 'agents' ? 'subagents' : section]}</h3>
         <div hidden={section !== 'general'}>
           <div className="preference-row"><div><strong>语言</strong><p>前端导航与设置标签</p></div><Choice label="界面语言" value={preferences.language} onChange={(value) => update({ language: value as UiPreferences['language'] })} options={[{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }]} /></div>
@@ -115,7 +115,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
           {bindingError && <p role="alert" className="settings-form-error">{bindingError}</p>}
         </div>
       </div>
-      <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭设置"><X size={16} /></button></Dialog.Close>
+      <DialogClose asChild><button type="button" className="icon-button dialog-close" aria-label="关闭设置"><X size={16} /></button></DialogClose>
       {customDraft && <div className="custom-provider-dialog" role="dialog" aria-label="自定义供应商"
         onClick={(event) => { if (event.target === event.currentTarget) setCustomDraft(null); }}>
         <div className="custom-provider-card">
@@ -144,8 +144,8 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
           </div>
         </div>
       </div>}
-    </Dialog.Content></Dialog.Portal>
-  </Dialog.Root>
+    </DialogContent>
+  </Dialog>
   <ConfirmDialog open={deleteProvider !== null} onOpenChange={(open) => { if (!open) setDeleteProvider(null); }}
     title="删除自定义供应商"
     description={deleteProvider ? `删除自定义供应商「${deleteProvider.name}」及其本地配置？此操作不可撤销。` : ''}

@@ -63,6 +63,9 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Explicit "restore on startup" intent; imported servers default off.
+    #[serde(default)]
+    pub auto_start: bool,
     /// Explicit user opt-in for this server's `readOnlyHint`. Default false:
     /// an untrusted server's tools always count as side-effecting.
     #[serde(default)]
@@ -94,6 +97,7 @@ pub struct McpServerView {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub disabled: bool,
+    pub auto_start: bool,
     pub trust: bool,
     pub running: bool,
     pub tool_count: usize,

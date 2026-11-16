@@ -145,6 +145,8 @@ pub enum StreamEvent {
         input: Option<u64>,
         output: Option<u64>,
         cache_hit: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
     },
     Done,
 }
@@ -400,7 +402,7 @@ pub(crate) async fn stream_common(
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
             }
-            Some(Err(_)) => return Err("读取模型流失败，网络连接已中断".into()),
+            Some(Err(error)) => return Err(format!("读取模型流失败，网络连接已中断：{}", config.redact(&error.to_string()).chars().take(200).collect::<String>())),
             None => {
                 if process(decoder.finish()?, parser, &events)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });

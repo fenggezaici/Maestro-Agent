@@ -166,6 +166,7 @@ pub async fn add_mcp_server(
             args: args.unwrap_or_default(),
             env: env.unwrap_or_default(),
             disabled: false,
+            auto_start: false,
             trust: trust.unwrap_or(false),
         },
     )

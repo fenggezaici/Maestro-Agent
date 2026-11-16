@@ -23,6 +23,7 @@ export interface McpServerView {
   args: string[];
   env: Record<string, string>;
   disabled: boolean;
+  autoStart: boolean;
   /** Explicit user opt-in for honoring this server's readOnlyHint. */
   trust: boolean;
   running: boolean;

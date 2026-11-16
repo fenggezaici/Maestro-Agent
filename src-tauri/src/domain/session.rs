@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{metrics::RunMetrics, plan::PlanCard};
 
@@ -116,13 +116,21 @@ pub struct SessionDetail {
     pub tools: Vec<ToolCallView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallView {
     pub run_id: i64,
     pub tool: String,
     pub detail: String,
     pub allowed: bool,
+    /// Set for `spawn_subagent` rows so the UI can open the matching trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    /// Live child-trace rows carry the lifecycle flags the UI renders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[cfg(test)]

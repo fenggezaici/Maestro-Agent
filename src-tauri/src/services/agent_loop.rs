@@ -2,7 +2,7 @@
 //! adapter streams normalized `StreamEvent`s over a channel; this service
 //! relays them to the kernel as typed domain events, executes tool calls via
 //! the kernel's authorized path, and feeds results back for the next turn.
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
 
 use futures_util::future::join_all;
 
@@ -12,7 +12,7 @@ use crate::{
     adapters::llm::{ChatConfig, LlmProvider, StreamEvent, TurnOutcome},
     domain::{
         AppResult, ChatMessage, Mode, RunMetrics, RunStatus, RunView, SessionDetail,
-        ToolPhase, ToolSpec,
+        SubagentStatus, SubagentTokenKind, SubagentView, ToolPhase, ToolSpec,
     },
     services::kernel::Kernel,
 };
@@ -31,13 +31,28 @@ const SANDBOX_HINT: &str = "如果任务需要工作区之外的文件（例如�
 /// Task-tracker discipline: the model must publish a plan before multi-step
 /// work and refresh it after every finished step, otherwise the UI panel has
 /// nothing to render.
-const SUBAGENT_HINT: &str = "当任务需要同时分析多个独立文件/目录，或需要并行只读调研时，优先在同一轮调用多个 spawn_subagent（最多 4 个），并选择合适的 subagent_type：explore 用于代码调研，general 用于分析总结。单文件读取或简单顺序任务不要使用。子智能体只读，不能写文件或执行命令；把返回摘要作为证据。";
+const SUBAGENT_HINT: &str = "当任务需要同时分析多个独立文件/目录，或需要并行只读调研时，优先在同一轮调用多个 spawn_subagent（最多 3 个），并选择合适的 subagent_type：explore 用于代码调研，general 用于分析总结。单文件读取或简单顺序任务不要使用。子智能体只读，不能写文件或执行命令；把返回摘要作为证据。";
 
 /// Fallback instruction when a user-defined agent has an empty prompt body.
 const DEFAULT_SUBAGENT_PROMPT: &str = "你是只读研究子智能体。只使用提供的只读工具分析，不写文件、不执行命令；完成后用简洁中文给出结论、证据路径和风险。";
 
-/// Fan-out guard: one parent turn may run this many children at once.
-const MAX_PARALLEL_SUBAGENTS: usize = 4;
+/// Efficiency budget: broad research otherwise reads every file until timeout.
+const SUBAGENT_BUDGET_HINT: &str = "效率要求：先列出最关键的文件清单，再批量读取；不要重复读取同一文件；最多使用 20 次工具调用；接近预算或时间上限时立即输出已有结论、证据路径与风险，不要继续尝试。";
+
+/// A child that stops producing progress must not hold the parent turn forever.
+const SUBAGENT_TOOL_BUDGET: usize = 20;
+
+fn subagent_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("MAESTRO_SUBAGENT_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (60..=1800).contains(value))
+            .unwrap_or(600),
+    )
+}
+/// Partial findings kept when a child times out or exhausts its step budget.
+const SUBAGENT_PARTIAL_BYTES: usize = 16384;
 
 const TASK_PLAN_HINT: &str = "在执行涉及多个文件或步骤的复杂任务前，必须先调用 update_plan 列出计划（每个步骤包含 id、description、status；初始为 pending，当前要做的步骤为 in_progress）。在后续执行中，每完成一步，必须重新调用 update_plan 提交完整步骤列表并更新各步状态；全部完成时所有步骤都应为 completed。简单的单步任务可以跳过。";
 
@@ -83,6 +98,20 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
     messages
 }
 
+/// Same as `conversation`, plus a bounded block of earlier child reports so a
+/// follow-up turn can still cite what subagents found in previous runs.
+pub fn conversation_with_reports(
+    detail: &SessionDetail,
+    run: &RunView,
+    reports: &str,
+) -> Vec<ChatMessage> {
+    let mut messages = conversation(detail, run);
+    if !reports.trim().is_empty() {
+        messages.insert(1, ChatMessage::text("system", reports));
+    }
+    messages
+}
+
 /// One provider turn with event relay. Returns when the provider's stream
 /// terminates (Done → `TurnOutcome`) or the run is cancelled.
 async fn stream_turn(
@@ -120,6 +149,13 @@ async fn stream_turn(
                 input_tokens: None,
                 output_tokens: None,
                 cache_hit_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                attempts: 0,
+                last_input_tokens: None,
+                last_output_tokens: None,
+                last_elapsed_ms: 0,
+                last_first_token_ms: None,
                 elapsed_ms: 0,
                 first_token_ms: None,
             };
@@ -145,10 +181,12 @@ async fn stream_turn(
                             reported = Instant::now();
                         }
                     }
-                    StreamEvent::Usage { input, output, cache_hit } => {
+                    StreamEvent::Usage { input, output, cache_hit, cache_write, reasoning } => {
                         metrics.input_tokens = input.or(metrics.input_tokens);
                         metrics.output_tokens = output.or(metrics.output_tokens);
                         metrics.cache_hit_tokens = cache_hit.or(metrics.cache_hit_tokens);
+                        metrics.cache_write_tokens = cache_write.or(metrics.cache_write_tokens);
+                        metrics.reasoning_tokens = reasoning.or(metrics.reasoning_tokens);
                     }
                     StreamEvent::Done => {
                         metrics.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -163,14 +201,46 @@ async fn stream_turn(
     outcome
 }
 
-/// Read-only research subagent. It never writes files or runs commands; its
-/// final text is returned to the parent model as a tool result.
+/// Read-only research subagent with its own persisted trace. It never writes
+/// files or runs commands; the final text is returned to the parent model and
+/// stored in the drill-down.
+struct ChildOutcome {
+    status: SubagentStatus,
+    content: String,
+    error: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    tool_count: usize,
+}
+
+fn next_subagent_id(run_id: i64) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("sa-{run_id}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// OpenCode gateways route by `x-opencode-session`; a child must not share the
+/// parent's id or concurrent streams get cut mid-flight.
+fn child_session_id(parent: Option<&str>, subagent_id: &str) -> String {
+    format!("{}-sub-{subagent_id}", parent.unwrap_or("maestro"))
+}
+
+fn max_parallel_subagents() -> usize {
+    std::env::var("MAESTRO_MAX_SUBAGENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=4).contains(value))
+        .unwrap_or(2)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     kernel: Arc<Kernel>,
     config: &ChatConfig,
-    arguments_json: &str,
-    mut cancel: watch::Receiver<bool>,
+    session_id: i64,
     run_id: i64,
+    subagent_id: String,
+    arguments_json: &str,
+    mut parent_cancel: watch::Receiver<bool>,
 ) -> AppResult<String> {
     let arguments: serde_json::Value =
         serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -180,8 +250,6 @@ async fn run_subagent(
     if prompt.is_empty() || prompt.len() > 8192 {
         return Err("spawn_subagent 需要 1–8192 字节的 prompt".into());
     }
-    // `all` merges builtin < global < project, so agents created in Settings
-    // are resolvable here; hidden definitions are not offered by the tool enum.
     let available = kernel.list_agents("all".into()).await.unwrap_or_default();
     let names = available.iter()
         .filter(|agent| !agent.hidden && agent.mode == "subagent")
@@ -198,80 +266,196 @@ async fn run_subagent(
         api_key: config.api_key.clone(), base_url: config.base_url.clone(),
         model: definition.model.clone().unwrap_or_else(|| config.model.clone()),
         provider: config.provider, reasoning: config.reasoning.clone(),
-        max_output: config.max_output, session: config.session.clone(),
+        max_output: config.max_output,
+        session: Some(child_session_id(config.session.as_deref(), &subagent_id)),
     };
     let provider = kernel.llm_provider(&child_config);
     let allowed = definition.tools.clone();
     let tools: Vec<_> = kernel.agent_tools(Mode::Plan).await.into_iter()
         .filter(|tool| tool.name != "spawn_subagent" && (allowed.is_empty() || allowed.iter().any(|name| name == &tool.name)))
         .collect();
-    // Hard allowlist: a name outside the offered set never reaches the executor.
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
-    let system_prompt = if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() };
-    let mut messages = vec![ChatMessage::text("system", system_prompt), ChatMessage::text("user", prompt)];
-    for _ in 0..definition.steps.unwrap_or(8) {
-        if *cancel.borrow() {
-            return Err("子智能体已取消".into());
+    let system_prompt = format!("{}
+{SUBAGENT_BUDGET_HINT}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() });
+    let mut messages = vec![ChatMessage::text("system", system_prompt), ChatMessage::text("user", prompt.clone())];
+
+    kernel.start_subagent(SubagentView {
+        id: subagent_id.clone(),
+        run_id,
+        session_id,
+        agent: definition.name.clone(),
+        description: description.clone(),
+        prompt,
+        model: Some(child_config.model.clone()),
+        status: SubagentStatus::Running,
+        summary: String::new(),
+        error: None,
+        content: String::new(),
+        reasoning: String::new(),
+        tool_count: 0,
+        input_tokens: None,
+        output_tokens: None,
+        started_at: crate::domain::unix_now(),
+        finished_at: None,
+        tools: Vec::new(),
+    }).await?;
+
+    let (child_tx, mut cancel) = watch::channel(*parent_cancel.borrow());
+    kernel.register_subagent_cancel(subagent_id.clone(), child_tx.clone());
+    let forward = tokio::spawn(async move {
+        if parent_cancel.changed().await.is_ok() {
+            let _ = child_tx.send(true);
         }
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let outcome = provider
-            .clone()
-            .stream(&child_config, &messages, &tools, &mut cancel, tx)
-            .await?;
-        let mut text = String::new();
-        while let Ok(event) = rx.try_recv() {
-            if let StreamEvent::Token(token) = event {
-                text.push_str(&token);
+    });
+
+    let outcome = async {
+        let timeout = subagent_timeout();
+        let deadline = Instant::now() + timeout;
+        let mut notes = String::new();
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut tool_count = 0usize;
+        let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
+        for _ in 0..definition.steps.unwrap_or(8) {
+            if tool_count >= SUBAGENT_TOOL_BUDGET {
+                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{SUBAGENT_TOOL_BUDGET} 次），已返回部分结论")), input_tokens, output_tokens, tool_count };
             }
-        }
-        if !outcome.done {
-            return Err("子智能体已取消".into());
-        }
-        if outcome.tool_calls.is_empty() {
-            return Ok(format!("【子智能体 {description}】
-{}", text.trim()));
-        }
-        messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: text,
-            tool_calls: Some(outcome.tool_calls.clone()),
-            tool_call_id: None,
-            name: None,
-            images: None,
-        });
-        let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
-        let mut runnable: Vec<(String, String)> = Vec::new();
-        let mut runnable_indices: Vec<usize> = Vec::new();
-        for (index, call) in outcome.tool_calls.iter().enumerate() {
-            if allowed_names.iter().any(|name| name == &call.name) {
-                runnable.push((call.name.clone(), call.arguments.clone()));
-                runnable_indices.push(index);
-            } else {
-                results[index] = Some(Err(format!("子智能体不允许调用工具：{}", call.name)));
+            if *cancel.borrow() {
+                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, tool_count };
             }
-        }
-        if !runnable.is_empty() {
-            // Plan mode pins the gate to read-only regardless of the parent run's mode.
-            let executed = kernel.execute_tool_calls_as(run_id, &runnable, Some(Mode::Plan)).await;
-            for (index, result) in runnable_indices.into_iter().zip(executed) {
-                results[index] = Some(result);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
             }
-        }
-        for (call, result) in outcome.tool_calls.iter().zip(results) {
+            let mut attempt = 0;
+            let (outcome, text) = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
+                }
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let streamed = tokio::time::timeout(
+                    remaining,
+                    provider.clone().stream(&child_config, &messages, &tools, &mut cancel, tx),
+                ).await;
+                let mut partial = String::new();
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        StreamEvent::Token(token) => {
+                            partial.push_str(&token);
+                            kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Content, &token).await;
+                        }
+                        StreamEvent::Reasoning(token) => {
+                            kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Reasoning, &token).await;
+                        }
+                        StreamEvent::Usage { input, output, .. } => {
+                            input_tokens = input.or(input_tokens);
+                            output_tokens = output.or(output_tokens);
+                        }
+                        StreamEvent::Done => {}
+                    }
+                }
+                match streamed {
+                    Ok(Ok(outcome)) => break (outcome, partial),
+                    Ok(Err(error)) => {
+                        let retryable = attempt == 0
+                            && partial.trim().is_empty()
+                            && error.contains("网络连接已中断")
+                            && !*cancel.borrow();
+                        if retryable {
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        if !partial.trim().is_empty() {
+                            notes.push_str(&partial);
+                        }
+                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(error), input_tokens, output_tokens, tool_count };
+                    }
+                    Err(_) => {
+                        if !partial.trim().is_empty() {
+                            notes.push_str(&partial);
+                        }
+                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
+                    }
+                }
+            };
+            if !outcome.done {
+                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, tool_count };
+            }
+            if !text.trim().is_empty() {
+                notes.push_str(&text);
+                if notes.len() > SUBAGENT_PARTIAL_BYTES {
+                    notes = notes.chars().take(SUBAGENT_PARTIAL_BYTES).collect();
+                }
+            }
+            if outcome.tool_calls.is_empty() {
+                return ChildOutcome { status: SubagentStatus::Completed, content: text, error: None, input_tokens, output_tokens, tool_count };
+            }
             messages.push(ChatMessage {
-                role: "tool".into(),
-                content: match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                    Ok(value) => value.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
-                    Err(error) => format!("子智能体工具失败：{error}"),
-                },
-                tool_call_id: Some(call.id.clone()),
-                name: Some(call.name.clone()),
-                tool_calls: None,
+                role: "assistant".into(),
+                content: text,
+                tool_calls: Some(outcome.tool_calls.clone()),
+                tool_call_id: None,
+                name: None,
                 images: None,
             });
+            let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
+            let mut runnable: Vec<(String, String)> = Vec::new();
+            let mut runnable_indices: Vec<usize> = Vec::new();
+            for (index, call) in outcome.tool_calls.iter().enumerate() {
+                if allowed_names.iter().any(|name| name == &call.name) {
+                    runnable.push((call.name.clone(), call.arguments.clone()));
+                    runnable_indices.push(index);
+                } else {
+                    results[index] = Some(Err(format!("子智能体不允许调用工具：{}", call.name)));
+                }
+            }
+            tool_count += runnable.len();
+            if !runnable.is_empty() {
+                // Plan mode pins the gate to read-only regardless of the parent run's mode.
+                let executed = kernel.execute_subagent_tool_calls(run_id, &subagent_id, &runnable, Some(Mode::Plan)).await;
+                for (index, result) in runnable_indices.into_iter().zip(executed) {
+                    results[index] = Some(result);
+                }
+            }
+            for (call, result) in outcome.tool_calls.iter().zip(results) {
+                messages.push(ChatMessage {
+                    role: "tool".into(),
+                    content: match result.unwrap_or_else(|| Err("missing tool result".into())) {
+                        Ok(value) => value.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
+                        Err(error) => format!("子智能体工具失败：{error}"),
+                    },
+                    tool_call_id: Some(call.id.clone()),
+                    name: Some(call.name.clone()),
+                    tool_calls: None,
+                    images: None,
+                });
+            }
         }
+        ChildOutcome {
+            status: SubagentStatus::Completed,
+            content: notes,
+            error: Some("达到工具轮次上限，已返回部分结论".into()),
+            input_tokens,
+            output_tokens,
+            tool_count,
+        }
+    }.await;
+
+    forward.abort();
+    kernel.unregister_subagent_cancel(&subagent_id);
+    let ChildOutcome { status, content, error, input_tokens, output_tokens, tool_count } = outcome;
+    let header = format!("【子智能体 {}｜{}｜{} 次工具】", definition.name, status.label(), tool_count);
+    let summary = if content.trim().is_empty() { header.clone() } else { format!("{header}\n{}", content.trim()) };
+    let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens).await;
+    if status == SubagentStatus::Cancelled {
+        return Err("子智能体已取消".into());
     }
-    Ok(format!("【子智能体 {description}】达到工具轮次上限，未完成全部研究"))
+    if status == SubagentStatus::Failed && content.trim().is_empty() {
+        return Err(error.unwrap_or_else(|| "子智能体失败".into()));
+    }
+    Ok(summary)
 }
 
 pub(crate) async fn run(
@@ -285,7 +469,8 @@ pub(crate) async fn run(
             return Ok(false);
         }
         let detail = kernel.session_detail(run.session_id).await?;
-        let mut messages = conversation(&detail, &run);
+        let reports = kernel.recent_subagent_reports(run.session_id).await.unwrap_or_default();
+        let mut messages = conversation_with_reports(&detail, &run, &reports);
         let tools = kernel.agent_tools(run.mode).await;
         let provider = kernel.llm_provider(&config);
         let max_rounds = max_tool_rounds();
@@ -329,28 +514,41 @@ pub(crate) async fn run(
             let mut normal_calls: Vec<(String, String)> = Vec::new();
             let mut normal_indices: Vec<usize> = Vec::new();
             let mut spawns = Vec::new();
+            let mut asks = Vec::new();
             for (index, call) in outcome.tool_calls.iter().enumerate() {
                 if call.name == "spawn_subagent" {
-                    if spawns.len() >= MAX_PARALLEL_SUBAGENTS {
-                        results[index] = Some(Err(format!("同一轮最多运行 {MAX_PARALLEL_SUBAGENTS} 个子智能体")));
+                    if spawns.len() >= max_parallel_subagents() {
+                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", max_parallel_subagents())));
                         continue;
                     }
                     let description = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
                         .and_then(|value| value.get("description").and_then(|item| item.as_str()).map(str::to_string))
                         .unwrap_or_else(|| "研究子任务".into());
-                    kernel.emit_tool(run.id, "spawn_subagent", ToolPhase::Started, &description).await;
-                    spawns.push((index, call.arguments.clone(), description));
+                    let subagent_id = next_subagent_id(run.id);
+                    kernel.emit_spawn(run.id, &subagent_id, ToolPhase::Started, &description).await;
+                    kernel.record_spawn(run.id, &subagent_id, &description).await;
+                    spawns.push((index, subagent_id, call.arguments.clone(), description));
+                } else if call.name == "ask_user" {
+                    asks.push((index, call.arguments.clone()));
                 } else {
                     normal_calls.push((call.name.clone(), call.arguments.clone()));
                     normal_indices.push(index);
                 }
             }
-            let spawned = join_all(spawns.iter().map(|(_, arguments, _)| {
-                run_subagent(kernel.clone(), &config, arguments, cancel.clone(), run.id)
+            for (position, (index, arguments)) in asks.into_iter().enumerate() {
+                let result = if position == 0 {
+                    kernel.ask_user(run.id, &arguments, cancel.clone()).await
+                } else {
+                    Err("同一轮最多提出 1 个问题".into())
+                };
+                results[index] = Some(result);
+            }
+            let spawned = join_all(spawns.iter().map(|(_, subagent_id, arguments, _)| {
+                run_subagent(kernel.clone(), &config, run.session_id, run.id, subagent_id.clone(), arguments, cancel.clone())
             })).await;
-            for ((index, _, description), result) in spawns.into_iter().zip(spawned) {
+            for ((index, subagent_id, _, description), result) in spawns.into_iter().zip(spawned) {
                 let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
-                kernel.emit_tool(run.id, "spawn_subagent", if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
+                kernel.emit_spawn(run.id, &subagent_id, if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
                 results[index] = Some(result);
             }
             if !normal_calls.is_empty() {
@@ -405,4 +603,20 @@ pub(crate) async fn run(
     };
     // All terminal events follow database completion; transport never marks the UI done early.
     kernel.finish(run.id, status, error).await;
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_sessions_are_distinct_from_the_parent() {
+        assert_eq!(child_session_id(Some("maestro-7"), "sa-7-1"), "maestro-7-sub-sa-7-1");
+        assert_ne!(
+            child_session_id(Some("maestro-7"), "sa-7-1"),
+            child_session_id(Some("maestro-7"), "sa-7-2")
+        );
+        assert_eq!(child_session_id(None, "sa-7-1"), "maestro-sub-sa-7-1");
+    }
 }

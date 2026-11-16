@@ -142,12 +142,6 @@ button:disabled {
 
 /* Confirm dialog */
 .confirm-dialog {
-  position: fixed;
-  z-index: 130;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: min(420px, calc(100vw - 40px));
   padding: var(--space-5);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-2xl);

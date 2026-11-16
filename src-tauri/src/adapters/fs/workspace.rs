@@ -54,7 +54,7 @@ impl Default for WorkspaceService {
     fn default() -> Self {
         Self {
             root: Arc::new(RwLock::new(None)),
-            gate: Arc::new(Semaphore::new(1)),
+            gate: Arc::new(Semaphore::new(4)),
         }
     }
 }

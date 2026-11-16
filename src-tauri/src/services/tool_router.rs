@@ -271,6 +271,40 @@ impl ToolRouter {
             }),
         });
         tools.push(ToolSpec {
+            name: "ask_user".into(),
+            description: "向用户提出 1-4 个带选项的问题并等待回答（可自定义输入）。只在缺少关键信息或需要用户决策时使用，不要用它确认琐碎事项。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "header": { "type": "string" },
+                                "question": { "type": "string" },
+                                "multiSelect": { "type": "boolean" },
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                }
+                            },
+                            "required": ["id", "question", "options"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        });
+        tools.push(ToolSpec {
             name: "update_plan".into(),
             description: "更新当前任务的步骤计划（仅 UI 状态，无文件/命令副作用）。执行涉及多个文件或步骤的复杂任务前必须先调用本工具列出计划；之后每完成一步，必须重新提交完整的 steps 列表并更新各步状态。".into(),
             parameters: json!({
@@ -323,6 +357,14 @@ impl ToolRouter {
             "run_command" => arg("command").unwrap_or("").to_string(),
             "load_skill" => arg("name").unwrap_or("").to_string(),
             "spawn_subagent" => arg("description").unwrap_or("研究子任务").to_string(),
+            "ask_user" => arguments
+                .get("questions")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("question"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("提问")
+                .to_string(),
             "update_plan" => arguments
                 .get("steps")
                 .cloned()

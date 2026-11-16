@@ -4,7 +4,14 @@
 export interface ChatMessage { role: 'user' | 'assistant'; content: string; images?: string[] }
 
 export type Mode = 'plan' | 'code' | 'confirm' | 'auto';
-export interface RunMetrics { runId: number; sessionId: number; provider: string; model: string; inputTokens: number | null; outputTokens: number | null; cacheHitTokens?: number | null; elapsedMs: number; firstTokenMs: number | null }
+export interface RunMetrics {
+  runId: number; sessionId: number; provider: string; model: string;
+  inputTokens: number | null; outputTokens: number | null;
+  cacheHitTokens?: number | null; elapsedMs: number; firstTokenMs: number | null;
+  cacheWriteTokens?: number | null; reasoningTokens?: number | null;
+  attempts?: number; lastInputTokens?: number | null; lastOutputTokens?: number | null; lastElapsedMs?: number;
+  lastFirstTokenMs?: number | null;
+}
 export type RunStatus = 'running' | 'completed' | 'cancelled' | 'failed';
 
 export interface RunView {
@@ -55,7 +62,41 @@ export interface PlanCard {
   status: PlanStatus;
   draft: PlanDraft;
 }
-export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string }
+export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string; subagentId?: string }
+
+export interface QuestionOption { label: string; description?: string | null }
+export interface UserQuestion {
+  id: string;
+  header?: string | null;
+  question: string;
+  multiSelect?: boolean;
+  options: QuestionOption[];
+}
+export interface QuestionAnswer { questionId: string; selected: string[]; custom?: string | null }
+
+export type SubagentStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export interface SubagentView {
+  id: string;
+  runId: number;
+  sessionId: number;
+  agent: string;
+  description: string;
+  prompt: string;
+  model?: string | null;
+  status: SubagentStatus;
+  summary: string;
+  error?: string | null;
+  content: string;
+  reasoning: string;
+  toolCount: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  startedAt: number;
+  finishedAt?: number | null;
+  tools: ToolCallView[];
+  /** Live-only interleaved reasoning/tool/content timeline. */
+  timeline?: import('../lib/conversation').TimelineItem[];
+}
 
 /// Live task-tracker steps published by `update_plan`; per-session UI state.
 export type PlanStepStatus = 'pending' | 'in_progress' | 'completed';
@@ -85,6 +126,11 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'task_plan_updated'; runId: number; sessionId: number; steps: PlanStep[] }
   | { type: 'sessions_changed' }
   | { type: 'workspace_changed' }
-  | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }
+  | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string; subagentId?: string }
+  | { type: 'subagent_started'; runId: number; subagent: SubagentView }
+  | { type: 'subagent_tool'; runId: number; subagentId: string; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }
+  | { type: 'subagent_token'; runId: number; subagentId: string; kind: 'content' | 'reasoning'; token: string }
+  | { type: 'subagent_finished'; runId: number; subagentId: string; status: SubagentStatus; summary: string; error: string | null; toolCount: number; inputTokens: number | null; outputTokens: number | null; finishedAt: number }
+  | { type: 'user_question'; runId: number; requestId: string; questions: UserQuestion[] }
   | { type: 'reasoning'; runId: number; token: string }
 );

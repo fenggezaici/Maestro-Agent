@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use crate::{
     adapters::{fs::workspace::WorkspaceService, llm::{ChatConfig, Provider}},
     commands::require_main,
-    domain::{AppResult, ChatMessage, Mode, RunView, Snapshot},
+    domain::{AppResult, ChatMessage, Mode, QuestionAnswer, RunView, Snapshot, SubagentView},
     services::kernel::Kernel,
 };
 
@@ -107,4 +107,37 @@ pub async fn list_runs(
 ) -> AppResult<Vec<RunView>> {
     require_main(&window)?;
     kernel.list_runs().await
+}
+
+#[tauri::command]
+pub async fn list_subagent_traces(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    session_id: i64,
+) -> AppResult<Vec<SubagentView>> {
+    require_main(&window)?;
+    kernel.list_subagent_traces(session_id).await
+}
+
+#[tauri::command]
+pub async fn cancel_subagent(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+    subagent_id: String,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.cancel_subagent(run_id, &subagent_id).await
+}
+
+#[tauri::command]
+pub async fn answer_user_question(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+    request_id: String,
+    answers: Vec<QuestionAnswer>,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.answer_user_question(run_id, &request_id, answers).await
 }

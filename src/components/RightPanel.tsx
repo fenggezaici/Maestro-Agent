@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
+import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
 import SplitDivider, { STORAGE_KEY } from './SplitDivider';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
-import type { PlanCard, PlanStep } from '../api/types';
+import type { PlanCard, PlanStep, SubagentView } from '../api/types';
 import type { ReviewFile } from '../lib/conversation';
 import type { WorkspaceController } from '../hooks/useWorkspace';
 import { useKernelStore } from '../stores/useKernelStore';
@@ -15,9 +15,11 @@ import { countChanges } from './MiniDiff';
 import LightweightDiffPreview from './LightweightDiffPreview';
 import MonacoCode from './MonacoCode';
 import TaskPlanPanel from './TaskPlanPanel';
+import SubagentTracePanel from './SubagentTracePanel';
+import type { UiPreferences } from '../uiPreferences';
 import { preloadMonaco } from '../editor/loader';
 
-export type ListTab = 'explorer' | 'changes' | 'tasks';
+export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
 
 interface ListNode { id: string; name: string; children: ListNode[]; leaf?: { path: string; file?: ExplorerFile } }
@@ -112,7 +114,7 @@ function ChangesList({ files, activePath, onPick }: { files: ReviewFile[]; activ
 /// toggled by a compact segmented header) + a right preview column that shows
 /// MonacoCode for workspace files, MonacoDiff for changed files, and a slim
 /// approval bar while a call is suspended.
-export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily }: {
+export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily, subagents, activeSubagentId, onActiveSubagent, onCancelSubagent, reasoningDisplay, light, onOpenWorkspaceFile }: {
   listTab: ListTab; onListTabChange: (tab: ListTab) => void;
   openTabs: ListTab[]; onAddTab: (tab: ListTab) => void; onCloseTab: (tab: ListTab) => void;
   activeFile: ActiveFile | null; onActiveFile: (file: ActiveFile | null) => void;
@@ -121,6 +123,9 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   preview: boolean; workspace: WorkspaceController;
   explorerView: ExplorerViewState; onExplorerViewChange: (view: ExplorerViewState) => void;
   scope: string; fontSize: number; fontFamily: string;
+  subagents: SubagentView[]; activeSubagentId: string | null; onActiveSubagent: (id: string) => void;
+  onCancelSubagent?: (id: string) => void; reasoningDisplay: UiPreferences['reasoningDisplay']; light: boolean;
+  onOpenWorkspaceFile?: (path: string) => void;
 }) {
   const t = useT();
   // Agent write/command side effects bump this tick — coalesce bursts into one
@@ -174,6 +179,7 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
     explorer: { label: '文件', icon: <Folder size={12} /> },
     changes: { label: '变更', icon: <GitCompareArrows size={12} /> },
     tasks: { label: '任务', icon: <ListTodo size={12} /> },
+    subagents: { label: '子智能体', icon: <Bot size={12} /> },
   };
   const noTabs = openTabs.length === 0;
   const [listWidth, setListWidth] = useState(() => { try { return Number(localStorage.getItem(STORAGE_KEY)) || 240; } catch { return 240; } });
@@ -231,7 +237,17 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             {planSteps.length > 0
               ? <TaskPlanPanel steps={planSteps} running={planRunning} variant="list" />
               : <p className="review-files-empty">暂无任务计划</p>}
-          </div> : <nav aria-label="变更文件列表" className="review-files">
+          </div> : listTab === 'subagents' ? <nav aria-label="子智能体列表" className="subagent-list">
+            {subagents.length === 0
+              ? <p className="review-files-empty">暂无子智能体</p>
+              : subagents.map((trace) => <button key={trace.id} type="button" className={`subagent-list-row${activeSubagentId === trace.id ? ' active' : ''}`}
+                aria-pressed={activeSubagentId === trace.id} onClick={() => onActiveSubagent(trace.id)}>
+                <Bot size={12} />
+                <span className="subagent-list-copy"><strong>{trace.agent}</strong><span>{trace.description}</span></span>
+                <em className={`subagent-status ${trace.status}`}>{trace.status === 'running' ? '执行中' : trace.status === 'completed' ? '完成' : trace.status === 'failed' ? '失败' : '取消'}</em>
+                <small>{trace.toolCount}</small>
+              </button>)}
+          </nav> : <nav aria-label="变更文件列表" className="review-files">
             <ChangesList files={reviewFiles} activePath={change?.path ?? null} onPick={(picked) => onActiveFile({ kind: 'change', path: picked })} />
           </nav>}
         </div>
@@ -241,7 +257,7 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
         <div className="preview-stack">
           <div className="preview-toolbar">
             <span className="preview-toolbar-path" title={previewPath}>
-              {noTabs ? '' : listTab === 'tasks' ? '任务计划' : previewPath ? previewPath.split('/').map((part, index, all) => <span key={`${part}-${index}`}
+              {noTabs ? '' : listTab === 'tasks' ? '任务计划' : listTab === 'subagents' ? (subagents.find((trace) => trace.id === activeSubagentId)?.description ?? '子智能体') : previewPath ? previewPath.split('/').map((part, index, all) => <span key={`${part}-${index}`}
                 className={index === all.length - 1 ? 'preview-path-leaf' : 'preview-path-dir'}>{part}{index < all.length - 1 ? ' / ' : ''}</span>) : ''}
             </span>
             {!noTabs && listTab !== 'tasks' && <span className="readonly-label"><LockKeyhole size={11} />只读</span>}
@@ -250,6 +266,13 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             ? <div className="editor-empty"><Braces size={34} strokeWidth={1} /><h3>没有打开的视图</h3><p>点击右侧 + 添加文件、变更或任务。</p></div>
             : listTab === 'tasks'
             ? <div className="editor-empty"><ListTodo size={34} strokeWidth={1} /><h3>任务计划</h3><p>左侧列出当前会话的步骤与进度。</p></div>
+            : listTab === 'subagents'
+            ? (() => {
+              const trace = subagents.find((item) => item.id === activeSubagentId);
+              return trace
+                ? <SubagentTracePanel trace={trace} light={light} reasoningDisplay={reasoningDisplay} onOpenFile={(path) => onOpenWorkspaceFile ? onOpenWorkspaceFile(path) : onActiveFile({ kind: 'workspace', path })} onCancel={onCancelSubagent} />
+                : <div className="editor-empty"><Bot size={34} strokeWidth={1} /><h3>子智能体</h3><p>左侧选择一个子智能体查看它的调研过程。</p></div>;
+            })()
             : (() => {
               if (change) return <LightweightDiffPreview key={`${change.path}:${change.before}:${change.after}`} path={change.path} before={change.before} after={change.after} fontSize={fontSize} />;
               if (previewFile) return <MonacoCode file={previewFile} fontSize={fontSize} fontFamily={fontFamily} />;

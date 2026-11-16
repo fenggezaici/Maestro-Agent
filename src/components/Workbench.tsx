@@ -31,6 +31,8 @@ import ExtensionsView from './ExtensionsView';
 import useExtensions, { type ExtensionsController } from '../hooks/useExtensions';
 import useSlashSources from '../hooks/useSlashSources';
 import { extensionsApi } from '../api/extensions';
+import { subagentsApi } from '../api/subagents';
+import UserQuestionDialog from './UserQuestionDialog';
 import { expandCommand, type SlashAction } from '../slashCommands';
 import { formatShortcut, labels, readUiPreferences, saveUiPreferences, shortcutChord, type ShortcutAction, type UiPreferences, type UiView } from '../uiPreferences';
 import { useWorkspace } from '../hooks/useWorkspace';
@@ -57,6 +59,7 @@ const MODE_LABEL: Record<Mode, string> = { plan: 'Plan 模式', code: 'Code 模�
 export interface WorkbenchController {
   state: Snapshot; sessions: SessionView[]; projects?: ProjectView[]; selectedSessionId: number | null;
   liveTools?: Record<number, import('../api/types').ToolCallView[]>;
+  subagents?: Record<string, import('../api/types').SubagentView>;
   liveTimeline?: Record<number, TimelineItem[]>;
   stoppingRunId?: number | null;
   /** Task-tracker steps for the selected session (per-session in the store). */
@@ -82,6 +85,8 @@ export interface WorkbenchController {
   deleteSession?: (sessionId: number) => unknown;
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (id: number) => unknown;
+  pendingQuestion?: { runId: number; requestId: string; questions: import('../api/types').UserQuestion[] } | null;
+  answerQuestion?: (runId: number, requestId: string, answers: import('../api/types').QuestionAnswer[]) => Promise<void>;
   queueStart?: (prompt: string, images?: string[]) => void;
   resolveApproval?: (runId: number, approved: boolean) => unknown;
   setMode: (mode: Mode) => unknown;
@@ -162,6 +167,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
+  const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
   const [listTab, setListTab] = useState<ListTab>('changes');
   const [openTabs, setOpenTabs] = useState<ListTab[]>(['explorer', 'changes']);
   const tasksDismissed = useRef(false);
@@ -329,6 +335,15 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const dashboardData = useMemo(() => preview ? createMockDashboard(currentProject) : liveDashboard ?? createEmptyDashboard(), [preview, currentProject, liveDashboard]);
   const running = !stoppingActiveRun && c.state.activeRun?.status === 'running';
   const blocked = preview || !c.state.ready || c.pending;
+  const sessionSubagents = Object.values(c.subagents ?? {})
+    .filter((trace) => trace.sessionId === c.selectedSessionId)
+    .sort((a, b) => a.startedAt - b.startedAt);
+  const subagentById = (id: string) => c.subagents?.[id];
+  const openSubagent = (id: string) => { setActiveSubagentId(id); addTab('subagents'); setReviewOpen(true); };
+  const cancelSubagent = (id: string) => {
+    const trace = c.subagents?.[id];
+    if (trace) void subagentsApi.cancel(trace.runId, id);
+  };
   const slashSources = useSlashSources(!preview && c.state.ready, currentProject.id);
   const slashActions: SlashAction[] = [
     { id: 'plan', description: '切换到 Plan 模式（只读分析）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
@@ -411,6 +426,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 
   useEffect(() => {
     if (lastSession.current !== c.selectedSessionId) {
+      setActiveSubagentId(null);
       lastSession.current = c.selectedSessionId;
       scroll.reset();
     }
@@ -548,6 +564,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
               onSelectFile={selectReviewFile}
               onOpenFile={openWorkspaceFile}
+              onOpenSubagent={openSubagent} subagentById={subagentById}
               onEditPrompt={(text) => { setPrompt(text); setPromptFocus((value) => value + 1); }}
               onJumpToTurn={(runId) => {
                 const root = history.current;
@@ -580,8 +597,10 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
               slash={{ actions: slashActions, skills: slashSources.skills, commands: slashSources.commands, onRefresh: slashSources.refresh, onRunCommand: runSlashCommand }} />
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} subagents={sessionSubagents} activeSubagentId={activeSubagentId} onActiveSubagent={setActiveSubagentId} onCancelSubagent={cancelSubagent} reasoningDisplay={preferences.reasoningDisplay} light={theme === 'light'} onOpenWorkspaceFile={openWorkspaceFile} /> : null} />
     </div>
+    <UserQuestionDialog request={c.pendingQuestion ?? null} pending={Boolean(c.pending)}
+      onSubmit={(answers) => { const request = c.pendingQuestion; if (request && c.answerQuestion) void c.answerQuestion(request.runId, request.requestId, answers); }} />
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
       files={paletteFiles} filesLoading={!preview && paletteOpen && workspace.loading}

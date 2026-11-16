@@ -6,8 +6,9 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{
-    ActivityDay, ActivitySnapshot, AppResult, RunChangeSummary, RunFileChange, Mode, PlanCard, PlanDecision, PlanDraft, PlanStatus,
-    ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView,
+    ActivityDay, ActivitySnapshot, AppResult, RunChangeSummary, RunFileChange, Mode, PlanCard,
+    PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics, RunStatus, RunView, SessionDetail,
+    SessionView, SubagentStatus, SubagentView, ToolCallView,
 };
 
 /// Seed id for the project that owns sessions migrated from pre-v4 databases.
@@ -287,6 +288,7 @@ impl Database {
                 "DELETE FROM run_metrics WHERE session_id = ?1",
                 "DELETE FROM plan_cards WHERE session_id = ?1",
                 "DELETE FROM run_file_changes WHERE session_id = ?1",
+                "DELETE FROM subagent_traces WHERE session_id = ?1",
                 "DELETE FROM runs WHERE session_id = ?1",
             ] {
                 transaction.execute(statement, [session_id]).map_err(db_error)?;
@@ -364,6 +366,8 @@ impl Database {
                 "DELETE FROM plan_cards WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM run_file_changes WHERE project_id = ?1 OR session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM subagent_traces WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM runs WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
@@ -505,11 +509,24 @@ impl Database {
                 .query_map([session_id], |row| {
                     let detail: String = row.get(2)?;
                     let (tool, reason) = detail.split_once(": ").unwrap_or((detail.as_str(), ""));
+                    let (subagent_id, reason) = if tool == "spawn_subagent" {
+                        match reason.split_once(" · ") {
+                            Some((id, rest)) if id.starts_with("sa-") => {
+                                (Some(id.to_string()), rest.to_string())
+                            }
+                            _ => (None, reason.to_string()),
+                        }
+                    } else {
+                        (None, reason.to_string())
+                    };
                     Ok(crate::domain::ToolCallView {
                         run_id: row.get(0)?,
                         tool: tool.to_string(),
-                        detail: reason.to_string(),
+                        detail: reason,
                         allowed: row.get::<_, String>(1)? == "tool_allowed",
+                        subagent_id,
+                        pending: None,
+                        target: None,
                     })
                 })
                 .map_err(db_error)?
@@ -517,6 +534,121 @@ impl Database {
                 .map_err(db_error)?;
             Ok(SessionDetail { session, runs, plans, metrics, tools })
         }).await
+    }
+
+    pub async fn insert_subagent_trace(&self, trace: SubagentView) -> AppResult<()> {
+        self.call(move |connection| {
+            let tools = serde_json::to_string(&trace.tools).map_err(|error| error.to_string())?;
+            connection
+                .execute(
+                    "INSERT INTO subagent_traces
+                     (id, run_id, session_id, agent, description, prompt, model, status, summary,
+                      error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    params![
+                        trace.id,
+                        trace.run_id,
+                        trace.session_id,
+                        trace.agent,
+                        trace.description,
+                        trace.prompt,
+                        trace.model,
+                        trace.status.as_str(),
+                        trace.summary,
+                        trace.error,
+                        trace.content,
+                        trace.tool_count as i64,
+                        trace.input_tokens.map(|value| value as i64),
+                        trace.output_tokens.map(|value| value as i64),
+                        trace.started_at,
+                        trace.finished_at,
+                        tools,
+                    ],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_subagent_trace(
+        &self,
+        id: String,
+        status: SubagentStatus,
+        summary: String,
+        error: Option<String>,
+        content: String,
+        tools: Vec<ToolCallView>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        finished_at: i64,
+    ) -> AppResult<()> {
+        self.call(move |connection| {
+            let tool_count = tools.len() as i64;
+            let tools = serde_json::to_string(&tools).map_err(|error| error.to_string())?;
+            let changed = connection
+                .execute(
+                    "UPDATE subagent_traces SET status = ?2, summary = ?3, error = ?4, content = ?5,
+                     tool_count = ?6, input_tokens = ?7, output_tokens = ?8, finished_at = ?9, tools = ?10
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        status.as_str(),
+                        summary,
+                        error,
+                        content,
+                        tool_count,
+                        input_tokens.map(|value| value as i64),
+                        output_tokens.map(|value| value as i64),
+                        finished_at,
+                        tools,
+                    ],
+                )
+                .map_err(db_error)?;
+            if changed != 1 {
+                return Err("Subagent trace not found".into());
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_subagent_traces(&self, session_id: i64) -> AppResult<Vec<SubagentView>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, run_id, session_id, agent, description, prompt, model, status, summary,
+                            error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools
+                     FROM subagent_traces WHERE session_id = ?1 ORDER BY started_at, id",
+                )
+                .map_err(db_error)?;
+            let rows = statement.query_map([session_id], subagent_row).map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
+    }
+
+    /// Newest reports first, capped for conversation-context injection.
+    pub async fn recent_subagent_reports(
+        &self,
+        session_id: i64,
+        limit: i64,
+    ) -> AppResult<Vec<SubagentView>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, run_id, session_id, agent, description, prompt, model, status, summary,
+                            error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools
+                     FROM subagent_traces
+                     WHERE session_id = ?1 AND summary != ''
+                     ORDER BY started_at DESC, id DESC LIMIT ?2",
+                )
+                .map_err(db_error)?;
+            let rows = statement.query_map(params![session_id, limit], subagent_row).map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
     }
 
     pub async fn create_plan(&self, run: RunView, draft: PlanDraft) -> AppResult<PlanCard> {
@@ -596,8 +728,15 @@ impl Database {
             let elapsed = i64::try_from(metrics.elapsed_ms).map_err(|_| "Invalid elapsed time")?;
             let first = metrics.first_token_ms.map(i64::try_from).transpose().map_err(|_| "Invalid first-token time")?;
             let cache_hit = metrics.cache_hit_tokens.map(i64::try_from).transpose().map_err(|_| "Provider cache usage exceeds database range")?;
-            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cache_hit_tokens=excluded.cache_hit_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms",
-                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, cache_hit, elapsed, first]).map_err(db_error)?;
+            let cache_write = metrics.cache_write_tokens.map(i64::try_from).transpose().map_err(|_| "Provider cache write exceeds database range")?;
+            let reasoning = metrics.reasoning_tokens.map(i64::try_from).transpose().map_err(|_| "Provider reasoning usage exceeds database range")?;
+            let attempts = i64::from(metrics.attempts);
+            let last_input = metrics.last_input_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
+            let last_output = metrics.last_output_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
+            let last_elapsed = i64::try_from(metrics.last_elapsed_ms).map_err(|_| "Invalid elapsed time")?;
+            let last_first = metrics.last_first_token_ms.map(i64::try_from).transpose().map_err(|_| "Invalid first-token time")?;
+            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cache_hit_tokens=excluded.cache_hit_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens, attempts=excluded.attempts, last_input_tokens=excluded.last_input_tokens, last_output_tokens=excluded.last_output_tokens, last_elapsed_ms=excluded.last_elapsed_ms, last_first_token_ms=excluded.last_first_token_ms",
+                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, cache_hit, elapsed, first, cache_write, reasoning, attempts, last_input, last_output, last_elapsed, last_first]).map_err(db_error)?;
             Ok(())
         }).await
     }
@@ -736,7 +875,7 @@ fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMe
             })
             .transpose()
     }
-    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
+    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
     let rows = statement
         .query_map([session_id], |row| {
             Ok(RunMetrics {
@@ -749,6 +888,16 @@ fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMe
                 cache_hit_tokens: number(row, 6)?,
                 elapsed_ms: number(row, 7)?.unwrap_or(0),
                 first_token_ms: number(row, 8)?,
+                cache_write_tokens: number(row, 9)?,
+                reasoning_tokens: number(row, 10)?,
+                attempts: {
+                    let stored = number(row, 11)?.unwrap_or(0) as u32;
+                    if stored == 0 && number(row, 8)?.is_some() { 1 } else { stored }
+                },
+                last_input_tokens: number(row, 12)?.or(number(row, 4)?),
+                last_output_tokens: number(row, 13)?.or(number(row, 5)?),
+                last_elapsed_ms: number(row, 14)?.filter(|value| *value > 0).unwrap_or_else(|| number(row, 7).ok().flatten().unwrap_or(0)),
+                last_first_token_ms: number(row, 15)?.or(number(row, 8)?),
             })
         })
         .map_err(db_error)?;
@@ -776,6 +925,31 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
         path: row.get(2)?,
         archived: row.get(3)?,
         created_at: row.get(4)?,
+    })
+}
+
+fn subagent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentView> {
+    let tools_json: String = row.get(16)?;
+    let tools: Vec<ToolCallView> = serde_json::from_str(&tools_json).unwrap_or_default();
+    Ok(SubagentView {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        session_id: row.get(2)?,
+        agent: row.get(3)?,
+        description: row.get(4)?,
+        prompt: row.get(5)?,
+        model: row.get(6)?,
+        status: SubagentStatus::from_str(&row.get::<_, String>(7)?),
+        summary: row.get(8)?,
+        error: row.get(9)?,
+        content: row.get(10)?,
+        tool_count: row.get::<_, i64>(11)? as usize,
+        input_tokens: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+        output_tokens: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
+        started_at: row.get(14)?,
+        finished_at: row.get(15)?,
+        reasoning: String::new(),
+        tools,
     })
 }
 
@@ -863,9 +1037,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 8 {
+    if version > 10 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 8"
+            "Database schema {version} is newer than supported version 10"
         ));
     }
     connection
@@ -1014,6 +1188,47 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 9 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE subagent_traces (
+                    id TEXT PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    agent TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    model TEXT,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    content TEXT NOT NULL DEFAULT '',
+                    tool_count INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    finished_at INTEGER,
+                    tools TEXT NOT NULL DEFAULT '[]'
+                 );
+                 CREATE INDEX subagent_traces_session ON subagent_traces(session_id, started_at);
+                 PRAGMA user_version = 9;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 10 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_metrics ADD COLUMN cache_write_tokens INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN reasoning_tokens INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE run_metrics ADD COLUMN last_input_tokens INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN last_output_tokens INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN last_elapsed_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE run_metrics ADD COLUMN last_first_token_ms INTEGER;
+                 PRAGMA user_version = 10;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -1026,6 +1241,13 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     transaction
         .execute(
             "UPDATE runs SET status = 'failed', error = 'Application exited before completion',
+             finished_at = unixepoch() WHERE status = 'running'",
+            [],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "UPDATE subagent_traces SET status = 'failed', error = 'Application exited before completion',
              finished_at = unixepoch() WHERE status = 'running'",
             [],
         )
@@ -1212,7 +1434,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 9)
+                    .pragma_update(None, "user_version", 11)
                     .map_err(db_error)
             })
             .await
@@ -1373,6 +1595,13 @@ mod tests {
                 output_tokens: Some(10),
                 elapsed_ms: 250,
                 first_token_ms: Some(20),
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                attempts: 1,
+                last_input_tokens: None,
+                last_output_tokens: Some(10),
+                last_elapsed_ms: 250,
+                last_first_token_ms: Some(20),
             })
             .await
             .unwrap();
@@ -1508,6 +1737,13 @@ mod tests {
                 output_tokens: Some(4),
                 elapsed_ms: 9,
                 first_token_ms: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                attempts: 1,
+                last_input_tokens: None,
+                last_output_tokens: Some(4),
+                last_elapsed_ms: 9,
+                last_first_token_ms: None,
             })
             .await
             .unwrap();
@@ -1581,6 +1817,119 @@ mod tests {
         assert!(database.session_detail(session.id).await.is_err());
         assert!(database.list_projects().await.unwrap().is_empty());
         assert!(database.first_active_project_id().await.unwrap().is_none());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_traces_persist_finish_and_cascade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("traces.sqlite3");
+        let database = Database::open(path.clone()).await.unwrap();
+        let session = database.create_session().await.unwrap();
+        let run_id = database
+            .create_run_in_session(session.id, "work".into(), Mode::Plan)
+            .await
+            .unwrap();
+        let trace = SubagentView {
+            id: "sa-1-1".into(),
+            run_id,
+            session_id: session.id,
+            agent: "explore".into(),
+            description: "调研".into(),
+            prompt: "读文件".into(),
+            model: Some("m".into()),
+            status: SubagentStatus::Running,
+            summary: String::new(),
+            error: None,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: 1,
+            finished_at: None,
+            tools: Vec::new(),
+        };
+        database.insert_subagent_trace(trace.clone()).await.unwrap();
+        let listed = database.list_subagent_traces(session.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, SubagentStatus::Running);
+
+        let tools = vec![ToolCallView {
+            run_id,
+            tool: "read_file".into(),
+            detail: "a.rs".into(),
+            allowed: true,
+            subagent_id: Some("sa-1-1".into()),
+            pending: None,
+            target: Some("a.rs".into()),
+        }];
+        database
+            .finish_subagent_trace(
+                "sa-1-1".into(),
+                SubagentStatus::Completed,
+                "【子智能体 explore】完成".into(),
+                None,
+                "结论".into(),
+                tools,
+                Some(3),
+                Some(4),
+                2,
+            )
+            .await
+            .unwrap();
+        let listed = database.list_subagent_traces(session.id).await.unwrap();
+        assert_eq!(listed[0].status, SubagentStatus::Completed);
+        assert_eq!(listed[0].tool_count, 1);
+        assert_eq!(listed[0].input_tokens, Some(3));
+        assert_eq!(listed[0].tools[0].subagent_id.as_deref(), Some("sa-1-1"));
+        assert_eq!(database.recent_subagent_reports(session.id, 6).await.unwrap().len(), 1);
+
+        database.shutdown().await.unwrap();
+        let database = Database::open(path).await.unwrap();
+        database.delete_session(session.id).await.unwrap();
+        assert!(database.list_subagent_traces(session.id).await.unwrap().is_empty());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_subagent_traces_are_failed_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("interrupted.sqlite3");
+        let database = Database::open(path.clone()).await.unwrap();
+        let session = database.create_session().await.unwrap();
+        let run_id = database
+            .create_run_in_session(session.id, "work".into(), Mode::Plan)
+            .await
+            .unwrap();
+        database
+            .insert_subagent_trace(SubagentView {
+                id: "sa-1-2".into(),
+                run_id,
+                session_id: session.id,
+                agent: "explore".into(),
+                description: "调研".into(),
+                prompt: "读文件".into(),
+                model: None,
+                status: SubagentStatus::Running,
+                summary: String::new(),
+                error: None,
+                content: String::new(),
+                reasoning: String::new(),
+                tool_count: 0,
+                input_tokens: None,
+                output_tokens: None,
+                started_at: 1,
+                finished_at: None,
+                tools: Vec::new(),
+            })
+            .await
+            .unwrap();
+        database.shutdown().await.unwrap();
+        let database = Database::open(path).await.unwrap();
+        let listed = database.list_subagent_traces(session.id).await.unwrap();
+        assert_eq!(listed[0].status, SubagentStatus::Failed);
+        assert!(listed[0].error.as_deref().unwrap_or_default().contains("Application exited"));
         database.shutdown().await.unwrap();
     }
 

@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useT } from '../i18n';
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
 import { ExternalLink, FolderInput, FolderOpen, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
@@ -47,10 +47,9 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canB
     if (message) { setError(message); return; }
     setValues(defaults()); setError(null); onOpenChange(false);
   }
-  return <Dialog.Root open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
-    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="project-dialog" aria-describedby={undefined}>
-        <Dialog.Title asChild><h3>{title}</h3></Dialog.Title>
+  return <Dialog open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
+    <DialogContent variant="form" className="project-dialog">
+        <DialogTitle asChild><h3>{title}</h3></DialogTitle>
         {hint && <p className="dialog-hint">{hint}</p>}
         <form onSubmit={(event) => void submit(event)}>
           {fields.map((field) => <div key={field.id}>
@@ -73,14 +72,12 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canB
           </div>)}
           {error && <p role="alert" className="settings-form-error">{error}</p>}
           <div className="dialog-actions">
-            <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
+            <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
             <button type="submit" className="button-approve" disabled={pending || fields.some((f) => f.required !== false && !(values[f.id] ?? '').trim())}>{submitLabel}</button>
           </div>
         </form>
-        <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+    </DialogContent>
+  </Dialog>;
 }
 
 function SkillList({ c }: { c: ExtensionsController }) {

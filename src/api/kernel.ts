@@ -2,6 +2,7 @@
 /// `kernel-event` subscription. All `invoke`/`listen` calls for the kernel
 /// live here — nothing else may touch Tauri IPC for these.
 import { invoke } from '@tauri-apps/api/core';
+import type { QuestionAnswer } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { providerModel } from '../providerModels';
 import { wireProvider } from '../customProviders';
@@ -21,6 +22,8 @@ export const kernelApi = {
   cancel: (runId: number) => invoke<void>('cancel_agent', { runId }),
   resolveApproval: (runId: number, approved: boolean) => invoke<void>('resolve_tool_approval', { runId, approved }),
   abort: (runId: number) => invoke<void>('abort_chat', { runId }),
+  answerQuestion: (runId: number, requestId: string, answers: QuestionAnswer[]) =>
+    invoke<void>('answer_user_question', { runId, requestId, answers }),
   listen: async (receive: (event: KernelEvent) => void) => {
     // Single channel: the backend emits normalized typed events (content,
     // reasoning, tool_call, status…) — no client-side reassembly.

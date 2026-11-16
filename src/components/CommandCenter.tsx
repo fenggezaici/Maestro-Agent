@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogContent, DialogTitle } from './ui/dialog';
 import { FileCode2, History, MessageSquare, Search, TerminalSquare } from 'lucide-react';
 import { fuzzyScore, pushPaletteHistory, readPaletteHistory, type FlatFile } from '../commandCenter';
 import { relativeSessionAge, type WorkbenchProject } from './workspace';
@@ -116,11 +116,10 @@ export default function CommandCenter({ open, onOpenChange, source, projects, co
   }
 
   let index = -1;
-  return <Dialog.Root open={open} onOpenChange={onOpenChange}>
-    <Dialog.Portal>
-      <Dialog.Overlay className="palette-overlay" />
-      <Dialog.Content className="palette-dialog" aria-label="Command Center" onOpenAutoFocus={(event) => event.preventDefault()}>
-        <Dialog.Title className="sr-only">Command Center</Dialog.Title>
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent variant="palette" className="palette-dialog" overlayClassName="palette-overlay" showClose={false}
+      aria-label="Command Center" onOpenAutoFocus={(event) => event.preventDefault()}>
+        <DialogTitle className="sr-only">Command Center</DialogTitle>
         <div className="palette-input-row">
           <Search size={15} />
           <input autoFocus aria-label="搜索命令、会话或文件" value={query} placeholder="搜索命令、会话或文件…"
@@ -146,9 +145,8 @@ export default function CommandCenter({ open, onOpenChange, source, projects, co
           </div>)}
           {flat.length === 0 && !filesLoading && <p className="palette-status">没有匹配结果</p>}
         </div>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+    </DialogContent>
+  </Dialog>;
 }
 
 function toItem(command: PaletteCommand, prefix: string): PaletteItem {

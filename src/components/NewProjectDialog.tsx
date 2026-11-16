@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import * as Dialog from '@radix-ui/react-dialog';
+import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
 import { FolderGit2, FolderOpen, Trash2, X } from 'lucide-react';
 import type { WorkbenchProject } from './workspace';
 import { IconButton } from './ui';
@@ -26,10 +26,9 @@ export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCre
     onOpenChange(false);
   }
 
-  return <Dialog.Root open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
-    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="project-dialog" aria-describedby={undefined}>
-        <Dialog.Title asChild><h3><FolderGit2 size={16} />新建项目</h3></Dialog.Title>
+  return <Dialog open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
+    <DialogContent variant="form" className="project-dialog">
+        <DialogTitle asChild><h3><FolderGit2 size={16} />新建项目</h3></DialogTitle>
         <p className="dialog-hint">项目是一组会话的容器，可选绑定一个本地工作区目录（Explorer 将切换到该目录）。</p>
         <form onSubmit={(event) => void submit(event)}>
           <label htmlFor="project-name">项目名称</label>
@@ -44,14 +43,12 @@ export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCre
           </div>
           {error && <p role="alert" className="settings-form-error">{error}</p>}
           <div className="dialog-actions">
-            <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
+            <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
             <button type="submit" className="button-approve" disabled={disabled || pending || !name.trim()}>创建项目</button>
           </div>
         </form>
-        <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+    </DialogContent>
+  </Dialog>;
 }
 
 export function DeleteProjectDialog({ project, onOpenChange, onConfirm }: {
@@ -62,14 +59,13 @@ export function DeleteProjectDialog({ project, onOpenChange, onConfirm }: {
   const [pending, setPending] = useState(false);
   const open = project !== null;
   const sessionCount = (project?.sessions.length ?? 0) + (project?.archivedSessions?.length ?? 0);
-  return <Dialog.Root open={open} onOpenChange={(value) => { if (!value) { setError(null); onOpenChange(false); } }}>
-    <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="project-dialog" aria-describedby={undefined}>
-        <Dialog.Title asChild><h3 className="dialog-danger"><Trash2 size={15} />删除项目</h3></Dialog.Title>
+  return <Dialog open={open} onOpenChange={(value) => { if (!value) { setError(null); onOpenChange(false); } }}>
+    <DialogContent variant="default" className="project-dialog">
+        <DialogTitle asChild><h3 className="dialog-danger"><Trash2 size={15} />删除项目</h3></DialogTitle>
         <p className="dialog-hint">将永久删除项目 <strong>{project?.name}</strong> 及其 {sessionCount} 个会话（含全部对话记录）。此操作不可撤销。</p>
         {error && <p role="alert" className="settings-form-error">{error}</p>}
         <div className="dialog-actions">
-          <Dialog.Close asChild><button type="button" className="button-ghost">取消</button></Dialog.Close>
+          <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
           <button type="button" className="button-approve dialog-danger" disabled={pending} onClick={async () => {
             if (!project || pending) return;
             setPending(true);
@@ -79,8 +75,6 @@ export function DeleteProjectDialog({ project, onOpenChange, onConfirm }: {
             onOpenChange(false);
           }}>删除项目</button>
         </div>
-        <Dialog.Close asChild><button type="button" className="icon-button dialog-close" aria-label="关闭"><X size={15} /></button></Dialog.Close>
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>;
+    </DialogContent>
+  </Dialog>;
 }

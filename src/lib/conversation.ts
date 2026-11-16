@@ -40,6 +40,11 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
     case 'sessions_changed':
     case 'workspace_changed':
     case 'tool_call': return next;
+    case 'subagent_started':
+    case 'subagent_tool':
+    case 'subagent_token':
+    case 'subagent_finished':
+    case 'user_question':
     case 'reasoning': return next;
     case 'metrics': return next;
   }
@@ -84,6 +89,7 @@ export function applyToolEventIndexed(
     // `started` carries the extracted target; later phases keep it while
     // `detail` rotates to preview JSON, result text, or the failure reason.
     target: event.phase === 'started' ? event.detail : prev?.target,
+    subagentId: event.subagentId ?? prev?.subagentId,
   };
   const index = event.phase === 'started' || pendingIndex < 0 ? list.length : pendingIndex;
   if (index === list.length) list.push(entry);

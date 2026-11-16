@@ -163,6 +163,13 @@ impl FrameParser for OpenAiParser {
                     .get("prompt_cache_hit_tokens")
                     .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
                     .and_then(|v| v.as_u64()),
+                cache_write: usage
+                    .get("prompt_cache_write_tokens")
+                    .or_else(|| usage.pointer("/prompt_tokens_details/cache_creation_tokens"))
+                    .and_then(|v| v.as_u64()),
+                reasoning: usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(|v| v.as_u64()),
             });
         }
         if let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) {

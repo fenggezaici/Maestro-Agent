@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { BrainCircuit, ChevronDown, ChevronRight, Clock3, Copy, Pencil, ThumbsDown, ThumbsUp, WandSparkles, Wrench } from 'lucide-react';
 
-import type { PlanCard as Plan, PlanDecision, RunView, ToolCallView } from '../api/types';
+import type { PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
 import { relativeTime, type ReasoningSegment, type TimelineItem } from '../lib/conversation';
 import type { UiPreferences } from '../uiPreferences';
 import CollapsibleBlock from './CollapsibleBlock';
@@ -133,7 +133,7 @@ function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]
   </>;
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -154,6 +154,8 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onEditPrompt?: (text: string) => void;
   onJumpToTurn?: (runId: number) => void;
   onOpenFile?: (path: string) => void;
+  onOpenSubagent?: (id: string) => void;
+  subagentById?: (id: string) => SubagentView | undefined;
   onResolveApproval?: (runId: number, approved: boolean) => void;
 }) {
   const railRef = useRef<HTMLElement>(null);
@@ -280,7 +282,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
                         {block.items!.map((item, itemIndex) => {
                           if (item.kind === 'reasoning') return <ReasoningNode key={`r${itemIndex}`} segment={item.segment} display={reasoningDisplay} />;
                           const call = item.kind === 'tool' ? liveCalls[item.index] : undefined;
-                          return call ? <div key={`t${itemIndex}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onResolveApproval={onResolveApproval} /></div> : null;
+                          return call ? <div key={`t${itemIndex}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onResolveApproval={onResolveApproval} onOpenSubagent={onOpenSubagent} subagent={call.subagentId ? subagentById?.(call.subagentId) : undefined} /></div> : null;
                         })}
                       </ExecutionGroup>)}
                   {!hasContent && (body !== '' || run.status !== 'running') &&
@@ -288,7 +290,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
                 </>;
               })()
               : <>
-                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} onOpenFile={onOpenFile} />}
+                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} subagentById={subagentById} />}
                 {inlineReasoning && reasoningDisplay !== 'hidden' &&
                   <CollapsibleBlock title="思考" icon={<BrainCircuit size={13} />} contentClass="reasoning-content"><ReasoningText text={inlineReasoning} streaming={false} /></CollapsibleBlock>}
               </>}
