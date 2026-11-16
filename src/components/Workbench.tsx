@@ -273,6 +273,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     if (!summaryRun || summaryRun.sessionId !== c.selectedSessionId) return;
     let cancelled = false;
     const terminal = summaryRun.status !== 'running';
+    if (!terminal) return;
     const fallback = () => {
       if (cancelled || !terminal) return;
       const rows = fallbackChanges(panelReviewFilesRef.current);
@@ -574,12 +575,12 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
                 scroll.scrollToTop(top);
               }}
               onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
+              footer={runSummary && runSummary.files > 0 && !running ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
+                loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
+                onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
+                onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
+                onRevert={previewRevert} /> : null}
               onScroll={scroll.onScroll} />
-            {runSummary && runSummary.files > 0 && <ChangeSummaryCard summary={runSummary} changes={runChanges}
-              loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
-              onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
-              onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
-              onRevert={previewRevert} />}
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}

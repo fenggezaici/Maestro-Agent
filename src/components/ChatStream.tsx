@@ -133,7 +133,7 @@ function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]
   </>;
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById, footer }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -157,6 +157,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onOpenSubagent?: (id: string) => void;
   subagentById?: (id: string) => SubagentView | undefined;
   onResolveApproval?: (runId: number, approved: boolean) => void;
+  footer?: ReactNode;
 }) {
   const railRef = useRef<HTMLElement>(null);
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
@@ -304,6 +305,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
           {plans.filter((plan) => plan.runId === run.id).map((plan) => <PlanCard key={plan.id} plan={plan} preview={preview} canDecide={!preview && run.status === 'completed'} pending={pending} onReview={onReviewPlan} onDecision={(_id, decision) => { if (!preview) onDecidePlan(plan, decision); }} />)}
         </article>
       </section>)}
+      {footer}
       </div>
     </div>
   </div>;

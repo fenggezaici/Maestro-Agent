@@ -13,7 +13,8 @@ import type { WorkbenchProject } from './workspace';
 import { Choice, IconButton } from './ui';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import ComposerControls from './ComposerControls';
-import SessionStats from './SessionStats';
+import SessionStats, { sessionUsage } from './SessionStats';
+import ContextRing from './ContextRing';
 import SlashPanel from './SlashPanel';
 import { buildSlashGroups, skillDirective, slashQuery, type SlashAction, type SlashItem } from '../slashCommands';
 
@@ -212,6 +213,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
         </Popover.Content></Popover.Portal>
       </Popover.Root>
       <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked || running} preferences={preferences} onPreferences={onPreferences} settingsVersion={settingsVersion} onError={onError} onCapability={onCapability} />
+      <ContextRing used={sessionUsage(runs, metrics, context).contextUsed} context={context} />
       <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Enter ↵'}</span>
       {running && !preview ? <IconButton label="停止生成" className="stop-button" onClick={onCancel}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
     </div>

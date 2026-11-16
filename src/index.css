@@ -1108,7 +1108,7 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .build-stamp { padding: 2px 10px 0; color: #5f5f5f; font-size: 9px; font-variant-numeric: tabular-nums; }
 
 /* Two-column main stage: chat and composer share one centered width */
-.conversation-stack { width: 100%; max-width: 896px; margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.conversation-stack { width: 100%; max-width: var(--chat-content-width); margin: 0 auto; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .conversation-stack .chat-history-inner { max-width: none; width: 100%; }
 .conversation-stack .composer-inner { max-width: none; width: 100%; }
 .conversation-stack .composer-area { max-width: none; padding: 16px 0 20px; }
@@ -1130,8 +1130,8 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 
 /* Scrollbar at the pane edge; content and composer share 896px */
 .chat-history { width: 100%; }
-.chat-history-inner { max-width: 896px; margin: 0 auto; width: 100%; }
-.composer-inner { max-width: 896px; margin: 0 auto; width: 100%; }
+.chat-history-inner { max-width: var(--chat-content-width); margin: 0 auto; width: 100%; }
+.composer-inner { max-width: var(--chat-content-width); margin: 0 auto; width: 100%; }
 .composer-area { max-width: none; width: 100%; margin: 0; padding: 16px 32px 20px; }
 
 /* Row-level expand chevrons (ZCode pattern) */
