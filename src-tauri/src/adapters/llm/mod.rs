@@ -49,6 +49,8 @@ pub struct ChatConfig {
     pub provider: Provider,
     pub reasoning: Option<String>,
     pub max_output: Option<u64>,
+    /// Model context window, used by automatic compaction.
+    pub context_window: Option<u64>,
     /// Stable per-conversation id. OpenCode gateways require it as
     /// `x-opencode-session` so requests can be routed/cached together.
     pub session: Option<String>,
@@ -243,6 +245,35 @@ fn retryable_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout() || error.is_request()
 }
 
+fn retryable_stream_error(error: &reqwest::Error) -> bool {
+    error.is_decode() || error.is_body() || error.is_timeout() || error.is_request()
+}
+
+fn is_sse_response(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+}
+
+fn stream_error_message(error: &reqwest::Error, config: &ChatConfig) -> String {
+    let detail = config
+        .redact(&error.to_string())
+        .chars()
+        .take(200)
+        .collect::<String>();
+    if error.is_timeout() {
+        format!("等待模型流超时：{detail}")
+    } else if error.is_decode() {
+        format!("模型流响应体解码失败（网关/代理提前关闭或分块传输损坏）：{detail}（可重试本轮）")
+    } else if error.is_body() {
+        format!("模型流响应体传输中断：{detail}（可重试本轮）")
+    } else {
+        format!("读取模型流失败，网络连接已中断：{detail}")
+    }
+}
+
 fn retry_after_ms(response: &reqwest::Response) -> Option<u64> {
     let headers = response.headers();
     if let Some(value) = headers.get("retry-after-ms").and_then(|value| value.to_str().ok()) {
@@ -350,17 +381,14 @@ pub(crate) async fn stream_common(
             _ => format!("模型服务返回 HTTP {code}，请检查 Base URL 与 Model{suffix}"),
         });
     }
-    if !response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"))
-    {
+    if !is_sse_response(&response) {
         return Err("模型服务未返回 text/event-stream，请确认接口支持 stream: true".into());
     }
     let mut body = response.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut output_bytes = 0usize;
+    let mut bytes_seen = 0usize;
+    let mut stream_retries = 0usize;
     let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>| -> AppResult<bool> {
         for frame in frames {
             for event in parser.handle(frame)? {
@@ -398,11 +426,39 @@ pub(crate) async fn stream_common(
         };
         match chunk {
             Some(Ok(bytes)) => {
+                bytes_seen += bytes.len();
                 if process(decoder.push(&bytes)?, parser, &events)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
             }
-            Some(Err(error)) => return Err(format!("读取模型流失败，网络连接已中断：{}", config.redact(&error.to_string()).chars().take(200).collect::<String>())),
+            Some(Err(error)) => {
+                if bytes_seen == 0 && stream_retries == 0 && retryable_stream_error(&error) {
+                    let Some(builder) = request.try_clone() else {
+                        return Err(stream_error_message(&error, config));
+                    };
+                    let retried = tokio::select! {
+                        biased;
+                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                        response = builder.send() => response,
+                    };
+                    match retried {
+                        Ok(next) if next.status().is_success() && is_sse_response(&next) => {
+                            stream_retries += 1;
+                            decoder = SseDecoder::new();
+                            body = next.bytes_stream();
+                            continue;
+                        }
+                        Ok(next) if !next.status().is_success() => {
+                            return Err(format!("模型服务返回 HTTP {}", next.status().as_u16()));
+                        }
+                        Ok(_) => {
+                            return Err("模型服务未返回 text/event-stream，请确认接口支持 stream: true".into());
+                        }
+                        Err(next_error) => return Err(stream_error_message(&next_error, config)),
+                    }
+                }
+                return Err(stream_error_message(&error, config));
+            }
             None => {
                 if process(decoder.finish()?, parser, &events)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
@@ -421,7 +477,13 @@ pub(crate) async fn stream_common(
 }
 
 pub(crate) fn http_client() -> AppResult<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
     reqwest::Client::builder()
+        .default_headers(headers)
         .redirect(reqwest::redirect::Policy::none())
         // OpenCode (and similar gateways) reject generic SDK/HTTP-library UAs.
         .user_agent(concat!("Maestro-Agent/", env!("CARGO_PKG_VERSION")))
@@ -444,6 +506,7 @@ mod tests {
             provider: Provider::Openai,
             reasoning: None,
             max_output: None,
+            context_window: None,
             session: None,
         };
         assert_eq!(
@@ -470,6 +533,7 @@ mod tests {
             provider: Provider::Openai,
             reasoning: None,
             max_output: None,
+            context_window: None,
             session: session.map(str::to_string),
         }
     }

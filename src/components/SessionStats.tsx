@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import { Clock3, Database, Gauge } from 'lucide-react';
 import type { RunMetrics, RunView } from '../api/types';
+import { CACHE_HIT_RATE_DISPLAY_THRESHOLD, getRenderableContextUsage } from '../lib/contextUsage';
 
 export function estimateTokens(text: string): number {
   const cjk = (text.match(/[\u3400-\u9fff]/g) ?? []).length;
@@ -44,7 +45,7 @@ export function sessionUsage(runs: RunView[], metrics: Record<number, RunMetrics
   const lastSpeed = lastReport
     ? ((lastReport.lastOutputTokens ?? 0) / (((lastReport.lastElapsedMs ?? 0) - (lastReport.lastFirstTokenMs ?? 0)) / 1000)).toFixed(1)
     : '—';
-  const contextUsed = reports.at(-1)?.lastInputTokens ?? reports.at(-1)?.inputTokens ?? 0;
+  const contextUsed = reports.at(-1)?.lastInputTokens ?? null;
   const inputKnown = reports.length > 0 && reports.every((report) => report.inputTokens != null);
   const cacheKnown = reports.length > 0 && reports.every((report) => report.cacheHitTokens != null && report.inputTokens != null);
   const liveOutput = current?.status === 'running' ? estimateTokens(current.output) : 0;
@@ -58,7 +59,8 @@ export function sessionUsage(runs: RunView[], metrics: Record<number, RunMetrics
   const decodeTokens = speedReports.reduce((total, report) => total + (report.outputTokens ?? 0), 0);
   const decodeMs = speedReports.reduce((total, report) => total + Math.max(0, report.elapsedMs - (report.firstTokenMs ?? 0)), 0);
   const speed = decodeTokens > 0 && decodeMs > 0 ? (decodeTokens / (decodeMs / 1000)).toFixed(1) : '—';
-  const contextPercent = context && contextUsed > 0 ? Math.min(100, (contextUsed / context) * 100) : null;
+  const renderableContext = getRenderableContextUsage(contextUsed, context);
+  const contextPercent = renderableContext ? Math.min(100, (renderableContext.used / renderableContext.context) * 100) : null;
   return {
     current, report: reports.at(-1), known: inputKnown && !estimated, input: exactInput, output, total, used: total,
     cacheRead, cacheWrite, reasoning, attempts, ttft, lastSpeed, contextUsed, contextPercent,
@@ -92,14 +94,12 @@ export default function SessionStats({ runs, metrics, context, steps = 0 }: { ru
       <Popover.Trigger asChild>
         <button type="button" className="stats-line" aria-label={`会话统计 Context ${usage.contextPercent === null ? '—' : `${usage.contextPercent.toFixed(1)}%`} Input ${compactTokens(usage.input)} Output ${compactTokens(usage.output)} Hit ${usage.cachePct ?? '—'} Speed ${formatSpeed(usage.speed)} tok/s TTFT ${usage.ttft === null ? '—' : `${usage.ttft}ms`}`}>
           <Gauge size={11} className="stats-line-icon" />
-          {chip('Context', usage.contextPercent === null ? '—' : `${usage.contextPercent.toFixed(1)}%`)}
-          <span className="stats-sep" />
+          {usage.contextPercent !== null && <>{chip('Context', `${usage.contextPercent.toFixed(1)}%`)}<span className="stats-sep" /></>}
           {chip('Input', hasData ? compactTokens(usage.input) : '—')}
           <span className="stats-sep" />
           {chip('Output', hasData ? compactTokens(usage.output) : '—')}
           <span className="stats-sep" />
-          {chip('Hit', usage.cachePct === null ? '—' : `${usage.cachePct}%`)}
-          <span className="stats-sep" />
+          {usage.cachePct !== null && Number(usage.cachePct) >= CACHE_HIT_RATE_DISPLAY_THRESHOLD && <>{chip('Hit', `${usage.cachePct}%`)}<span className="stats-sep" /></>}
           {chip('', `${formatSpeed(usage.speed)} tok/s`)}
           <span className="stats-sep" />
           {chip('TTFT', usage.ttft === null ? '—' : `${(Number(usage.ttft) / 1000).toFixed(1)}s`)}

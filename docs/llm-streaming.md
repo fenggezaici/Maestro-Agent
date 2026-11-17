@@ -57,3 +57,13 @@ Rust 集成测试使用本地 OpenAI 兼容服务，覆盖真实 HTTP、先后�
 完整原生 UI 验收仍需自己的有效服务配置；不宣称已测试未提供的云端账号。
 `smoke-desktop.ps1 -NativeOnly` 不调用模型；完整模式需显式 `-AllowModelRequest`，可能产生 API 费用。
 
+
+## SSE body failures
+
+`error decoding response body` is a transport-level reqwest error while reading the SSE/chunked body, not a model or context error. Common causes are an OpenCode gateway/proxy closing the stream, network instability, or malformed chunk framing. The transport now:
+
+- classifies decode/body/timeout failures with distinct messages and keeps the redacted underlying error;
+- retries the request once when the failure happens before the first SSE chunk (`bytes_seen == 0`); once any byte has arrived it never replays, to avoid duplicate tokens or tool calls;
+- sends `Accept-Encoding: identity` so an intermediate compression layer cannot corrupt the stream.
+
+If the same failure repeats at the same point, check the gateway/proxy or network before increasing retries.

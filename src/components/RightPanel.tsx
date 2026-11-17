@@ -183,9 +183,23 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   };
   const noTabs = openTabs.length === 0;
   const [listWidth, setListWidth] = useState(() => { try { return Number(localStorage.getItem(STORAGE_KEY)) || 240; } catch { return 240; } });
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const addMenuContentRef = useRef<HTMLDivElement>(null);
+  const addMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const splitRef = useRef<HTMLDivElement>(null);
   const commitWidth = (width: number) => { setListWidth(width); try { localStorage.setItem(STORAGE_KEY, String(width)); } catch { /* quota */ } };
   useEffect(() => { splitRef.current?.style.setProperty('--right-list-width', `${listWidth}px`); }, [listWidth]);
+  useEffect(() => {
+    if (!addMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (addMenuContentRef.current?.contains(target) || addMenuTriggerRef.current?.contains(target)) return;
+      setAddMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, [addMenuOpen]);
 
   return <aside aria-label="右侧工作区" className="right-pane" onMouseEnter={preloadMonaco} onFocusCapture={preloadMonaco}>
         <div className="right-tabs-toolbar">
@@ -198,14 +212,15 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
                   onClick={() => onCloseTab(tab)}><X size={11} /></button>
               </div>)}
             </div>
-            <DropdownMenu.Root>
+            <DropdownMenu.Root open={addMenuOpen} onOpenChange={setAddMenuOpen}>
               <DropdownMenu.Trigger asChild>
-                <button type="button" className="right-tab-add" aria-label="添加视图"><Plus size={14} /></button>
+                <button ref={addMenuTriggerRef} type="button" className="right-tab-add" aria-label="添加视图"><Plus size={14} /></button>
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
-                <DropdownMenu.Content className="dropdown-content" align="end" sideOffset={4}>
+                <DropdownMenu.Content ref={addMenuContentRef} className="dropdown-content" align="end" sideOffset={4}
+                  onPointerDown={(event) => { if (event.target === event.currentTarget) setAddMenuOpen(false); }}>
                   {(Object.keys(TAB_META) as ListTab[]).map((tab) => <DropdownMenu.Item key={tab} className="dropdown-item"
-                    disabled={openTabs.includes(tab)} onSelect={() => onAddTab(tab)}>
+                    onSelect={() => { if (!openTabs.includes(tab)) onAddTab(tab); }}>
                     <span className="choice-item-main">{TAB_META[tab].icon}{TAB_META[tab].label}</span>
                     {openTabs.includes(tab) && <span className="right-tab-open-tag">已打开</span>}
                   </DropdownMenu.Item>)}

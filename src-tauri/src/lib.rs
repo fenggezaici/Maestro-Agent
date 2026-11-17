@@ -70,6 +70,7 @@ pub fn run() {
             commands::kernel::list_subagent_traces,
             commands::kernel::cancel_subagent,
             commands::kernel::answer_user_question,
+            commands::kernel::compact_session,
             commands::sessions::create_session,
             commands::sessions::set_session_archived,
             commands::sessions::rename_session,

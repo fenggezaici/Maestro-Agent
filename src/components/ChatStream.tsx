@@ -3,13 +3,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { BrainCircuit, ChevronDown, ChevronRight, Clock3, Copy, Pencil, ThumbsDown, ThumbsUp, WandSparkles, Wrench } from 'lucide-react';
 
-import type { PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
+import type { ApprovalDecision, CommandScope, ContextCompaction, PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
 import { relativeTime, type ReasoningSegment, type TimelineItem } from '../lib/conversation';
 import type { UiPreferences } from '../uiPreferences';
 import CollapsibleBlock from './CollapsibleBlock';
 import PlanCard from './PlanCard';
 import ToolCallBlocks, { ToolCallRow } from './ToolCallBlocks';
 import MarkdownMessage from './MarkdownMessage';
+import { compactTokens } from './SessionStats';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 
 /// Models without `reasoning_content` emit inline <think>…</think> blocks —
@@ -76,11 +77,14 @@ function ExecutionGroup({ timeline, running, children }: { timeline: TimelineIte
     if (manual.current) return;
     setOpen(running);
   }, [running]);
-  const sealed = timeline.flatMap((item) => item.kind === 'reasoning' && item.segment.endedAt !== undefined ? [item.segment.startedAt, item.segment.endedAt] : []);
-  const ms = sealed.length ? Math.max(...sealed) - Math.min(...sealed) : 0;
+  const ms = timeline.reduce((total, item) => item.kind === 'reasoning' && item.segment.endedAt !== undefined
+    ? total + Math.max(0, item.segment.endedAt - item.segment.startedAt)
+    : total, 0);
   const seconds = Math.max(1, Math.round(ms / 1000));
   const tools = timeline.filter((item) => item.kind === 'tool').length;
-  const label = ms > 0 ? (seconds >= 60 ? `已工作 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `已工作 ${seconds} 秒`) : `已执行 ${tools} 个工具`;
+  const label = ms > 0
+    ? `${seconds >= 60 ? `思考 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `思考 ${seconds} 秒`} · ${tools} 个工具`
+    : `已执行 ${tools} 个工具`;
   return <div className={`execution-group ${open ? 'open' : ''}`}>
     <button type="button" className="execution-summary" aria-expanded={open}
       onClick={() => { manual.current = true; setOpen((value) => !value); }}>
@@ -133,7 +137,7 @@ function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]
   </>;
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById, footer }: {
+export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById, footer, compactions = [] }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
@@ -156,8 +160,9 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
   onOpenFile?: (path: string) => void;
   onOpenSubagent?: (id: string) => void;
   subagentById?: (id: string) => SubagentView | undefined;
-  onResolveApproval?: (runId: number, approved: boolean) => void;
+  onResolveApproval?: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => void;
   footer?: ReactNode;
+  compactions?: ContextCompaction[];
 }) {
   const railRef = useRef<HTMLElement>(null);
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
@@ -305,6 +310,14 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
           {plans.filter((plan) => plan.runId === run.id).map((plan) => <PlanCard key={plan.id} plan={plan} preview={preview} canDecide={!preview && run.status === 'completed'} pending={pending} onReview={onReviewPlan} onDecision={(_id, decision) => { if (!preview) onDecidePlan(plan, decision); }} />)}
         </article>
       </section>)}
+      {compactions.map((item) => <div className={`context-compaction-row ${item.status}`} key={item.operationId}>
+        <strong>上下文已压缩（{item.trigger === 'auto' ? '自动' : '手动'}）</strong>
+        <span>{compactTokens(item.preTokens)} → {item.postTokens ? compactTokens(item.postTokens) : '…'}</span>
+        {item.status === 'running' && <span className="context-compaction-status">进行中…</span>}
+        {item.status === 'failed' && <span className="context-compaction-status">失败</span>}
+        {item.status === 'interrupted' && <span className="context-compaction-status">已中断</span>}
+        {item.summary && <details><summary>查看摘要</summary><pre>{item.summary}</pre></details>}
+      </div>)}
       {footer}
       </div>
     </div>

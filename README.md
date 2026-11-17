@@ -37,7 +37,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
-| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批 |
+| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许（会话级规则，命令可选前缀或精确）/ 拒绝并反馈，拒绝原因回传给模型 |
 | IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
 | Composer 统计 | Harness 风格六枚 chip：Context / Input / Output / Hit rate / tok-s / TTFT；Context 取最新一次 prompt，Input 为计费累计（cache read+write+uncached），tok/s=Σoutput/Σdecode，TTFT 为平均首 token；点击展开详情；缺失字段显示 —，不用文本估算 |
@@ -201,13 +201,19 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - ZCode 轻量 Diff、变更卡、preview/apply 撤销
 - Activity 项目级真实聚合（历史行数不回填）
 - 右侧 rAF 分栏、停止后输入队列、侧栏对齐
+- 统一 Dialog 适配层（8 个弹窗，Portal/Overlay/固定居中/变体）
+- DeepSeek Harness 六 chip 统计（Context/Input/Output/Hit/tok-s/TTFT）与 run_metrics v10 持久化
+- 工具审批 allow-once / allow-always / deny feedback（会话级规则、命令前缀/精确命令）
+- 中断/失败轮次上下文回放（部分输出 + 工具动作摘要），同一会话继续追问不丢工作记忆
+- ZCode 风格 context_compaction：80% 自动触发、`/compact` 手动触发、持久摘要与 pre/post token 分隔行
+- run 内工具消息持久化与回放（v12），同一 session 新 run 不再丢失上一轮工具上下文
+- ZCode 风格 reasoning/content chunk 合并（32ms/512 字符），长思考不再每 token 重渲染
 
 后续重点：
 
 - 可写子智能体（按工具授权 + 独立审批）、子会话目录与侧栏
 - Activity 费用估算（接入模型价格表）与历史行数回填
 - 完整中英文 i18n 与消息目录
-- 工具审批的 allow-once / allow-always / deny feedback
 - 模型文件上下文授权、执行前基线核验
 - 自动任务、附件后端与系统凭据保护
 

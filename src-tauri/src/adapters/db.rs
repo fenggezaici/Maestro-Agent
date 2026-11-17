@@ -6,7 +6,8 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{
-    ActivityDay, ActivitySnapshot, AppResult, RunChangeSummary, RunFileChange, Mode, PlanCard,
+    ActivityDay, ActivitySnapshot, AppResult, ContextCompaction, RunChangeSummary, RunFileChange, Mode, PlanCard,
+    RunMessage,
     PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics, RunStatus, RunView, SessionDetail,
     SessionView, SubagentStatus, SubagentView, ToolCallView,
 };
@@ -289,6 +290,8 @@ impl Database {
                 "DELETE FROM plan_cards WHERE session_id = ?1",
                 "DELETE FROM run_file_changes WHERE session_id = ?1",
                 "DELETE FROM subagent_traces WHERE session_id = ?1",
+                "DELETE FROM session_compactions WHERE session_id = ?1",
+                "DELETE FROM run_messages WHERE session_id = ?1",
                 "DELETE FROM runs WHERE session_id = ?1",
             ] {
                 transaction.execute(statement, [session_id]).map_err(db_error)?;
@@ -368,6 +371,10 @@ impl Database {
                 "DELETE FROM run_file_changes WHERE project_id = ?1 OR session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM subagent_traces WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM session_compactions WHERE session_id IN
+                 (SELECT id FROM sessions WHERE project_id = ?1)",
+                "DELETE FROM run_messages WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
                 "DELETE FROM runs WHERE session_id IN
                  (SELECT id FROM sessions WHERE project_id = ?1)",
@@ -532,7 +539,21 @@ impl Database {
                 .map_err(db_error)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(db_error)?;
-            Ok(SessionDetail { session, runs, plans, metrics, tools })
+            let compactions = {
+                let mut statement = connection
+                    .prepare("SELECT operation_id, session_id, through_run_id, summary, trigger, status, pre_tokens, post_tokens, created_at FROM session_compactions WHERE session_id=?1 ORDER BY created_at")
+                    .map_err(db_error)?;
+                let rows = statement.query_map([session_id], compaction_row).map_err(db_error)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
+            };
+            let run_messages = {
+                let mut statement = connection
+                    .prepare("SELECT run_id, session_id, seq, role, content, tool_calls, tool_call_id, name FROM run_messages WHERE session_id=?1 ORDER BY run_id, seq")
+                    .map_err(db_error)?;
+                let rows = statement.query_map([session_id], run_message_row).map_err(db_error)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
+            };
+            Ok(SessionDetail { session, runs, plans, metrics, tools, compactions, run_messages })
         }).await
     }
 
@@ -630,6 +651,63 @@ impl Database {
     }
 
     /// Newest reports first, capped for conversation-context injection.
+    pub async fn save_run_messages(&self, messages: Vec<RunMessage>) -> AppResult<()> {
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db_error)?;
+            for message in messages {
+                let tool_calls = message
+                    .tool_calls
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "INSERT INTO run_messages (run_id, session_id, seq, role, content, tool_calls, tool_call_id, name)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                         ON CONFLICT(run_id, seq) DO UPDATE SET role=excluded.role, content=excluded.content,
+                         tool_calls=excluded.tool_calls, tool_call_id=excluded.tool_call_id, name=excluded.name",
+                        params![message.run_id, message.session_id, message.seq, message.role,
+                            message.content, tool_calls, message.tool_call_id, message.name],
+                    )
+                    .map_err(db_error)?;
+            }
+            transaction.commit().map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn save_compaction(&self, compaction: ContextCompaction) -> AppResult<()> {
+        self.call(move |connection| {
+            let pre = i64::try_from(compaction.pre_tokens).map_err(|_| "Invalid compaction tokens")?;
+            let post = compaction.post_tokens.map(i64::try_from).transpose().map_err(|_| "Invalid compaction tokens")?;
+            connection
+                .execute(
+                    "INSERT INTO session_compactions
+                     (operation_id, session_id, through_run_id, summary, trigger, status, pre_tokens, post_tokens, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                     ON CONFLICT(operation_id) DO UPDATE SET status=excluded.status, summary=excluded.summary,
+                     through_run_id=excluded.through_run_id, post_tokens=excluded.post_tokens",
+                    params![compaction.operation_id, compaction.session_id, compaction.through_run_id,
+                        compaction.summary, compaction.trigger, compaction.status, pre, post, compaction.created_at],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_compactions(&self, session_id: i64) -> AppResult<Vec<ContextCompaction>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT operation_id, session_id, through_run_id, summary, trigger, status, pre_tokens, post_tokens, created_at FROM session_compactions WHERE session_id=?1 ORDER BY created_at")
+                .map_err(db_error)?;
+            let rows = statement.query_map([session_id], compaction_row).map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
+    }
+
     pub async fn recent_subagent_reports(
         &self,
         session_id: i64,
@@ -928,6 +1006,34 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
     })
 }
 
+fn run_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunMessage> {
+    let tool_calls: Option<String> = row.get(5)?;
+    Ok(RunMessage {
+        run_id: row.get(0)?,
+        session_id: row.get(1)?,
+        seq: row.get(2)?,
+        role: row.get(3)?,
+        content: row.get(4)?,
+        tool_calls: tool_calls.and_then(|value| serde_json::from_str(&value).ok()),
+        tool_call_id: row.get(6)?,
+        name: row.get(7)?,
+    })
+}
+
+fn compaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextCompaction> {
+    Ok(ContextCompaction {
+        operation_id: row.get(0)?,
+        session_id: row.get(1)?,
+        through_run_id: row.get(2)?,
+        summary: row.get(3)?,
+        trigger: row.get(4)?,
+        status: row.get(5)?,
+        pre_tokens: row.get::<_, i64>(6)? as u64,
+        post_tokens: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+        created_at: row.get(8)?,
+    })
+}
+
 fn subagent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentView> {
     let tools_json: String = row.get(16)?;
     let tools: Vec<ToolCallView> = serde_json::from_str(&tools_json).unwrap_or_default();
@@ -1037,9 +1143,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 10 {
+    if version > 12 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 10"
+            "Database schema {version} is newer than supported version 12"
         ));
     }
     connection
@@ -1226,6 +1332,46 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
                  ALTER TABLE run_metrics ADD COLUMN last_elapsed_ms INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE run_metrics ADD COLUMN last_first_token_ms INTEGER;
                  PRAGMA user_version = 10;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 11 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE session_compactions (
+                    operation_id TEXT PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    through_run_id INTEGER NOT NULL,
+                    summary TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    pre_tokens INTEGER NOT NULL DEFAULT 0,
+                    post_tokens INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE INDEX session_compactions_session ON session_compactions(session_id, created_at);
+                 PRAGMA user_version = 11;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 12 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE run_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    tool_calls TEXT,
+                    tool_call_id TEXT,
+                    name TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE UNIQUE INDEX run_messages_run_seq ON run_messages(run_id, seq);
+                 CREATE INDEX run_messages_session ON run_messages(session_id, run_id, seq);
+                 PRAGMA user_version = 12;",
             )
             .map_err(db_error)?;
     }
@@ -1434,7 +1580,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 11)
+                    .pragma_update(None, "user_version", 13)
                     .map_err(db_error)
             })
             .await

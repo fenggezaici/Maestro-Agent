@@ -17,7 +17,9 @@ use crate::{
         policy::{self, ToolEffect, ToolGate},
         AppResult, ChatMessage, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft,
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
-        format_answers, parse_questions, validate_answers, Question, QuestionAnswer, SubagentStatus,
+        format_answers, parse_questions, validate_answers, ApprovalCandidate, ApprovalDecision, ApprovalRule,
+        ContextCompaction,
+        CommandScope, Question, QuestionAnswer, RunMessage, SubagentStatus,
         SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
     },
     services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
@@ -40,7 +42,14 @@ struct Control {
 }
 
 struct PendingApproval {
-    responder: oneshot::Sender<bool>,
+    responder: oneshot::Sender<ApprovalResponse>,
+    session_id: i64,
+    candidates: Vec<ApprovalCandidate>,
+}
+
+struct ApprovalResponse {
+    decision: ApprovalDecision,
+    feedback: Option<String>,
 }
 
 struct PendingQuestion {
@@ -102,6 +111,8 @@ pub struct Kernel {
     /// Cancellation channels for running children, so one child can stop alone.
     subagent_cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
     metrics_acc: StdMutex<HashMap<i64, MetricsAccumulator>>,
+    /// Session-scoped "always allow" rules; cleared when the app exits.
+    approval_rules: StdMutex<HashMap<i64, Vec<ApprovalRule>>>,
 }
 
 impl Kernel {
@@ -127,6 +138,7 @@ impl Kernel {
             subagents: StdMutex::new(HashMap::new()),
             subagent_cancels: StdMutex::new(HashMap::new()),
             metrics_acc: StdMutex::new(HashMap::new()),
+            approval_rules: StdMutex::new(HashMap::new()),
         });
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
         Ok(kernel)
@@ -317,7 +329,10 @@ impl Kernel {
         // Unblock any call suspended on an approval so the loop can observe
         // the cancellation and finish instead of hanging on the user's answer.
         if let Some(pending) = control.pending.take() {
-            let _ = pending.responder.send(false);
+            let _ = pending.responder.send(ApprovalResponse {
+                decision: ApprovalDecision::Deny,
+                feedback: None,
+            });
         }
         if let Some(question) = control.pending_question.take() {
             let _ = question.responder.send(None);
@@ -594,6 +609,76 @@ impl Kernel {
         Ok(())
     }
 
+    pub async fn save_run_messages(&self, messages: Vec<RunMessage>) -> AppResult<()> {
+        self.database.save_run_messages(messages).await
+    }
+
+    pub async fn save_compaction(&self, compaction: ContextCompaction) -> AppResult<()> {
+        self.database.save_compaction(compaction.clone()).await?;
+        let mut state = self.state.lock().await;
+        self.emit_locked(&mut state, EventData::ContextCompaction { compaction });
+        Ok(())
+    }
+
+    /// Manual `/compact`: fold terminal runs into one persisted summary. The
+    /// next run replays the summary instead of the covered runs.
+    pub async fn compact_session(&self, session_id: i64) -> AppResult<()> {
+        let detail = self.session_detail(session_id).await?;
+        let terminal: Vec<_> = detail
+            .runs
+            .iter()
+            .filter(|run| run.status != RunStatus::Running)
+            .collect();
+        let Some(latest) = terminal.last() else {
+            return Ok(());
+        };
+        let mut summary = String::from("[手动压缩] 会话历史摘要：\n");
+        for run in &terminal {
+            summary.push_str(&format!(
+                "- [{}] {}: {}\n",
+                run.status.as_str(),
+                run.prompt.chars().take(200).collect::<String>(),
+                run.output.chars().take(500).collect::<String>()
+            ));
+            let calls: Vec<_> = detail.tools.iter().filter(|call| call.run_id == run.id).collect();
+            let start = calls.len().saturating_sub(12);
+            for call in &calls[start..] {
+                summary.push_str(&format!(
+                    "  · {} · {}\n",
+                    call.tool,
+                    call.detail.replace(['\n', '\r'], " ").chars().take(120).collect::<String>()
+                ));
+            }
+        }
+        let summary: String = summary.chars().take(12000).collect();
+        let pre: u64 = terminal
+            .iter()
+            .map(|run| (run.prompt.len() + run.output.len()) as u64 / 4)
+            .sum();
+        let compaction = ContextCompaction {
+            operation_id: format!("compact-manual-{}-{}", session_id, crate::domain::unix_now()),
+            session_id,
+            through_run_id: latest.id,
+            post_tokens: Some((summary.len() / 4) as u64),
+            summary,
+            trigger: "manual".into(),
+            status: "completed".into(),
+            pre_tokens: pre,
+            created_at: crate::domain::unix_now(),
+        };
+        self.save_compaction(compaction).await
+    }
+
+    pub async fn latest_compaction(&self, session_id: i64) -> AppResult<Option<ContextCompaction>> {
+        Ok(self
+            .database
+            .list_compactions(session_id)
+            .await?
+            .into_iter()
+            .filter(|item| item.status == "completed")
+            .last())
+    }
+
     pub async fn list_subagent_traces(&self, session_id: i64) -> AppResult<Vec<SubagentView>> {
         let mut traces = self.database.list_subagent_traces(session_id).await?;
         let live = self.subagents.lock().unwrap();
@@ -698,7 +783,13 @@ impl Kernel {
 
     /// Resolve a suspended tool call: `true` executes it, `false` rejects it.
     /// A run holds at most one pending approval; unknown/stale calls error.
-    pub async fn resolve_approval(&self, run_id: i64, approved: bool) -> AppResult<()> {
+    pub async fn resolve_approval(
+        &self,
+        run_id: i64,
+        decision: ApprovalDecision,
+        command_scope: CommandScope,
+        feedback: Option<String>,
+    ) -> AppResult<()> {
         let _command = self.commands.lock().await;
         let mut state = self.state.lock().await;
         Self::active_run_locked(&state, run_id)?;
@@ -707,7 +798,17 @@ impl Kernel {
             .as_mut()
             .and_then(|control| control.pending.take())
             .ok_or("没有等待批准的工具调用")?;
-        let _ = pending.responder.send(approved);
+        if decision == ApprovalDecision::AllowAlways {
+            let mut rules = self.approval_rules.lock().unwrap();
+            let entry = rules.entry(pending.session_id).or_default();
+            for candidate in &pending.candidates {
+                let rule = ApprovalRule::from_candidate(candidate, command_scope);
+                if !entry.contains(&rule) {
+                    entry.push(rule);
+                }
+            }
+        }
+        let _ = pending.responder.send(ApprovalResponse { decision, feedback });
         Ok(())
     }
 
@@ -806,6 +907,30 @@ impl Kernel {
         Ok(())
     }
 
+    fn approval_candidate(tool: &str, arguments_json: &str) -> ApprovalCandidate {
+        let value: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+        let command = (tool == "run_command")
+            .then(|| value.get("command").and_then(|item| item.as_str()).map(str::to_string))
+            .flatten();
+        let target = if let Some(command) = &command {
+            command.clone()
+        } else if tool.starts_with("mcp__") {
+            String::new()
+        } else {
+            ToolRouter::call_target(tool, arguments_json)
+        };
+        ApprovalCandidate { tool: tool.into(), target, command }
+    }
+
+    fn is_auto_approved(&self, session_id: i64, candidate: &ApprovalCandidate) -> bool {
+        self.approval_rules
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .is_some_and(|rules| rules.iter().any(|rule| rule.matches(candidate)))
+    }
+
     /// Execute one model-requested tool call: classify, apply the mode gate
     /// (deny / suspend-for-approval / allow), route, audit, and return bounded
     /// text for the next conversation turn. The approval wait never holds the
@@ -886,11 +1011,19 @@ impl Kernel {
         // whole batch can share one approval wait.
         let mut gates = Vec::with_capacity(calls.len());
         let mut suspended = Vec::new();
+        let mut auto_approved = Vec::new();
+        let mut candidates = Vec::new();
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             let target = ToolRouter::call_target(tool, arguments_json);
             self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
+            let candidate = Self::approval_candidate(tool, arguments_json);
+            let auto = self.is_auto_approved(run.session_id, &candidate);
             let gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
+                Ok(effect) if auto => {
+                    auto_approved.push(index);
+                    Gate::Allow(effect)
+                }
                 Ok(effect) => match policy::gate_with_args(mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
                     ToolGate::Deny => Gate::Denied(
                         self.block_tool_scoped(
@@ -903,6 +1036,7 @@ impl Kernel {
                     ),
                     ToolGate::RequireApproval => {
                         suspended.push(index);
+                        candidates.push(candidate);
                         Gate::Suspended(effect)
                     }
                     ToolGate::Allow => Gate::Allow(effect),
@@ -912,8 +1046,8 @@ impl Kernel {
         }
         // Phase 2: one shared suspension — every gated call reports
         // AwaitingApproval (with its own preview) before the single wait.
-        let approved = if suspended.is_empty() {
-            true
+        let (approved, feedback) = if suspended.is_empty() {
+            (true, None)
         } else {
             let (tx, rx) = oneshot::channel();
             let mut waiting = false;
@@ -921,7 +1055,11 @@ impl Kernel {
                 let mut state = self.state.lock().await;
                 if Self::active_run_locked(&state, run_id).is_ok() {
                     if let Some(control) = state.control.as_mut() {
-                        control.pending = Some(PendingApproval { responder: tx });
+                        control.pending = Some(PendingApproval {
+                            responder: tx,
+                            session_id: run.session_id,
+                            candidates: candidates.clone(),
+                        });
                         waiting = true;
                     }
                 }
@@ -934,7 +1072,18 @@ impl Kernel {
                 self.emit_tool_scoped(run_id, subagent_id, &calls[index].0, ToolPhase::AwaitingApproval, &preview)
                     .await;
             }
-            waiting && rx.await.unwrap_or(false)
+            if !waiting {
+                (false, None)
+            } else {
+                let response = rx.await.unwrap_or(ApprovalResponse {
+                    decision: ApprovalDecision::Deny,
+                    feedback: None,
+                });
+                match response.decision {
+                    ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => (true, None),
+                    ApprovalDecision::Deny => (false, response.feedback),
+                }
+            }
         };
         // Pure read-only batches run concurrently. Started events were already
         // emitted in call order; Finished events are emitted in the same order,
@@ -976,10 +1125,18 @@ impl Kernel {
             match &mut gates[index] {
                 Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
                 Gate::Suspended(_) if !approved => {
-                    results.push(self.block_tool_scoped(run_id, subagent_id, tool, "用户拒绝了该操作".into()).await);
+                    let reason = feedback
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| format!("用户拒绝了该操作：{value}"))
+                        .unwrap_or_else(|| "用户拒绝了该操作".into());
+                    results.push(self.block_tool_scoped(run_id, subagent_id, tool, reason).await);
                 }
                 Gate::Allow(effect) | Gate::Suspended(effect) => {
-                    let audit = if suspended.contains(&index) {
+                    let audit = if auto_approved.contains(&index) {
+                        "auto-approved"
+                    } else if suspended.contains(&index) {
                         "user approved"
                     } else {
                         "extension"
@@ -1552,7 +1709,10 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         // a waiting execute_model_tool resolves as rejected, not as a hang.
         if let Some(control) = state.control.as_mut() {
             if let Some(pending) = control.pending.take() {
-                let _ = pending.responder.send(false);
+                let _ = pending.responder.send(ApprovalResponse {
+                    decision: ApprovalDecision::Deny,
+                    feedback: None,
+                });
             }
         }
         state.control = None;
@@ -1574,7 +1734,10 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
             state.control.as_mut().map(|control| {
                 let _ = control.cancel.send(true);
                 if let Some(pending) = control.pending.take() {
-                    let _ = pending.responder.send(false);
+                    let _ = pending.responder.send(ApprovalResponse {
+                    decision: ApprovalDecision::Deny,
+                    feedback: None,
+                });
                 }
                 control.done.clone()
             })
@@ -1610,6 +1773,7 @@ mod tests {
             provider: crate::adapters::llm::Provider::Openai,
             reasoning: None,
             max_output: None,
+            context_window: None,
             session: None,
         }
     }
@@ -2048,7 +2212,7 @@ mod tests {
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
-        kernel.resolve_approval(id, true).await.unwrap();
+        kernel.resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Prefix, None).await.unwrap();
         assert!(call.await.unwrap().is_ok());
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
@@ -2092,8 +2256,12 @@ mod tests {
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
-        kernel.resolve_approval(id, false).await.unwrap();
-        assert!(call.await.unwrap().is_err());
+        kernel
+            .resolve_approval(id, ApprovalDecision::Deny, CommandScope::Prefix, Some("不要写 b.txt".into()))
+            .await
+            .unwrap();
+        let error = call.await.unwrap().unwrap_err();
+        assert!(error.contains("不要写 b.txt"), "{error}");
         assert!(!workspace.path().join("b.txt").exists());
         assert!(events
             .lock()
@@ -2101,6 +2269,38 @@ mod tests {
             .iter()
             .any(|event| matches!(event.data, EventData::ToolCall { phase: ToolPhase::Blocked, .. })));
         kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allow_always_skips_the_next_approval_for_the_same_target() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let worker = kernel.clone();
+        let first = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"a.txt","content":"one"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowAlways, CommandScope::Prefix, None)
+            .await
+            .unwrap();
+        assert!(first.await.unwrap().is_ok());
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            kernel.execute_model_tool(id, "write_file", r#"{"path":"a.txt","content":"two"}"#),
+        )
+        .await
+        .expect("allow-always must not suspend the same target again")
+        .unwrap();
+        assert!(second.contains("a.txt"));
+        kernel.finish(id, RunStatus::Completed, None).await;
         kernel.shutdown().await.unwrap();
     }
 
@@ -2163,7 +2363,7 @@ mod tests {
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
-        kernel.resolve_approval(id, true).await.unwrap();
+        kernel.resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Prefix, None).await.unwrap();
         let output = call.await.unwrap().unwrap();
         assert!(output.contains("exit code 0"), "{output}");
         assert!(output.contains("approved-run"), "{output}");
@@ -2180,7 +2380,7 @@ mod tests {
             worker.execute_model_tool(id, "list_sessions", "{}").await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
-        kernel.resolve_approval(id, true).await.unwrap();
+        kernel.resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Prefix, None).await.unwrap();
         assert!(call.await.unwrap().is_ok());
         kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();

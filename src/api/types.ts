@@ -74,6 +74,9 @@ export interface UserQuestion {
 }
 export interface QuestionAnswer { questionId: string; selected: string[]; custom?: string | null }
 
+export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
+export type CommandScope = 'prefix' | 'exact';
+
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 export interface SubagentView {
   id: string;
@@ -109,7 +112,16 @@ export type ApprovalPreview =
   | { kind: 'write'; path: string; exists: boolean; old: string; new: string }
   | { kind: 'command'; command: string }
   | { kind: 'args'; arguments: string };
-export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[] }
+export interface ContextCompaction {
+  operationId: string; sessionId: number; throughRunId: number; summary: string;
+  trigger: 'auto' | 'manual'; status: 'running' | 'completed' | 'failed' | 'interrupted';
+  preTokens: number; postTokens?: number | null; createdAt: number;
+}
+export interface RunMessage {
+  runId: number; sessionId: number; seq: number; role: string; content: string;
+  toolCalls?: unknown; toolCallId?: string | null; name?: string | null;
+}
+export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[] }
 
 /// Single `kernel-event` channel contract. Streamed text arrives already
 /// classified as `content` (answer) or `reasoning` (thinking); tool execution
@@ -132,5 +144,6 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'subagent_token'; runId: number; subagentId: string; kind: 'content' | 'reasoning'; token: string }
   | { type: 'subagent_finished'; runId: number; subagentId: string; status: SubagentStatus; summary: string; error: string | null; toolCount: number; inputTokens: number | null; outputTokens: number | null; finishedAt: number }
   | { type: 'user_question'; runId: number; requestId: string; questions: UserQuestion[] }
+  | { type: 'context_compaction'; compaction: ContextCompaction }
   | { type: 'reasoning'; runId: number; token: string }
 );

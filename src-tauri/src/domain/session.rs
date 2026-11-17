@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{metrics::RunMetrics, plan::PlanCard};
+use crate::domain::{compaction::ContextCompaction, metrics::RunMetrics, plan::PlanCard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +106,22 @@ pub struct ProjectView {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunMessage {
+    pub run_id: i64,
+    pub session_id: i64,
+    pub seq: i64,
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
@@ -114,6 +130,10 @@ pub struct SessionDetail {
     pub plans: Vec<PlanCard>,
     pub metrics: Vec<RunMetrics>,
     pub tools: Vec<ToolCallView>,
+    #[serde(default)]
+    pub compactions: Vec<ContextCompaction>,
+    #[serde(default)]
+    pub run_messages: Vec<RunMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

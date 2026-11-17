@@ -63,7 +63,7 @@ it('interleaves sealed reasoning nodes with tool rows and keeps the active burst
     reasoning('follow-up', 4000),
   ];
   render(<ChatStream {...base} liveTools={{ 1: calls }} liveTimeline={{ 1: timeline }} />);
-  fireEvent.click(screen.getByRole('button', { name: /已工作 3 秒/ }));
+  fireEvent.click(screen.getByRole('button', { name: /思考 3 秒/ }));
   expect(screen.getByText('思考 · 3 秒')).toBeInTheDocument();
   expect(screen.getByText('思考 · 进行中…')).toBeInTheDocument();
   expect(screen.getByText('读取')).toBeInTheDocument();

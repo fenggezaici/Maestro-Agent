@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     adapters::llm::{ChatConfig, LlmProvider, StreamEvent, TurnOutcome},
     domain::{
-        AppResult, ChatMessage, Mode, RunMetrics, RunStatus, RunView, SessionDetail,
-        SubagentStatus, SubagentTokenKind, SubagentView, ToolPhase, ToolSpec,
+        AppResult, ChatMessage, ContextCompaction, Mode, RunMessage, RunMetrics, RunStatus, RunView, SessionDetail,
+        SubagentStatus, SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
     },
     services::kernel::Kernel,
 };
@@ -23,6 +23,9 @@ fn max_tool_rounds() -> usize {
 }
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+/// ZCode-style chunking: coalesce raw deltas before emitting to the UI.
+const STREAM_CHUNK_INTERVAL: Duration = Duration::from_millis(32);
+const STREAM_CHUNK_BYTES: usize = 512;
 
 /// Scoped reads only reach the selected workspace. Tell the model up front so
 /// it explains the boundary instead of burning turns probing outside paths.
@@ -54,6 +57,8 @@ fn subagent_timeout() -> Duration {
 /// Partial findings kept when a child times out or exhausts its step budget.
 const SUBAGENT_PARTIAL_BYTES: usize = 16384;
 
+const HISTORY_HINT: &str = "历史中被中断的轮次只包含部分输出；它们是已完成的工作记录，不要重复执行，除非用户要求。";
+
 const TASK_PLAN_HINT: &str = "在执行涉及多个文件或步骤的复杂任务前，必须先调用 update_plan 列出计划（每个步骤包含 id、description、status；初始为 pending，当前要做的步骤为 in_progress）。在后续执行中，每完成一步，必须重新调用 update_plan 提交完整步骤列表并更新各步状态；全部完成时所有步骤都应为 completed。简单的单步任务可以跳过。";
 
 /// Conversation assembly: system policy for the run's mode plus prior
@@ -68,34 +73,133 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
     };
     let mut messages = vec![ChatMessage::text(
         "system",
-        format!("{policy}\n{SANDBOX_HINT}\n{SUBAGENT_HINT}\n{TASK_PLAN_HINT}"),
+        format!("{policy}\n{SANDBOX_HINT}\n{SUBAGENT_HINT}\n{TASK_PLAN_HINT}\n{HISTORY_HINT}"),
     )];
+    let latest = detail
+        .compactions
+        .iter()
+        .rev()
+        .find(|compaction| compaction.status == "completed");
+    let boundary = latest.map(|compaction| compaction.through_run_id).unwrap_or(0);
+    if let Some(compaction) = latest {
+        messages.push(ChatMessage::text(
+            "system",
+            format!("[上下文压缩摘要]
+{}", compaction.summary),
+        ));
+    }
     let prior: Vec<_> = detail
         .runs
         .iter()
         .filter(|item| {
-            item.id < run.id
+            item.id > boundary
+                && item.id < run.id
                 && item.session_id == run.session_id
-                && item.status == RunStatus::Completed
-                && !item.output.is_empty()
+                && item.status != RunStatus::Running
         })
         .collect();
     let mut budget = 131072usize;
     let mut included = Vec::new();
     for item in prior.into_iter().rev().take(32) {
-        let size = item.prompt.len() + item.output.len();
+        let summary = tool_summary(detail, item.id);
+        let mut output = item.output.clone();
+        let mut run_messages: Vec<RunMessage> = detail
+            .run_messages
+            .iter()
+            .filter(|message| message.run_id == item.id)
+            .cloned()
+            .collect();
+        let message_bytes: usize = run_messages.iter().map(|message| message.content.len()).sum();
+        let mut size = item.prompt.len() + output.len() + summary.len() + message_bytes;
+        if size > budget {
+            output = truncate_middle(&output, 4096);
+            size = item.prompt.len() + output.len() + summary.len() + message_bytes;
+        }
+        if size > budget {
+            run_messages.clear();
+            size = item.prompt.len() + output.len() + summary.len();
+        }
+        if size > budget {
+            output.clear();
+            size = item.prompt.len() + summary.len();
+        }
         if size > budget {
             break;
         }
         budget -= size;
-        included.push(item);
+        included.push((item, output, summary, run_messages));
     }
-    for item in included.into_iter().rev() {
+    for (item, output, summary, run_messages) in included.into_iter().rev() {
         messages.push(ChatMessage::text("user", item.prompt.clone()));
-        messages.push(ChatMessage::text("assistant", item.output.clone()));
+        if !run_messages.is_empty() {
+            for message in &run_messages {
+                let tool_calls = message
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                messages.push(ChatMessage {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    tool_calls,
+                    tool_call_id: message.tool_call_id.clone(),
+                    name: message.name.clone(),
+                    images: None,
+                });
+            }
+        }
+        let mut body = match item.status {
+            RunStatus::Completed => {
+                if output.trim().is_empty() { "[上一轮没有最终文字输出]".to_string() } else { output }
+            }
+            RunStatus::Cancelled => format!(
+                "[上一轮被用户中断（cancelled），以下为已产生的部分输出，不是最终答案]\n{}",
+                if output.trim().is_empty() { "（没有已产生的输出）" } else { output.as_str() }
+            ),
+            RunStatus::Failed => format!(
+                "[上一轮执行失败（failed），以下为已产生的部分输出，不是最终答案]\n{}",
+                if output.trim().is_empty() { "（没有已产生的输出）" } else { output.as_str() }
+            ),
+            RunStatus::Running => continue,
+        };
+        if let Some(error) = item.error.as_deref().filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("\n[错误：{error}]"));
+        }
+        messages.push(ChatMessage::text("assistant", body));
+        if run_messages.is_empty() && !summary.is_empty() {
+            messages.push(ChatMessage::text(
+                "system",
+                format!("上一轮实际执行过的工具（供参考，不要当作新任务）：\n{summary}"),
+            ));
+        }
     }
     messages.push(ChatMessage::text("user", run.prompt.clone()));
     messages
+}
+
+fn tool_summary(detail: &SessionDetail, run_id: i64) -> String {
+    let calls: Vec<&ToolCallView> = detail.tools.iter().filter(|call| call.run_id == run_id).collect();
+    let start = calls.len().saturating_sub(12);
+    calls[start..]
+        .iter()
+        .map(|call| {
+            let text = call.detail.replace(['\n', '\r'], " ");
+            format!("- {} · {}", call.tool, text.chars().take(120).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let half = max / 2;
+    format!(
+        "{}\n…\n{}",
+        chars[..half].iter().collect::<String>(),
+        chars[chars.len() - half..].iter().collect::<String>()
+    )
 }
 
 /// Same as `conversation`, plus a bounded block of earlier child reports so a
@@ -110,6 +214,22 @@ pub fn conversation_with_reports(
         messages.insert(1, ChatMessage::text("system", reports));
     }
     messages
+}
+
+async fn flush_reasoning(kernel: &Kernel, run_id: i64, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    let chunk = std::mem::take(buffer);
+    kernel.reasoning_token(run_id, chunk).await;
+}
+
+async fn flush_content(kernel: &Kernel, run_id: i64, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    let chunk = std::mem::take(buffer);
+    kernel.token(run_id, chunk).await;
 }
 
 /// One provider turn with event relay. Returns when the provider's stream
@@ -161,20 +281,48 @@ async fn stream_turn(
             };
             // Drain relay: drop any buffered events the instant the run is
             // cancelled — this is what makes "stop" actually stop the stream.
+            let mut reasoning_buf = String::new();
+            let mut content_buf = String::new();
+            let mut last_chunk = Instant::now();
             loop {
                 let event = tokio::select! {
+                    biased;
                     event = rx.recv() => event,
                     _ = relay_cancel.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(8)) => {
+                        if last_chunk.elapsed() >= STREAM_CHUNK_INTERVAL {
+                            flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                            flush_content(&kernel, run_id, &mut content_buf).await;
+                            last_chunk = Instant::now();
+                        }
+                        continue;
+                    }
                 };
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                    flush_content(&kernel, run_id, &mut content_buf).await;
+                    break;
+                };
                 match event {
-                    StreamEvent::Reasoning(token) => kernel.reasoning_token(run_id, token).await,
+                    StreamEvent::Reasoning(token) => {
+                        reasoning_buf.push_str(&token);
+                        if reasoning_buf.len() >= STREAM_CHUNK_BYTES || last_chunk.elapsed() >= STREAM_CHUNK_INTERVAL {
+                            flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                            last_chunk = Instant::now();
+                        }
+                    }
                     StreamEvent::Token(token) => {
+                        // A content delta always ends the current thought burst.
+                        flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                         if first_token_ms.is_none() {
                             first_token_ms = Some(started.elapsed().as_millis() as u64);
                             metrics.first_token_ms = first_token_ms;
                         }
-                        kernel.token(run_id, token).await;
+                        content_buf.push_str(&token);
+                        if content_buf.len() >= STREAM_CHUNK_BYTES || last_chunk.elapsed() >= STREAM_CHUNK_INTERVAL {
+                            flush_content(&kernel, run_id, &mut content_buf).await;
+                            last_chunk = Instant::now();
+                        }
                         if reported.elapsed() >= METRICS_REPORT_INTERVAL {
                             metrics.elapsed_ms = started.elapsed().as_millis() as u64;
                             let _ = kernel.report_metrics(metrics.clone(), false).await;
@@ -182,6 +330,8 @@ async fn stream_turn(
                         }
                     }
                     StreamEvent::Usage { input, output, cache_hit, cache_write, reasoning } => {
+                        flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                        flush_content(&kernel, run_id, &mut content_buf).await;
                         metrics.input_tokens = input.or(metrics.input_tokens);
                         metrics.output_tokens = output.or(metrics.output_tokens);
                         metrics.cache_hit_tokens = cache_hit.or(metrics.cache_hit_tokens);
@@ -189,6 +339,8 @@ async fn stream_turn(
                         metrics.reasoning_tokens = reasoning.or(metrics.reasoning_tokens);
                     }
                     StreamEvent::Done => {
+                        flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                        flush_content(&kernel, run_id, &mut content_buf).await;
                         metrics.elapsed_ms = started.elapsed().as_millis() as u64;
                         let _ = kernel.report_metrics(metrics.clone(), true).await;
                     }
@@ -267,6 +419,7 @@ async fn run_subagent(
         model: definition.model.clone().unwrap_or_else(|| config.model.clone()),
         provider: config.provider, reasoning: config.reasoning.clone(),
         max_output: config.max_output,
+        context_window: config.context_window,
         session: Some(child_session_id(config.session.as_deref(), &subagent_id)),
     };
     let provider = kernel.llm_provider(&child_config);
@@ -471,12 +624,27 @@ pub(crate) async fn run(
         let detail = kernel.session_detail(run.session_id).await?;
         let reports = kernel.recent_subagent_reports(run.session_id).await.unwrap_or_default();
         let mut messages = conversation_with_reports(&detail, &run, &reports);
+        let mut saved_upto = messages.len();
+        let mut next_seq = 0i64;
         let tools = kernel.agent_tools(run.mode).await;
         let provider = kernel.llm_provider(&config);
         let max_rounds = max_tool_rounds();
         for _round in 0..max_rounds {
             if kernel.is_cancelled(run.id).await {
                 return Ok(false);
+            }
+            if needs_compaction(&messages, config.context_window) {
+                messages = compact_messages(
+                    &kernel,
+                    &provider,
+                    &config,
+                    &messages,
+                    &run,
+                    "auto",
+                    &mut cancel,
+                )
+                .await?;
+                saved_upto = messages.len();
             }
             // Watch the cancel signal outside the provider: "stop" must work
             // even if a provider ignores the receiver while awaiting bytes.
@@ -492,7 +660,25 @@ pub(crate) async fn run(
                     &tools,
                     &mut cancel,
                     run.id,
-                ) => outcome?,
+                ) => outcome,
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) if is_context_error(&error) => {
+                    messages = compact_messages(
+                        &kernel,
+                        &provider,
+                        &config,
+                        &messages,
+                        &run,
+                        "auto",
+                        &mut cancel,
+                    )
+                    .await?;
+                    saved_upto = messages.len();
+                    stream_turn(&kernel, &provider, &config, &messages, &tools, &mut cancel, run.id).await?
+                }
+                Err(error) => return Err(error),
             };
             if !outcome.done {
                 return Ok(false);
@@ -571,6 +757,25 @@ pub(crate) async fn run(
                     images: None,
                 });
             }
+            let new_messages: Vec<RunMessage> = messages[saved_upto..]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| RunMessage {
+                    run_id: run.id,
+                    session_id: run.session_id,
+                    seq: next_seq + offset as i64,
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    tool_calls: message.tool_calls.as_ref().and_then(|calls| serde_json::to_value(calls).ok()),
+                    tool_call_id: message.tool_call_id.clone(),
+                    name: message.name.clone(),
+                })
+                .collect();
+            if !new_messages.is_empty() {
+                next_seq += new_messages.len() as i64;
+                saved_upto = messages.len();
+                let _ = kernel.save_run_messages(new_messages).await;
+            }
         }
         // Tool budget exhausted — give the model one final no-tools turn to
         // summarize what it already gathered instead of failing the run.
@@ -606,9 +811,277 @@ pub(crate) async fn run(
 }
 
 
+fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            let cjk = message.content.chars().filter(|character| ('\u{3400}'..='\u{9fff}').contains(character)).count();
+            let text = message.content.chars().count();
+            let base = cjk + text.saturating_sub(cjk) / 4;
+            let tools = message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| serde_json::to_string(calls).ok())
+                .map(|json| json.len() / 4)
+                .unwrap_or(0);
+            base + tools
+        })
+        .sum()
+}
+
+fn needs_compaction(messages: &[ChatMessage], context_window: Option<u64>) -> bool {
+    context_window.is_some_and(|window| window > 0 && estimate_tokens(messages) as f64 >= window as f64 * 0.8)
+}
+
+fn is_context_error(error: &str) -> bool {
+    let value = error.to_ascii_lowercase();
+    value.contains("context length")
+        || value.contains("maximum context")
+        || value.contains("too many tokens")
+        || value.contains("context window")
+        || value.contains("context_length_exceeded")
+}
+
+fn heuristic_summary(messages: &[ChatMessage]) -> String {
+    let mut summary = String::from("[启发式压缩] 早期对话摘要：\n");
+    for message in messages {
+        summary.push_str(&format!(
+            "- {}: {}\n",
+            message.role,
+            message.content.chars().take(300).collect::<String>()
+        ));
+    }
+    summary.chars().take(12000).collect()
+}
+
+async fn summarize_with_model(
+    provider: &Arc<dyn LlmProvider>,
+    config: &ChatConfig,
+    transcript: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<String> {
+    let summary_config = ChatConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+        provider: config.provider,
+        reasoning: None,
+        max_output: Some(1024),
+        context_window: None,
+        session: config.session.clone(),
+    };
+    let messages = vec![
+        ChatMessage::text(
+            "system",
+            "你是上下文压缩器。把下面的历史压缩成简洁中文摘要，必须保留：已完成的工作、涉及的文件路径、未完成事项、关键结论与风险。不要调用工具，不要编造。",
+        ),
+        ChatMessage::text("user", transcript),
+    ];
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let streamed = tokio::time::timeout(
+        Duration::from_secs(60),
+        provider.clone().stream(&summary_config, &messages, &[], cancel, tx),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !streamed.done {
+        return None;
+    }
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let StreamEvent::Token(token) = event {
+            text.push_str(&token);
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+async fn compact_messages(
+    kernel: &Arc<Kernel>,
+    provider: &Arc<dyn LlmProvider>,
+    config: &ChatConfig,
+    messages: &[ChatMessage],
+    run: &RunView,
+    trigger: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> AppResult<Vec<ChatMessage>> {
+    let keep = 8.min(messages.len().saturating_sub(1));
+    let split = messages.len().saturating_sub(keep);
+    if split <= 1 {
+        return Ok(messages.to_vec());
+    }
+    let pre = estimate_tokens(messages) as u64;
+    let older = &messages[1..split];
+    let transcript = older
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content.chars().take(1000).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let operation_id = format!("compact-{}-{}", run.id, crate::domain::unix_now());
+    let running = ContextCompaction {
+        operation_id: operation_id.clone(),
+        session_id: run.session_id,
+        through_run_id: run.id - 1,
+        summary: String::new(),
+        trigger: trigger.into(),
+        status: "running".into(),
+        pre_tokens: pre,
+        post_tokens: None,
+        created_at: crate::domain::unix_now(),
+    };
+    let _ = kernel.save_compaction(running.clone()).await;
+    let summary = summarize_with_model(provider, config, &transcript, cancel)
+        .await
+        .unwrap_or_else(|| heuristic_summary(older));
+    let mut next = vec![
+        messages[0].clone(),
+        ChatMessage::text("system", format!("[上下文压缩摘要]\n{summary}")),
+    ];
+    next.extend_from_slice(&messages[split..]);
+    let post = estimate_tokens(&next) as u64;
+    let _ = kernel
+        .save_compaction(ContextCompaction {
+            operation_id,
+            summary,
+            status: "completed".into(),
+            post_tokens: Some(post),
+            ..running
+        })
+        .await;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(status: RunStatus, output: &str) -> (SessionDetail, RunView) {
+        let prior = RunView {
+            id: 1,
+            session_id: 7,
+            prompt: "上一轮任务".into(),
+            mode: Mode::Code,
+            status,
+            output: output.into(),
+            error: None,
+            created_at: 1,
+        };
+        let current = RunView {
+            id: 2,
+            session_id: 7,
+            prompt: "继续".into(),
+            mode: Mode::Code,
+            status: RunStatus::Running,
+            output: String::new(),
+            error: None,
+            created_at: 2,
+        };
+        let detail = SessionDetail {
+            session: crate::domain::SessionView {
+                id: 7,
+                title: "session".into(),
+                updated_at: 2,
+                run_count: 2,
+                project_id: 1,
+                archived: false,
+            },
+            runs: vec![prior],
+            plans: Vec::new(),
+            metrics: Vec::new(),
+            compactions: Vec::new(),
+            run_messages: Vec::new(),
+            tools: vec![ToolCallView {
+                run_id: 1,
+                tool: "write_file".into(),
+                detail: "src/a.ts".into(),
+                allowed: true,
+                subagent_id: None,
+                pending: None,
+                target: None,
+            }],
+        };
+        (detail, current)
+    }
+
+    #[test]
+    fn stored_run_messages_are_replayed_in_order() {
+        let (mut detail, current) = fixture(RunStatus::Completed, "final answer");
+        detail.run_messages.push(RunMessage {
+            run_id: 1,
+            session_id: 7,
+            seq: 0,
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(serde_json::json!([
+                { "id": "call-1", "name": "read_file", "arguments": "{\"path\":\"a.ts\"}" }
+            ])),
+            tool_call_id: None,
+            name: None,
+        });
+        detail.run_messages.push(RunMessage {
+            run_id: 1,
+            session_id: 7,
+            seq: 1,
+            role: "tool".into(),
+            content: "file body".into(),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+            name: Some("read_file".into()),
+        });
+        let messages = conversation(&detail, &current);
+        assert!(messages.iter().any(|message| message.role == "tool" && message.content == "file body"));
+        assert!(!messages.iter().any(|message| message.content.contains("上一轮实际执行过的工具")));
+    }
+
+    #[test]
+    fn completed_compaction_replaces_the_runs_it_covers() {
+        let (mut detail, current) = fixture(RunStatus::Completed, "done");
+        detail.compactions.push(ContextCompaction {
+            operation_id: "compact-1".into(),
+            session_id: 7,
+            through_run_id: 1,
+            summary: "早前完成了 A".into(),
+            trigger: "auto".into(),
+            status: "completed".into(),
+            pre_tokens: 100,
+            post_tokens: Some(20),
+            created_at: 1,
+        });
+        let messages = conversation(&detail, &current);
+        assert!(messages.iter().any(|message| message.role == "system"
+            && message.content.contains("早前完成了 A")));
+        assert!(!messages.iter().any(|message| message.content.contains("上一轮任务")));
+    }
+
+    #[test]
+    fn interrupted_runs_are_replayed_with_partial_output_and_tool_summary() {
+        let (detail, current) = fixture(RunStatus::Cancelled, "已经写了 a.ts");
+        let messages = conversation(&detail, &current);
+        assert!(messages.iter().any(|message| message.role == "assistant"
+            && message.content.contains("上一轮被用户中断")
+            && message.content.contains("已经写了 a.ts")));
+        assert!(messages.iter().any(|message| message.role == "system"
+            && message.content.contains("write_file")
+            && message.content.contains("src/a.ts")));
+    }
+
+    #[test]
+    fn completed_runs_without_text_still_replay_their_tool_actions() {
+        let (detail, current) = fixture(RunStatus::Completed, "");
+        let messages = conversation(&detail, &current);
+        assert!(messages.iter().any(|message| message.role == "assistant"
+            && message.content.contains("没有最终文字输出")));
+        assert!(messages.iter().any(|message| message.role == "system"
+            && message.content.contains("write_file")));
+    }
+
+    #[test]
+    fn running_prior_runs_are_not_replayed() {
+        let (detail, current) = fixture(RunStatus::Running, "partial");
+        let messages = conversation(&detail, &current);
+        assert!(!messages.iter().any(|message| message.content.contains("上一轮任务")));
+    }
 
     #[test]
     fn child_sessions_are_distinct_from_the_parent() {

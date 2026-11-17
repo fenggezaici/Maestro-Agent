@@ -2,7 +2,7 @@
 /// `kernel-event` subscription. All `invoke`/`listen` calls for the kernel
 /// live here — nothing else may touch Tauri IPC for these.
 import { invoke } from '@tauri-apps/api/core';
-import type { QuestionAnswer } from './types';
+import type { ApprovalDecision, CommandScope, QuestionAnswer } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { providerModel } from '../providerModels';
 import { wireProvider } from '../customProviders';
@@ -18,12 +18,15 @@ export const kernelApi = {
     ...(settings.provider ? { provider: wireProvider(settings.provider) } : {}),
     ...(settings.reasoning ? { reasoning_effort: settings.reasoning } : {}),
     ...(providerModel(settings.provider ?? 'openai', settings.model)?.output ? { max_output: providerModel(settings.provider ?? 'openai', settings.model)!.output } : {}),
+    ...(providerModel(settings.provider ?? 'openai', settings.model)?.context ? { context_window: providerModel(settings.provider ?? 'openai', settings.model)!.context } : {}),
   }),
   cancel: (runId: number) => invoke<void>('cancel_agent', { runId }),
-  resolveApproval: (runId: number, approved: boolean) => invoke<void>('resolve_tool_approval', { runId, approved }),
+  resolveApproval: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) =>
+    invoke<void>('resolve_tool_approval', { runId, decision, commandScope: commandScope ?? null, feedback: feedback ?? null }),
   abort: (runId: number) => invoke<void>('abort_chat', { runId }),
   answerQuestion: (runId: number, requestId: string, answers: QuestionAnswer[]) =>
     invoke<void>('answer_user_question', { runId, requestId, answers }),
+  compactSession: (sessionId: number) => invoke<void>('compact_session', { sessionId }),
   listen: async (receive: (event: KernelEvent) => void) => {
     // Single channel: the backend emits normalized typed events (content,
     // reasoning, tool_call, status…) — no client-side reassembly.

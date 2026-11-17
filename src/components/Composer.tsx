@@ -153,7 +153,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     promptInput.current?.focus();
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={onSubmit} className="composer">
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={onSubmit} className="composer">
     {slashState && <SlashPanel groups={slashGroups} index={slashIndex} onHover={setSlashIndex} onSelect={selectSlash} />}
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
     <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />

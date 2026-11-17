@@ -1,6 +1,6 @@
 import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
 import { useState } from 'react';
-import type { SubagentView, ToolCallView } from '../api/types';
+import type { ApprovalDecision, CommandScope, SubagentView, ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
 import MiniDiff, { countChanges } from './MiniDiff';
 import { parseUserQuestionPayload, questionAnswerText } from '../lib/userQuestion';
@@ -73,8 +73,11 @@ function targetOf(call: ToolCallView): string {
 /// One collapsed tool-call row with icon + verb + target + status; expandable
 /// detail panel for results/output/failures. Exported so the reasoning timeline
 /// can interleave rows with thinking nodes in event order.
-export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, approved: boolean) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
+export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
   const [expanded, setExpanded] = useState(false);
+  const [scopeOpen, setScopeOpen] = useState(false);
+  const [denyOpen, setDenyOpen] = useState(false);
+  const [feedback, setFeedback] = useState('');
   const pending = Boolean(call.pending || call.awaitingApproval);
   const status = call.awaitingApproval ? '待批准' : call.pending ? '执行中' : call.allowed ? '已执行' : '已阻止';
   const statusClass = call.awaitingApproval || call.pending ? 'pending' : call.allowed ? 'ok' : 'blocked';
@@ -113,9 +116,25 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval,
           : preview?.kind === 'write' ? <MiniDiff before={preview.old} after={preview.new} />
           : <pre className="tool-approval-args">{preview?.kind === 'args' ? preview.arguments : call.detail}</pre>}
         <div className="tool-approval-actions">
-          <button type="button" className="button-ghost" aria-label="拒绝工具调用" onClick={() => onResolveApproval(call.runId, false)}>Reject</button>
-          <button type="button" className="button-approve" aria-label="批准工具调用" onClick={() => onResolveApproval(call.runId, true)}>Approve</button>
+          <button type="button" className="button-ghost" aria-label="批准工具调用" onClick={() => onResolveApproval(call.runId, 'allow_once')}>允许一次</button>
+          <div className="approval-always">
+            <button type="button" className="button-ghost" aria-label="始终允许工具调用"
+              onClick={() => call.tool === 'run_command' ? setScopeOpen((value) => !value) : onResolveApproval(call.runId, 'allow_always')}>始终允许</button>
+            {scopeOpen && call.tool === 'run_command' && <div className="approval-scope-menu" role="menu">
+              <button type="button" role="menuitem" onClick={() => onResolveApproval(call.runId, 'allow_always', 'prefix')}>命令前缀</button>
+              <button type="button" role="menuitem" onClick={() => onResolveApproval(call.runId, 'allow_always', 'exact')}>仅此命令</button>
+            </div>}
+          </div>
+          <button type="button" className="button-ghost" aria-label="拒绝工具调用" onClick={() => setDenyOpen((value) => !value)}>拒绝</button>
         </div>
+        {denyOpen && <div className="tool-approval-feedback">
+          <textarea aria-label="拒绝原因" value={feedback} placeholder="拒绝原因（可选），会回传给模型"
+            onChange={(event) => setFeedback(event.target.value)} />
+          <div className="tool-approval-feedback-actions">
+            <button type="button" className="button-ghost" onClick={() => onResolveApproval(call.runId, 'deny')}>直接拒绝</button>
+            <button type="button" className="button-approve" onClick={() => onResolveApproval(call.runId, 'deny', undefined, feedback.trim() || undefined)}>拒绝并反馈</button>
+          </div>
+        </div>}
       </div>;
     })()}
     {expanded && !call.awaitingApproval && (spawn

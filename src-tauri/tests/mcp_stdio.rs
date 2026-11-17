@@ -61,6 +61,7 @@ async fn fake_stdio_server_lists_calls_and_respects_trust() {
                 args: vec![script.to_string_lossy().into_owned()],
                 env: Default::default(),
                 disabled: false,
+                auto_start: false,
                 trust: false,
             },
         )

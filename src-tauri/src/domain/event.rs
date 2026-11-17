@@ -5,6 +5,7 @@ use crate::domain::{
     plan::{PlanCard, PlanStep},
     session::{Mode, RunView},
     subagent::{SubagentStatus, SubagentTokenKind, SubagentView},
+    compaction::ContextCompaction,
     user_question::Question,
 };
 
@@ -113,6 +114,8 @@ pub enum EventData {
         kind: SubagentTokenKind,
         token: String,
     },
+    /// Synthetic context-compaction separator (ZCode `context_compaction`).
+    ContextCompaction { compaction: ContextCompaction },
     /// The model is waiting for a structured answer from the user.
     UserQuestion {
         #[serde(rename = "runId")]

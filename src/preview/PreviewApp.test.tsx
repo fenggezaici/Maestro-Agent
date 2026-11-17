@@ -122,7 +122,8 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
   render(<PreviewApp />);
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-chat');
-  expect(screen.getByLabelText('会话统计')).toHaveTextContent(/Context.*Input.*Output.*Hit/);
+  expect(screen.getByLabelText('会话统计')).toHaveTextContent(/Input.*Output/);
+  expect(screen.getByLabelText('会话统计')).not.toHaveTextContent('上下文用量不可用');
   expect(screen.queryByRole('button', { name: '模型参数' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByLabelText('选择模型'));
   fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));

@@ -5,6 +5,8 @@ pub mod extension;
 pub mod message;
 pub mod activity;
 pub mod agent;
+pub mod approval;
+pub mod compaction;
 pub mod change;
 pub mod metrics;
 pub mod plan;
@@ -30,8 +32,10 @@ pub use plan::{
 };
 pub use policy::{authorize, classify, gate, ToolEffect, ToolGate};
 pub use session::{
-    unix_now, Mode, ProjectView, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
-    ToolCallView,
+    unix_now, Mode, ProjectView, RunMessage, RunStatus, RunView, SessionDetail, SessionView,
+    Snapshot, ToolCallView,
 };
+pub use approval::{ApprovalCandidate, ApprovalDecision, ApprovalRule, CommandScope};
+pub use compaction::ContextCompaction;
 pub use subagent::{SubagentStatus, SubagentTokenKind, SubagentView};
 pub use user_question::{format_answers, parse_questions, validate_answers, Question, QuestionAnswer, QuestionOption};

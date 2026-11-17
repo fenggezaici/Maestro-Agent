@@ -65,6 +65,40 @@ async fn provider(
     (url, received, task)
 }
 
+async fn provider_truncated_then_ok() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut attempt = 0;
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            if attempt == 0 {
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                // Close without the terminating zero chunk: reqwest reports a
+                // transport error before any SSE frame is delivered.
+                attempt += 1;
+                continue;
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\ndata: [DONE]\n\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            break;
+        }
+    });
+    (url, task)
+}
+
 fn config(base_url: String) -> ChatConfig {
     ChatConfig {
         api_key: "test-secret".into(),
@@ -73,6 +107,7 @@ fn config(base_url: String) -> ChatConfig {
         provider: Provider::Openai,
         reasoning: None,
         max_output: None,
+        context_window: None,
         session: None,
     }
 }
@@ -85,6 +120,71 @@ async fn idle(kernel: &Kernel) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn retries_once_when_the_gateway_closes_before_the_first_chunk() {
+    let (url, server) = provider_truncated_then_ok().await;
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(move |event| captured.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "retry this".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(runs[0].output.contains("Recovered"));
+    server.await.unwrap();
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reasoning_deltas_are_coalesced_into_one_chunk() {
+    let (url, _request, server) = provider(
+        200,
+        vec![
+            (0, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n"),
+            (0, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}\n\n"),
+            (0, "data: [DONE]\n\n"),
+        ],
+    )
+    .await;
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(move |event| captured.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "reason".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let chunks: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::Reasoning { token, .. } => Some(token.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chunks, vec!["think more".to_string()]);
+    server.await.unwrap();
+    kernel.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -297,6 +397,8 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
         runs: vec![prior, foreign, current.clone()],
         plans: Vec::new(),
         metrics: Vec::new(),
+        compactions: Vec::new(),
+        run_messages: Vec::new(),
         tools: Vec::new(),
     };
     let messages: Vec<ChatMessage> = conversation(&detail, &current);

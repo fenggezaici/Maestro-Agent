@@ -86,9 +86,11 @@ export interface WorkbenchController {
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (id: number) => unknown;
   pendingQuestion?: { runId: number; requestId: string; questions: import('../api/types').UserQuestion[] } | null;
+  compactions?: import('../api/types').ContextCompaction[];
+  compactSession?: (sessionId: number) => Promise<void>;
   answerQuestion?: (runId: number, requestId: string, answers: import('../api/types').QuestionAnswer[]) => Promise<void>;
   queueStart?: (prompt: string, images?: string[]) => void;
-  resolveApproval?: (runId: number, approved: boolean) => unknown;
+  resolveApproval?: (runId: number, decision: import('../api/types').ApprovalDecision, commandScope?: import('../api/types').CommandScope, feedback?: string) => unknown;
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
 }
@@ -353,6 +355,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     { id: 'auto', description: '切换到 Auto 模式（已开放工具直接执行）', disabled: running || c.state.mode === 'auto', run: () => void c.setMode('auto') },
     { id: 'new', description: '在当前项目新建会话', disabled: projects.length === 0 || c.pending, run: () => { const numeric = Number(currentProject.id); if (Number.isFinite(numeric)) void c.createSession(numeric); } },
     { id: 'stop', description: '停止当前生成', disabled: !running || !c.state.activeRun, run: () => { if (c.state.activeRun) c.cancel(c.state.activeRun.id); } },
+    { id: 'compact', description: '压缩当前会话上下文', disabled: running || c.selectedSessionId === null || !c.compactSession, run: () => { if (c.selectedSessionId && c.compactSession) void c.compactSession(c.selectedSessionId); } },
     { id: 'review', description: '切换右侧审查面板', run: () => setReviewOpen((value) => !value) },
     { id: 'extensions', description: '打开扩展（Skills / MCP）', run: () => setNavigation('extensions') },
     { id: 'activity', description: '打开活动面板', run: () => setNavigation('activity') },
@@ -574,7 +577,8 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
                 const top = root.scrollTop + turn.getBoundingClientRect().top - root.getBoundingClientRect().top - 12;
                 scroll.scrollToTop(top);
               }}
-              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, approved) => void c.resolveApproval!(runId, approved)}
+              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, decision, commandScope, feedback) => void c.resolveApproval!(runId, decision, commandScope, feedback)}
+              compactions={c.compactions ?? []}
               footer={runSummary && runSummary.files > 0 && !running ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
                 loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
                 onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}

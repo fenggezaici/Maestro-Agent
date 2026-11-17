@@ -44,6 +44,7 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
     case 'subagent_tool':
     case 'subagent_token':
     case 'subagent_finished':
+    case 'context_compaction':
     case 'user_question':
     case 'reasoning': return next;
     case 'metrics': return next;

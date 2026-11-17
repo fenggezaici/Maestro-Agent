@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use crate::{
     adapters::{fs::workspace::WorkspaceService, llm::{ChatConfig, Provider}},
     commands::require_main,
-    domain::{AppResult, ChatMessage, Mode, QuestionAnswer, RunView, Snapshot, SubagentView},
+    domain::{AppResult, ApprovalDecision, ChatMessage, CommandScope, Mode, QuestionAnswer, RunView, Snapshot, SubagentView},
     services::kernel::Kernel,
 };
 
@@ -44,6 +44,7 @@ pub async fn stream_chat(
     provider: Option<Provider>,
     reasoning_effort: Option<String>,
     max_output: Option<u64>,
+    context_window: Option<u64>,
 ) -> AppResult<i64> {
     if window.label() != "main" || app.get_webview_window("main").is_none() {
         return Err("Only the main window may start a chat".into());
@@ -55,6 +56,7 @@ pub async fn stream_chat(
         provider: provider.unwrap_or_default(),
         reasoning: reasoning_effort,
         max_output,
+        context_window,
         // The kernel stamps a stable per-session id before the run starts.
         session: None,
     };
@@ -94,10 +96,14 @@ pub async fn resolve_tool_approval(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,
     run_id: i64,
-    approved: bool,
+    decision: ApprovalDecision,
+    command_scope: Option<CommandScope>,
+    feedback: Option<String>,
 ) -> AppResult<()> {
     require_main(&window)?;
-    kernel.resolve_approval(run_id, approved).await
+    kernel
+        .resolve_approval(run_id, decision, command_scope.unwrap_or(CommandScope::Prefix), feedback)
+        .await
 }
 
 #[tauri::command]
@@ -140,4 +146,14 @@ pub async fn answer_user_question(
 ) -> AppResult<()> {
     require_main(&window)?;
     kernel.answer_user_question(run_id, &request_id, answers).await
+}
+
+#[tauri::command]
+pub async fn compact_session(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    session_id: i64,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.compact_session(session_id).await
 }

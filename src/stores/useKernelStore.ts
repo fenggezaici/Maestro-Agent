@@ -9,7 +9,7 @@ import { sessionsApi } from '../api/sessions';
 import { subagentsApi } from '../api/subagents';
 import type {
   KernelEvent, Mode, PlanCard, PlanDecision, PlanStep, ProjectView, RunMetrics,
-  QuestionAnswer, SessionDetail, SessionView, Snapshot, SubagentView, ToolCallView, UserQuestion,
+  ApprovalDecision, CommandScope, ContextCompaction, QuestionAnswer, SessionDetail, SessionView, Snapshot, SubagentView, ToolCallView, UserQuestion,
 } from '../api/types';
 import {
   appendContent, appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
@@ -32,6 +32,7 @@ export interface KernelStore {
   subagents: Record<string, SubagentView>;
   /** Active ask_user request, if any. */
   pendingQuestion: { runId: number; requestId: string; questions: UserQuestion[] } | null;
+  compactions: ContextCompaction[];
   /// Bumped on every `workspace_changed` kernel event — workspace views
   /// subscribe and refresh their tree/preview without polling.
   workspaceTick: number;
@@ -75,8 +76,9 @@ export interface KernelStore {
   start: (prompt: string, images?: string[]) => Promise<number | undefined>;
   cancel: (runId: number) => Promise<void>;
   answerQuestion: (runId: number, requestId: string, answers: QuestionAnswer[]) => Promise<void>;
+  compactSession: (sessionId: number) => Promise<void>;
   queueStart: (prompt: string, images?: string[]) => void;
-  resolveApproval: (runId: number, approved: boolean) => Promise<void>;
+  resolveApproval: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => Promise<void>;
   setMode: (mode: Mode) => Promise<void>;
   decidePlan: (card: PlanCard, decision: PlanDecision) => Promise<PlanCard | undefined>;
 }
@@ -152,6 +154,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
           detail: result,
           metrics: { ...s.metrics, ...Object.fromEntries((result.metrics ?? []).map((v) => [v.runId, v])) },
           subagents: { ...Object.fromEntries(traces.map((trace) => [trace.id, trace])), ...s.subagents },
+          compactions: result.compactions ?? [],
         }));
       }
     } finally {
@@ -189,6 +192,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     liveTools: {},
     subagents: {},
     pendingQuestion: null,
+    compactions: [],
     workspaceTick: 0,
     liveTimeline: {},
     stoppingRunId: null,
@@ -231,6 +235,9 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
             liveTimeline: { ...s.liveTimeline, [event.runId]: appendTool(s.liveTimeline[event.runId], index, Date.now()) },
           };
         });
+      }
+      if (event.type === 'context_compaction') {
+        set((s) => ({ compactions: [...s.compactions.filter((item) => item.operationId !== event.compaction.operationId), event.compaction] }));
       }
       if (event.type === 'user_question') {
         set({ pendingQuestion: { runId: event.runId, requestId: event.requestId, questions: event.questions } });
@@ -500,6 +507,11 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
     },
 
+    compactSession: async (sessionId) => {
+      await command(() => kernelApi.compactSession(sessionId));
+      await refreshDetail(sessionId);
+    },
+
     cancel: (runId) => {
       // Stop the UI immediately — seal the open thinking burst and settle
       // pending tool rows before the backend even acknowledges the abort.
@@ -539,7 +551,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }, 3000);
       return Promise.resolve();
     },
-    resolveApproval: (runId, approved) => command(() => kernelApi.resolveApproval(runId, approved)).then(() => undefined),
+    resolveApproval: (runId, decision, commandScope, feedback) => command(() => kernelApi.resolveApproval(runId, decision, commandScope, feedback)).then(() => undefined),
     setMode: (mode) => command(() => kernelApi.setMode(mode)).then(() => undefined),
     decidePlan: (card, decision) => command(async () => {
       const plan = await sessionsApi.decidePlan(card.sessionId, card.id, decision);
