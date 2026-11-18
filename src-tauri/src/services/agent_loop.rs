@@ -282,7 +282,7 @@ async fn stream_turn(
         let kernel = kernel.clone();
         let mut relay_cancel = cancel.clone();
         tokio::spawn(async move {
-            let started = Instant::now();
+            let mut started = Instant::now();
             let mut reported = Instant::now();
             let mut first_token_ms = None;
             let mut metrics = RunMetrics {
@@ -411,6 +411,17 @@ async fn stream_turn(
                         let _ = kernel.report_metrics(metrics.clone(), false).await;
                         reported = Instant::now();
                     }
+                    StreamEvent::Retry => {
+                        // DSH：失败 attempt 不进 sessionStats——新 attempt 重新
+                        // 计时与估算；已流出的 reasoning 是真实产出，保留在
+                        // 思考折叠段内不回撤。
+                        started = Instant::now();
+                        first_token_ms = None;
+                        metrics.first_token_ms = None;
+                        surface_cjk = 0;
+                        surface_other = 0;
+                        metrics.live_surface_tokens = None;
+                    }
                     StreamEvent::Done => {
                         flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                         flush_content(&kernel, run_id, &mut content_buf).await;
@@ -529,7 +540,7 @@ async fn drain_subagent_stream(
     let mut call = SubagentCall::default();
     let mut last_delta_ms = None;
     // 父 metrics 口径按“本调用”计时（与 stream_turn relay 同构）。
-    let call_started = Instant::now();
+    let mut call_started = Instant::now();
     let mut reported = Instant::now();
     let mut call_first_ms: Option<u64> = None;
     let mut saw_done = false;
@@ -626,6 +637,18 @@ async fn drain_subagent_stream(
                 surface_est(&mut metrics, surface_cjk, surface_other);
                 let _ = kernel.report_subagent_metrics(metrics.clone(), false).await;
                 reported = Instant::now();
+            }
+            StreamEvent::Retry => {
+                // 与主 relay 同口径：新 attempt 重新计时，decode 窗口与
+                // surface 估算只覆盖成功 attempt。
+                call_started = Instant::now();
+                call_first_ms = None;
+                metrics.first_token_ms = None;
+                call.first_delta_ms = None;
+                last_delta_ms = None;
+                surface_cjk = 0;
+                surface_other = 0;
+                metrics.live_surface_tokens = None;
             }
             StreamEvent::Done => {
                 // 子调用自身口径：decode 窗口 = 首个有效 delta → 末个 delta；

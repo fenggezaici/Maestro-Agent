@@ -160,6 +160,9 @@ pub enum StreamEvent {
     /// token/decode 窗口打点与 live surface 估算（参数属于 provider 计费的
     /// 输出 token）；不转发 UI、不计入输出大小上限。
     ToolCallDelta(String),
+    /// 中流失败后整步重发的打点（正文 Token 未流出时）：agent_loop 收到后
+    /// 重置本 attempt 的计时与 metrics——DSH 口径下失败 attempt 不进统计。
+    Retry,
     Usage {
         input: Option<u64>,
         output: Option<u64>,
@@ -210,6 +213,9 @@ pub(crate) trait FrameParser: Send {
     /// never seen (truncated stream).
     fn finish(&mut self) -> AppResult<Vec<StreamEvent>>;
     fn drain_tool_calls(&mut self) -> Vec<ToolCallSpec>;
+    /// 中流重试清空 per-attempt 状态：半截 tool-call 参数、`<think>` 缓冲等
+    /// 不得拼接到重发 attempt 的流上。
+    fn reset(&mut self);
 }
 
 /// Translate our neutral `ToolSpec` list into the provider's wire shape.
@@ -253,12 +259,13 @@ const MAX_OUTPUT_BYTES: usize = 1048576;
 const RETRY_MAX_RETRIES: usize = 5;
 const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
-/// 流中途断开的整请求重发上限：只允许在还没产出任何可见 delta 时重发，
-/// 否则会让模型从头生成、UI 出现重复文本。
+/// 流中途断开的整请求重发上限：只允许在可见正文 Token 还没产出时重发
+/// （reasoning/tool-arg delta 不阻断——重生成仅让思考折叠段出现重复），
+/// 否则会让正文从头生成、UI 出现重复文本。
 const STREAM_RETRY_MAX: usize = 3;
 
-fn should_retry_stream(deltas_seen: u64, stream_retries: usize, retryable: bool) -> bool {
-    deltas_seen == 0 && stream_retries < STREAM_RETRY_MAX && retryable
+fn should_retry_stream(content_seen: u64, stream_retries: usize, retryable: bool) -> bool {
+    content_seen == 0 && stream_retries < STREAM_RETRY_MAX && retryable
 }
 
 fn retryable_status(status: u16) -> bool {
@@ -410,11 +417,13 @@ pub(crate) async fn stream_common(
     let mut output_bytes = 0usize;
     let mut deltas_seen = 0u64;
     let mut stream_retries = 0usize;
-    let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>, deltas_seen: &mut u64| -> AppResult<bool> {
+    let mut content_seen = 0u64;
+    let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>, deltas_seen: &mut u64, content_seen: &mut u64| -> AppResult<bool> {
         for frame in frames {
             for event in parser.handle(frame)? {
                 if let StreamEvent::Token(ref token) = event {
                     output_bytes += token.len();
+                    *content_seen += 1;
                     if output_bytes > MAX_OUTPUT_BYTES {
                         return Err("模型回复超过 1 MiB 限制".into());
                     }
@@ -450,12 +459,12 @@ pub(crate) async fn stream_common(
         };
         match chunk {
             Some(Ok(bytes)) => {
-                if process(decoder.push(&bytes)?, parser, &events, &mut deltas_seen)? {
+                if process(decoder.push(&bytes)?, parser, &events, &mut deltas_seen, &mut content_seen)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
             }
             Some(Err(error)) => {
-                if should_retry_stream(deltas_seen, stream_retries, retryable_stream_error(&error)) {
+                if should_retry_stream(content_seen, stream_retries, retryable_stream_error(&error)) {
                     let Some(builder) = request.try_clone() else {
                         return Err(stream_error_message(&error, config));
                     };
@@ -473,7 +482,9 @@ pub(crate) async fn stream_common(
                         Ok(next) if next.status().is_success() && is_sse_response(&next) => {
                             stream_retries += 1;
                             decoder = SseDecoder::new();
+                            parser.reset();
                             body = next.bytes_stream();
+                            let _ = events.send(StreamEvent::Retry);
                             continue;
                         }
                         Ok(next) if !next.status().is_success() => {
@@ -493,7 +504,7 @@ pub(crate) async fn stream_common(
                 });
             }
             None => {
-                if process(decoder.finish()?, parser, &events, &mut deltas_seen)? {
+                if process(decoder.finish()?, parser, &events, &mut deltas_seen, &mut content_seen)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
                 for event in parser.finish()? {
@@ -605,11 +616,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_retry_only_before_the_first_visible_delta() {
-        // 字节已到达但尚无可见 delta（role/message_start/usage 帧）→ 允许重发。
+    fn stream_retry_only_before_the_first_visible_content_delta() {
+        // content_seen 只计正文 Token：reasoning/tool-arg delta 不阻断重发
+        // （重生成只让思考折叠段重复，正文不会产生可见重复）。
         assert!(should_retry_stream(0, 0, true));
         assert!(should_retry_stream(0, STREAM_RETRY_MAX - 1, true));
-        // 已产出可见 delta → 重发会从头生成导致重复文本，禁止。
+        // 正文 Token 已流出 → 重发会从头生成正文导致可见重复，禁止。
         assert!(!should_retry_stream(1, 0, true));
         // 重试耗尽、错误不可重试 → 禁止。
         assert!(!should_retry_stream(0, STREAM_RETRY_MAX, true));

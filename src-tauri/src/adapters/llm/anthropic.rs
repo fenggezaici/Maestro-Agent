@@ -224,4 +224,8 @@ impl FrameParser for AnthropicParser {
             .filter(|call| !call.name.is_empty())
             .collect()
     }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }

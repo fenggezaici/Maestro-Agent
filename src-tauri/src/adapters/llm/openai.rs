@@ -247,6 +247,10 @@ impl FrameParser for OpenAiParser {
             .filter(|call| !call.name.is_empty())
             .collect()
     }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[cfg(test)]

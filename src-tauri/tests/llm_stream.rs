@@ -128,6 +128,51 @@ Connection: close
     (url, task)
 }
 
+async fn provider_reasoning_then_truncated_then_ok() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut attempt = 0;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let _ = socket.set_nodelay(true);
+            let mut received = false;
+            loop {
+                let mut buffer = [0u8; 8192];
+                match tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buffer)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(_)) => received = true,
+                    Err(_) => break,
+                }
+            }
+            if !received {
+                continue;
+            }
+            if attempt == 0 {
+                attempt += 1;
+                // 思考 delta 已交付后 chunked 截断：正文 Token 未流出 →
+                // 客户端应整步重发（reasoning 折叠段重复为已知代价）。
+                let frame = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking…\"}}]}\n\n";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{frame}\r\n",
+                    frame.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                continue;
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking2\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\ndata: [DONE]\n\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            break;
+        }
+    });
+    (url, task)
+}
+
 fn config(base_url: String) -> ChatConfig {
     ChatConfig {
         api_key: "test-secret".into(),
@@ -174,6 +219,44 @@ async fn retries_once_when_the_gateway_closes_before_the_first_chunk() {
     let runs = kernel.list_runs().await.unwrap();
     assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
     assert!(runs[0].output.contains("Recovered"));
+    server.await.unwrap();
+    kernel.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retries_mid_stream_when_only_reasoning_has_flown() {
+    // DSH：正文 Token 未流出时传输失败整步重发；失败 attempt 的思考
+    // 保留在折叠段内，不重试正文。
+    let (url, server) = provider_reasoning_then_truncated_then_ok().await;
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(move |event| captured.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "retry this".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(runs[0].output.contains("Recovered"));
+    let reasoning: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::Reasoning { token, .. } => Some(token.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(reasoning.iter().any(|token| token.contains("thinking…")), "{reasoning:?}");
+    assert!(reasoning.iter().any(|token| token.contains("thinking2")), "{reasoning:?}");
     server.await.unwrap();
     kernel.shutdown().await.unwrap();
 }
