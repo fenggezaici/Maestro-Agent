@@ -360,7 +360,7 @@ async fn stream_turn(
                 // tool-call delta 即首 token，三种 delta 共用同一打点与 tick。
                 let is_delta = matches!(
                     event,
-                    StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta
+                    StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta(_)
                 );
                 match event {
                     StreamEvent::Reasoning(token) => {
@@ -371,8 +371,10 @@ async fn stream_turn(
                             last_chunk = Instant::now();
                         }
                     }
-                    StreamEvent::ToolCallDelta => {
-                        // A tool-call delta also ends the current thought burst.
+                    StreamEvent::ToolCallDelta(args) => {
+                        // 参数文本也是 provider 计费的输出，计入 surface 估算；
+                        // tool-call delta 同样结束当前思考 burst。
+                        count_surface(&args, &mut surface_cjk, &mut surface_other);
                         flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                     }
                     StreamEvent::Token(token) => {
@@ -564,7 +566,7 @@ async fn drain_subagent_stream(
         // DSH isTokenDelta：text/reasoning/tool-call delta 都算有效增量。
         let is_delta = matches!(
             event,
-            StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta
+            StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta(_)
         );
         if is_delta {
             let at = started.elapsed().as_millis() as u64;
@@ -592,7 +594,10 @@ async fn drain_subagent_stream(
                 count_surface(&token, &mut surface_cjk, &mut surface_other);
                 kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Reasoning, &token).await;
             }
-            StreamEvent::ToolCallDelta => {}
+            StreamEvent::ToolCallDelta(args) => {
+                // 参数文本计入 surface 估算（provider 计费输出的一部分）。
+                count_surface(&args, &mut surface_cjk, &mut surface_other);
+            }
             StreamEvent::Usage { input, output, cache_hit, cache_write, reasoning } => {
                 // DSH addReplacing：同调用的后续 usage 样本替换前值。
                 if let Some(value) = input {
@@ -1278,6 +1283,27 @@ async fn compact_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_surface_prices_tool_call_argument_text_like_content() {
+        // Tool-call 参数是 provider 计费的输出 token：参数流期间
+        // liveSurfaceTokens 必须保持非零，≈tok/s 才不会停摆。
+        let mut cjk = 0;
+        let mut other = 0;
+        count_surface("{\"path\":\"src/a.ts\",\"content\":\"console.log(1)\"}", &mut cjk, &mut other);
+        assert_eq!(cjk, 0);
+        assert!(other > 0);
+        let est = cjk + other.div_ceil(4);
+        assert!(est > 0);
+    }
+
+    #[test]
+    fn count_surface_keeps_cjk_density_for_argument_text() {
+        let mut cjk = 0;
+        let mut other = 0;
+        count_surface("{\"path\":\"目录/文件.txt\"}", &mut cjk, &mut other);
+        assert_eq!(cjk, 4);
+    }
 
     fn fixture(status: RunStatus, output: &str) -> (SessionDetail, RunView) {
         let prior = RunView {

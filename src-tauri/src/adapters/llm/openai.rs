@@ -202,6 +202,7 @@ impl FrameParser for OpenAiParser {
                 // DSH isTokenDelta 口径：name 出现或 arguments 非空的 tool-call
                 // delta 视为可见生成输出，是首 token/decode 窗口的打点边界。
                 let mut visible = false;
+                let mut delta_text = String::new();
                 for call in calls {
                     let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                     let acc = self.tool_calls.entry(index).or_default();
@@ -211,14 +212,16 @@ impl FrameParser for OpenAiParser {
                     if let Some(name) = call.pointer("/function/name").and_then(|n| n.as_str()) {
                         acc.name = name.into();
                         visible = true;
+                        delta_text.push_str(name);
                     }
                     if let Some(args) = call.pointer("/function/arguments").and_then(|a| a.as_str()) {
                         acc.arguments.push_str(args);
                         visible |= !args.is_empty();
+                        delta_text.push_str(args);
                     }
                 }
                 if visible {
-                    events.push(StreamEvent::ToolCallDelta);
+                    events.push(StreamEvent::ToolCallDelta(delta_text));
                 }
             }
         }
@@ -301,7 +304,11 @@ mod tests {
         // 有效增量 —— 首 token 与 decode 窗口由它打点，但参数本身不进正文。
         assert_eq!(
             events,
-            vec![StreamEvent::ToolCallDelta, StreamEvent::ToolCallDelta, StreamEvent::Done]
+            vec![
+                StreamEvent::ToolCallDelta("read_file{\"pa".into()),
+                StreamEvent::ToolCallDelta("th\":\"a\"}".into()),
+                StreamEvent::Done,
+            ]
         );
         let calls = parser.drain_tool_calls();
         assert_eq!(calls.len(), 1);

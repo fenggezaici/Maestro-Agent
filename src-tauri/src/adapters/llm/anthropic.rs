@@ -170,7 +170,7 @@ impl FrameParser for AnthropicParser {
                     if let Some(name) = value.pointer("/content_block/name").and_then(|v| v.as_str()) {
                         acc.name = name.into();
                         // tool_use 块出现即一段可见生成输出（DSH isTokenDelta）。
-                        events.push(StreamEvent::ToolCallDelta);
+                        events.push(StreamEvent::ToolCallDelta(name.to_string()));
                     }
                 }
             }
@@ -182,7 +182,7 @@ impl FrameParser for AnthropicParser {
                     let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                     self.tool_calls.entry(index).or_default().arguments.push_str(partial);
                     if !partial.is_empty() {
-                        events.push(StreamEvent::ToolCallDelta);
+                        events.push(StreamEvent::ToolCallDelta(partial.to_string()));
                     }
                 }
                 if let Some(text) = value.pointer("/delta/text").and_then(|text| text.as_str()) {

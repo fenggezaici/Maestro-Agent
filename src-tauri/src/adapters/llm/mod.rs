@@ -156,8 +156,10 @@ pub enum StreamEvent {
     Reasoning(String),
     /// 计时边界事件：一段工具调用参数 delta 到达（DSH `isTokenDelta` 口径 —
     /// 非空 argumentsDelta 或 name 已知的 tool-call-delta 也算可见输出）。
-    /// 只用于首 token/decode 窗口打点，不转发 UI、不计入输出大小上限。
-    ToolCallDelta,
+    /// 载荷是本 chunk 的可见参数文本（name 或 arguments 片段），用于首
+    /// token/decode 窗口打点与 live surface 估算（参数属于 provider 计费的
+    /// 输出 token）；不转发 UI、不计入输出大小上限。
+    ToolCallDelta(String),
     Usage {
         input: Option<u64>,
         output: Option<u64>,
@@ -417,7 +419,7 @@ pub(crate) async fn stream_common(
                         return Err("模型回复超过 1 MiB 限制".into());
                     }
                 }
-                if matches!(event, StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta) {
+                if matches!(event, StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta(_)) {
                     *deltas_seen += 1;
                 }
                 let done = matches!(event, StreamEvent::Done);
