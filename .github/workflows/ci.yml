@@ -115,6 +115,18 @@ jobs:
       - name: Install matching msedgedriver
         run: node scripts/e2e-driver-setup.mjs
 
+      # WebView2 Runtime ≥150 drops WEBVIEW2_* env vars and CLI debugging
+      # switches for elevated hosts (MicrosoftEdge/WebView2Feedback#5645);
+      # GitHub runners are always elevated, so the debug port must come
+      # through the HKLM policy channel, which survives elevation.
+      - name: Allow WebView2 remote debugging on this elevated runner
+        shell: pwsh
+        run: |
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2' `
+            -Name 'AdditionalBrowserArguments' -PropertyType String -Force `
+            -Value '--remote-debugging-port=0 --disable-gpu' | Out-Null
+
       # Distinguish "app crashes at startup" from "WebView2/driver flake" on
       # the next failure. The debug build is a console subsystem binary, so a
       # startup panic reaches stderr. The process must be killed afterwards —
