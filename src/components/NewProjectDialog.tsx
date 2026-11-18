@@ -1,8 +1,10 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
-import { FolderGit2, FolderOpen, Trash2, X } from 'lucide-react';
+import { Folder, FolderGit2, FolderOpen, FolderPlus, Pencil, Trash2 } from 'lucide-react';
 import type { WorkbenchProject } from './workspace';
 import { IconButton } from './ui';
+
+const pathLeaf = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? path;
 
 export function NewProjectDialog({ open, onOpenChange, disabled, onBrowse, onCreate }: {
   open: boolean; onOpenChange: (open: boolean) => void; disabled?: boolean;
@@ -75,6 +77,71 @@ export function DeleteProjectDialog({ project, onOpenChange, onConfirm }: {
             onOpenChange(false);
           }}>删除项目</button>
         </div>
+    </DialogContent>
+  </Dialog>;
+}
+
+export function EditProjectDialog({ project, onOpenChange, onBrowse, onSave, onDelete }: {
+  project: WorkbenchProject | null;
+  onOpenChange: (open: boolean) => void;
+  onBrowse?: () => Promise<string | null>;
+  onSave?: (name: string, path: string | null) => Promise<string | null>;
+  onDelete?: (projectId: string) => void;
+}) {
+  const [name, setName] = useState('');
+  const [path, setPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const open = project !== null;
+  const projectId = project?.id;
+  useEffect(() => {
+    if (projectId === undefined) return;
+    setName(project?.name ?? '');
+    setPath(project?.path ?? null);
+    setError(null);
+  }, [projectId, project?.name, project?.path]);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (pending || !project) return;
+    const nextName = name.trim();
+    if (!nextName) { setError('项目名称不能为空'); return; }
+    if (!onSave) { onOpenChange(false); return; }
+    setPending(true);
+    setError(null);
+    const message = await onSave(nextName, path?.trim() || null);
+    setPending(false);
+    if (message) { setError(message); return; }
+    onOpenChange(false);
+  }
+
+  return <Dialog open={open} onOpenChange={(value) => { if (!value) { setError(null); onOpenChange(false); } }}>
+    <DialogContent variant="form" className="project-dialog">
+      <DialogTitle asChild><h3><Pencil size={15} />编辑项目</h3></DialogTitle>
+      <form onSubmit={(event) => void submit(event)}>
+        <label htmlFor="edit-project-name">项目名称</label>
+        <input id="edit-project-name" autoComplete="off" spellCheck={false} autoFocus value={name} disabled={pending}
+          onChange={(event) => setName(event.target.value)} placeholder="项目名称" maxLength={128} />
+        <label>源文件夹</label>
+        <div className="edit-roots">
+          {path && <div className="edit-root-row">
+            <Folder size={14} />
+            <span className="edit-root-name" title={path}>{pathLeaf(path)}</span>
+            <span className="edit-root-badge">主要</span>
+          </div>}
+          {onBrowse && <button type="button" className="edit-root-add" disabled={pending}
+            onClick={async () => { const picked = await onBrowse(); if (picked) setPath(picked); }}>
+            <FolderPlus size={14} />{path ? '更换文件夹' : '添加文件夹'}
+          </button>}
+        </div>
+        {error && <p role="alert" className="settings-form-error">{error}</p>}
+        <div className="dialog-actions">
+          {onDelete && <button type="button" className="button-ghost dialog-danger edit-project-delete" disabled={pending}
+            onClick={() => { if (project && !pending) { onOpenChange(false); onDelete(project.id); } }}>删除项目</button>}
+          <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
+          <button type="submit" className="button-approve" disabled={pending || !name.trim() || !onSave}>保存</button>
+        </div>
+      </form>
     </DialogContent>
   </Dialog>;
 }

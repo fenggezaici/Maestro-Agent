@@ -19,6 +19,18 @@ it('renders nothing before any value is known', () => {
   expect(screen.queryByRole('img')).not.toBeInTheDocument();
 });
 
+it('drops the retained value when the session key remounts the ring', () => {
+  // 切会话：key 变化触发重挂载，lastKnown 清空——新会话不得残留旧会话的
+  // 上下文百分比（渲染端靠 Composer 传 key={sessionId} 保证）。
+  const { rerender } = render(
+    <Tooltip.Provider><ContextRing key={1} used={400_000} context={1_000_000} /></Tooltip.Provider>,
+  );
+  expect(screen.getByRole('img', { name: '上下文已用 40%' })).toBeInTheDocument();
+
+  rerender(<Tooltip.Provider><ContextRing key={2} used={null} context={1_000_000} /></Tooltip.Provider>);
+  expect(screen.queryByRole('img')).not.toBeInTheDocument();
+});
+
 it('keeps one decimal so small real usage does not display as 0%', () => {
   // ZCode Intl percent 格式：2K/1M = 0.2%，不得取整成 0%。
   ring(2_000, 1_000_000);

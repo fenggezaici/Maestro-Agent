@@ -2,6 +2,7 @@ import { useState } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { Archive, ArchiveRestore, ChevronRight, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings2, Trash2 } from 'lucide-react';
 import ConfirmDialog from './ConfirmDialog';
+import { EditProjectDialog } from './NewProjectDialog';
 import { IconButton } from './ui';
 import { groupSessionsByDate } from '../sessionGroups';
 import { relativeSessionAge, type WorkbenchProject } from './workspace';
@@ -25,7 +26,8 @@ interface Props {
   onDeleteSession?: (sessionId: number) => void;
   onSelectProject?: (projectId: string) => void;
   onNewProject?: () => void;
-  onRenameProject?: (projectId: number, name: string) => void;
+  onEditSave?: (project: WorkbenchProject, name: string, path: string | null) => Promise<string | null>;
+  onBrowse?: () => Promise<string | null>;
   onTogglePinProject?: (projectId: string) => void;
   pinnedProjectIds?: string[];
   onManageProject?: () => void;
@@ -55,9 +57,8 @@ function SessionMenu({ session, pinned, onRename, onArchive, onTogglePin, onDele
   </DropdownMenu.Root>;
 }
 
-export default function ProjectSessions({ projects, currentProjectId, selectedSessionId, activeSessionId, source, canCreate, pinnedIds = [], onSelect, onCreate, onSelectProject, onNewProject, onRenameProject, onTogglePinProject, pinnedProjectIds = [], onManageProject, onTogglePin, onRenameSession, onArchiveSession, onDeleteSession, onDeleteProject }: Props) {
-  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
-  const [projectDraft, setProjectDraft] = useState('');
+export default function ProjectSessions({ projects, currentProjectId, selectedSessionId, activeSessionId, source, canCreate, pinnedIds = [], onSelect, onCreate, onSelectProject, onNewProject, onEditSave, onBrowse, onTogglePinProject, pinnedProjectIds = [], onManageProject, onTogglePin, onRenameSession, onArchiveSession, onDeleteSession, onDeleteProject }: Props) {
+  const [editingProject, setEditingProject] = useState<WorkbenchProject | null>(null);
   const [search, setSearch] = useState('');
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
@@ -113,35 +114,25 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
     return <div key={project.id} className={`project-node ${project.id === currentProjectId ? 'active' : ''}`}>
       <div className="project-row">
         <button type="button" className="project-toggle" aria-expanded={expanded} aria-label={`项目 ${project.name}`}
-          onClick={(event) => {
-            if ((event.target as HTMLElement).closest('.project-add-btn')) return;
+          onClick={() => {
             setCollapsed((value) => { const next = new Set(value); next.has(project.id) ? next.delete(project.id) : next.add(project.id); return next; });
             if (project.id !== currentProjectId) onSelectProject?.(project.id);
           }}>
           {expanded ? <ChevronRight size={13} className="project-chevron open" /> : <ChevronRight size={13} className="project-chevron" />}
           <span className="project-name">{project.name}</span>
-          <span className="project-count">{project.sessions.length}</span>
         </button>
-        <button type="button" className="project-add-btn" aria-label={`在项目 ${project.name} 下新建会话`} disabled={!canCreate} onClick={(event) => { event.stopPropagation(); onCreate(project.id); }}><Plus size={12} /></button>
         <DropdownMenu.Root>
           <DropdownMenu.Trigger className="project-menu-btn" aria-label={`项目 ${project.name} 操作`} onClick={(event) => event.stopPropagation()}><MoreHorizontal size={13} /></DropdownMenu.Trigger>
           <DropdownMenu.Portal><DropdownMenu.Content sideOffset={4} align="end" className="dropdown-content">
-            <DropdownMenu.Item className="dropdown-item" onSelect={() => { setRenamingProjectId(project.id); setProjectDraft(project.name); }}><span className="choice-item-main"><Pencil size={13} className="item-menu-icon" />编辑项目</span></DropdownMenu.Item>
+            <DropdownMenu.Item className="dropdown-item" onSelect={() => setEditingProject(project)}><span className="choice-item-main"><Pencil size={13} className="item-menu-icon" />编辑项目</span></DropdownMenu.Item>
             {onTogglePinProject && <DropdownMenu.Item className="dropdown-item" onSelect={() => onTogglePinProject(project.id)}><span className="choice-item-main">{pinnedProjectIds.includes(project.id) ? <PinOff size={13} className="item-menu-icon" /> : <Pin size={13} className="item-menu-icon" />}{pinnedProjectIds.includes(project.id) ? '取消置顶' : '置顶'}</span></DropdownMenu.Item>}
             {onDeleteProject && <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => onDeleteProject(project.id)}><span className="choice-item-main"><Trash2 size={13} className="item-menu-icon" />删除项目</span></DropdownMenu.Item>}
             <DropdownMenu.Separator className="subtle-separator" />
             {onManageProject && <DropdownMenu.Item className="dropdown-item" onSelect={onManageProject}><span className="choice-item-main"><Settings2 size={13} className="item-menu-icon" />管理项目…</span></DropdownMenu.Item>}
           </DropdownMenu.Content></DropdownMenu.Portal>
         </DropdownMenu.Root>
+        <button type="button" className="project-add-btn" aria-label={`在项目 ${project.name} 下新建会话`} disabled={!canCreate} onClick={(event) => { event.stopPropagation(); onCreate(project.id); }}><Plus size={12} /></button>
       </div>
-      {renamingProjectId === project.id && <input className="session-rename-input project-rename-input" aria-label={`重命名项目 ${project.name}`} autoFocus value={projectDraft}
-        onChange={(event) => setProjectDraft(event.target.value)}
-        onBlur={() => { const name = projectDraft.trim(); const numeric = Number(project.id); if (name && Number.isFinite(numeric)) onRenameProject?.(numeric, name); setRenamingProjectId(null); }}
-        onKeyDown={(event) => {
-          if (event.nativeEvent.isComposing) return;
-          if (event.key === 'Enter') { const name = projectDraft.trim(); const numeric = Number(project.id); if (name && Number.isFinite(numeric)) onRenameProject?.(numeric, name); setRenamingProjectId(null); }
-          if (event.key === 'Escape') setRenamingProjectId(null);
-        }} />}
       {expanded && <div className="project-children">
         {groups.length > 0
           ? groups.map((group) => <div key={group.key} className="session-group">
@@ -173,6 +164,10 @@ export default function ProjectSessions({ projects, currentProjectId, selectedSe
       {!query && projects.length === 0 && <p className="sidebar-empty">暂无项目，先新建项目</p>}
     </nav>
   </div>
+  <EditProjectDialog project={editingProject} onOpenChange={(open) => { if (!open) setEditingProject(null); }}
+    onBrowse={onBrowse}
+    onSave={editingProject && onEditSave ? (name, path) => onEditSave(editingProject, name, path) : undefined}
+    onDelete={onDeleteProject} />
   <ConfirmDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
     title="删除会话"
     description={deleteTarget ? `删除会话「${deleteTarget.title}」及其全部消息记录？此操作不可撤销。` : ''}

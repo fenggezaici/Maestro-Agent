@@ -34,6 +34,8 @@ export default function PreviewApp() {
     archive: (sessionId, archived) => mutateSession(sessionId, (session) => ({ ...session, archived })),
     archiveProject: (projectId, archived) => setProjects((items) => items.map((project) => project.id === projectId ? { ...project, archived } : project)),
     deleteProject: (projectId) => setProjects((items) => items.filter((project) => project.id !== projectId)),
+    renameProject: (projectId, name) => setProjects((items) => items.map((project) => project.id === projectId ? { ...project, name } : project)),
+    setProjectPath: (projectId, path) => setProjects((items) => items.map((project) => project.id === projectId ? { ...project, path } : project)),
     createProject: async (name, path) => {
       const id = `p${nextProjectId.current++}`;
       setProjects((items) => [...items, { id, name, path: path ?? null, sessions: [] }]);

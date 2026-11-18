@@ -85,19 +85,23 @@ pub async fn set_project_archived(
 
 #[tauri::command]
 pub async fn update_project_name(
-    kernel: tauri::State<'_, Kernel>,
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
     project_id: i64,
     name: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
+    require_main(&window)?;
     kernel.update_project_name(project_id, name).await
 }
 
 #[tauri::command]
 pub async fn update_project_path(
-    kernel: tauri::State<'_, Kernel>,
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
     project_id: i64,
     path: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
+    require_main(&window)?;
     kernel.update_project_path(project_id, path).await
 }
 

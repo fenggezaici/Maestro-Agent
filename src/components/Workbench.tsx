@@ -78,8 +78,8 @@ export interface WorkbenchController {
   createProject?: (name: string, path?: string) => Promise<{ project?: ProjectView; error?: string }>;
   setProjectArchived?: (projectId: number, archived: boolean) => unknown;
   deleteProject?: (projectId: number) => Promise<{ error?: string } | undefined>;
-  updateProjectPath?: (projectId: number, path: string) => Promise<unknown>;
-  renameProject?: (projectId: number, name: string) => Promise<unknown>;
+  updateProjectPath?: (projectId: number, path: string) => Promise<{ error?: string }>;
+  renameProject?: (projectId: number, name: string) => Promise<{ error?: string }>;
   setSessionArchived?: (sessionId: number, archived: boolean) => unknown;
   renameSession?: (sessionId: number, title: string) => unknown;
   deleteSession?: (sessionId: number) => unknown;
@@ -146,6 +146,8 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     deleteProject?: (projectId: string) => void;
     deleteSession?: (sessionId: number) => void;
     createProject?: (name: string, path?: string) => Promise<string | null>;
+    renameProject?: (projectId: string, name: string) => void;
+    setProjectPath?: (projectId: string, path: string) => void;
   };
 }) {
   const preview = source === 'preview';
@@ -570,7 +572,27 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
           onSelect={(id) => { setNavigation('agents'); c.selectSession(id); }}
           onSelectProject={(projectId) => { const numeric = Number(projectId); if (Number.isFinite(numeric)) { setNavigation('agents'); c.selectProject?.(numeric); } }}
           onNewProject={() => setNewProjectOpen(true)}
-          onRenameProject={c.renameProject ? (id, name) => void c.renameProject!(id, name) : undefined}
+          onBrowse={preview ? undefined : pickDirectory}
+          onEditSave={async (project, name, path) => {
+            const numeric = Number(project.id);
+            if (preview) {
+              if (name !== project.name) sessionActions?.renameProject?.(project.id, name);
+              if (path && path !== (project.path ?? null)) sessionActions?.setProjectPath?.(project.id, path);
+              return null;
+            }
+            if (name !== project.name) {
+              if (!c.renameProject) return '后端不支持项目改名';
+              const result = await c.renameProject(numeric, name);
+              if (result?.error) return result.error;
+            }
+            if (path !== (project.path ?? null)) {
+              if (!path) return '项目目录不能为空';
+              if (!c.updateProjectPath) return '后端不支持修改项目目录';
+              const result = await c.updateProjectPath(numeric, path);
+              if (result?.error) return result.error;
+            }
+            return null;
+          }}
           onTogglePinProject={(projectId) => setPinnedProjects((value) => value.includes(projectId) ? value.filter((item) => item !== projectId) : [...value, projectId])}
           pinnedProjectIds={pinnedProjects}
           onManageProject={() => setSettingsOpen(true)}
@@ -629,7 +651,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
               onError={setToastError} onCapability={updateCapability}
               running={running} pending={c.pending}
               onCancel={() => { const run = c.state.activeRun; if (run) void c.cancel(run.id); }}
-              runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model}
+              runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} sessionId={c.selectedSessionId}
               slash={{ actions: slashActions, skills: slashSources.skills, commands: slashSources.commands, onRefresh: slashSources.refresh, onRunCommand: runSlashCommand }} />
           </>}
       </main>

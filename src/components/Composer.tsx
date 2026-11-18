@@ -35,7 +35,7 @@ export interface ComposerHandle { setText: (text: string) => void; clear: () => 
 /// back into Workbench state, which would re-render the shell on every keystroke.
 let draftCache = '';
 
-function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, slash }: {
+function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, slash, sessionId }: {
   atBottom: boolean;
   onScrollBottom: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>, value: string) => boolean | Promise<boolean>;
@@ -62,6 +62,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
   runs: RunView[];
   metrics?: Record<number, RunMetrics>;
   context: number | null;
+  sessionId: number | null;
   modelLabel: string;
   status?: 'approval' | 'tool' | 'thinking' | 'working' | null;
   slash?: {
@@ -225,7 +226,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
         </Popover.Content></Popover.Portal>
       </Popover.Root>
       <div className="flex-1" /><ComposerControls preview={preview} disabled={blocked || running} preferences={preferences} onPreferences={onPreferences} settingsVersion={settingsVersion} onError={onError} onCapability={onCapability} />
-      <ContextRing used={sessionUsage(runs, metrics, context).contextUsed} context={context} />
+      <ContextRing key={sessionId} used={sessionUsage(runs, metrics, context).contextUsed} context={context} />
       <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Enter ↵'}</span>
       {running && !preview ? <IconButton label="停止生成" className="stop-button" onClick={onCancel}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
     </div>

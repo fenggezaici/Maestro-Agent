@@ -67,8 +67,8 @@ export interface KernelStore {
   createSession: (projectId?: number) => Promise<SessionView | undefined>;
   createProject: (name: string, path?: string) => Promise<{ project?: ProjectView; error?: string }>;
   setProjectArchived: (projectId: number, archived: boolean) => Promise<ProjectView | undefined>;
-  updateProjectPath: (projectId: number, path: string) => Promise<void>;
-  renameProject: (projectId: number, name: string) => Promise<void>;
+  updateProjectPath: (projectId: number, path: string) => Promise<{ error?: string }>;
+  renameProject: (projectId: number, name: string) => Promise<{ error?: string }>;
   deleteProject: (projectId: number) => Promise<{ error?: string }>;
   setSessionArchived: (sessionId: number, archived: boolean) => Promise<SessionView | undefined>;
   renameSession: (sessionId: number, title: string) => Promise<SessionView | undefined>;
@@ -438,14 +438,28 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
     },
 
-    updateProjectPath: (projectId, path) => command(async () => {
-      await sessionsApi.updateProjectPath(projectId, path);
-      await refreshProjects();
-    }),
-    renameProject: (projectId, name) => command(async () => {
-      await sessionsApi.updateProjectName(projectId, name);
-      await refreshProjects();
-    }),
+    updateProjectPath: async (projectId, path) => {
+      try {
+        await sessionsApi.updateProjectPath(projectId, path);
+        await refreshProjects();
+        return {};
+      } catch (reason) {
+        const message = errorMessage(reason);
+        if (mounted) setError(message);
+        return { error: message };
+      }
+    },
+    renameProject: async (projectId, name) => {
+      try {
+        await sessionsApi.updateProjectName(projectId, name);
+        await refreshProjects();
+        return {};
+      } catch (reason) {
+        const message = errorMessage(reason);
+        if (mounted) setError(message);
+        return { error: message };
+      }
+    },
 
     setProjectArchived: (projectId, archived) => command(async () => {
       const project = await sessionsApi.setProjectArchived(projectId, archived);
