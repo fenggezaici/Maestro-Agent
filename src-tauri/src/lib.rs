@@ -130,9 +130,7 @@ pub fn run() {
                     batch.push(first);
                     collect_events(&mut rx, &mut batch).await;
                     for event in batch.drain(..) {
-                        if let Err(error) = handle.emit_to("main", EVENT_NAME, &event) {
-                            eprintln!("Cannot emit kernel event: {error}");
-                        }
+                        let _ = handle.emit_to("main", EVENT_NAME, &event);
                     }
                 }
             });
@@ -241,10 +239,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let code = match kernel.shutdown().await {
                     Ok(()) => 0,
-                    Err(error) => {
-                        eprintln!("Shutdown failed: {error}");
-                        1
-                    }
+                    Err(_) => 1,
                 };
                 exit_ready.store(true, Ordering::Release);
                 handle.exit(code);

@@ -314,7 +314,6 @@ async fn stream_turn(
             let mut content_buf = String::new();
             let mut last_chunk = Instant::now();
             let mut saw_done = false;
-            let mut last_delta_ms: Option<u64> = None;
             // DSH surfaceTokens 口径：当前请求已流式 surface 文本的估算 tokens
             // （content+reasoning，CJK=1/其他÷4）。provider 上报 output usage
             // 后计数清零——估算只覆盖最近一个 usage 样本之后的文本。
@@ -346,7 +345,6 @@ async fn stream_turn(
                     // 不贡献 attempts/ttft/decode/llmMs。
                     if !saw_done {
                         metrics.elapsed_ms = started.elapsed().as_millis() as u64;
-                        log_step_timing("aborted", &metrics, first_token_ms, last_delta_ms);
                         if metrics.input_tokens.is_some()
                             || metrics.output_tokens.is_some()
                             || metrics.cache_hit_tokens.is_some()
@@ -416,13 +414,11 @@ async fn stream_turn(
                         flush_content(&kernel, run_id, &mut content_buf).await;
                         metrics.elapsed_ms = started.elapsed().as_millis() as u64;
                         let _ = kernel.report_metrics(metrics.clone(), true).await;
-                        log_step_timing("done", &metrics, first_token_ms, last_delta_ms);
                         saw_done = true;
                     }
                 }
                 if is_delta {
                     let now_ms = started.elapsed().as_millis() as u64;
-                    last_delta_ms = Some(now_ms);
                     if first_token_ms.is_none() {
                         first_token_ms = Some(now_ms);
                         metrics.first_token_ms = first_token_ms;
@@ -484,26 +480,6 @@ fn count_surface(text: &str, cjk: &mut u64, other: &mut u64) {
     }
 }
 
-/// Per-request timing breakdown for diagnosing where the decode window goes:
-/// `active` = 首 delta → 末 delta（真实生成期），`tail` = 末 delta → 流终止
-/// （usage/[DONE] 帧等待）。与既有 `LLM retry` 日志同级，无敏感数据。
-fn log_step_timing(tag: &str, metrics: &RunMetrics, first_ms: Option<u64>, last_delta_ms: Option<u64>) {
-    let active = match (first_ms, last_delta_ms) {
-        (Some(first), Some(last)) => format!("{}ms", last.saturating_sub(first)),
-        _ => "—".to_string(),
-    };
-    let tail = last_delta_ms
-        .map(|last| format!("{}ms", metrics.elapsed_ms.saturating_sub(last)))
-        .unwrap_or_else(|| "—".to_string());
-    let ttft = first_ms
-        .map(|first| format!("{first}ms"))
-        .unwrap_or_else(|| "—".to_string());
-    eprintln!(
-        "LLM step timing {tag} run_id={} ttft={ttft} active={active} tail={tail} output={:?}",
-        metrics.run_id, metrics.output_tokens
-    );
-}
-
 fn add_tokens(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
     match (total, extra) {
         (None, None) => None,
@@ -554,7 +530,6 @@ async fn drain_subagent_stream(
     let call_started = Instant::now();
     let mut reported = Instant::now();
     let mut call_first_ms: Option<u64> = None;
-    let mut call_last_ms: Option<u64> = None;
     let mut saw_done = false;
     let mut surface_cjk: u64 = 0;
     let mut surface_other: u64 = 0;
@@ -598,7 +573,6 @@ async fn drain_subagent_stream(
             }
             last_delta_ms = Some(at);
             let call_at = call_started.elapsed().as_millis() as u64;
-            call_last_ms = Some(call_at);
             if call_first_ms.is_none() {
                 call_first_ms = Some(call_at);
                 metrics.first_token_ms = call_first_ms;
@@ -660,7 +634,6 @@ async fn drain_subagent_stream(
                 // 父会话口径：子调用整对 persist —— 一次真实 model step。
                 metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
                 let _ = kernel.report_subagent_metrics(metrics.clone(), true).await;
-                log_step_timing("sub done", &metrics, call_first_ms, call_last_ms);
                 saw_done = true;
             }
         }
@@ -674,7 +647,6 @@ async fn drain_subagent_stream(
     // 无 Done 的终止（断流/超时/取消）：只保留已到达的 usage 样本。
     if !saw_done {
         metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
-        log_step_timing("sub aborted", &metrics, call_first_ms, call_last_ms);
         if metrics.input_tokens.is_some()
             || metrics.output_tokens.is_some()
             || metrics.cache_hit_tokens.is_some()

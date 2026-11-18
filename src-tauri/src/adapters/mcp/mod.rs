@@ -371,9 +371,7 @@ impl McpManager {
             Err(_) => return,
         };
         for name in names {
-            if let Err(error) = self.start(&name).await {
-                eprintln!("MCP 服务 {name} 启动失败：{error}");
-            }
+            let _ = self.start(&name).await;
         }
     }
 

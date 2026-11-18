@@ -355,7 +355,6 @@ pub(crate) async fn stream_common(
                     break response;
                 }
                 let delay = retry_delay(attempt, retry_after_ms(&response));
-                eprintln!("LLM retry {}/{} host={host} status={status} delay={}ms", attempt + 1, RETRY_MAX_RETRIES, delay.as_millis());
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
@@ -365,7 +364,6 @@ pub(crate) async fn stream_common(
             Err(error) => {
                 if attempt < RETRY_MAX_RETRIES && retryable_error(&error) {
                     let delay = retry_delay(attempt, None);
-                    eprintln!("LLM retry {}/{} host={host} error={error} delay={}ms", attempt + 1, RETRY_MAX_RETRIES, delay.as_millis());
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
@@ -373,7 +371,6 @@ pub(crate) async fn stream_common(
                     attempt += 1;
                     continue;
                 }
-                eprintln!("LLM request failed: host={host} error={error}");
                 return Err(if error.is_timeout() {
                     format!("模型连接超时（{host}）")
                 } else if error.is_connect() {
@@ -461,7 +458,6 @@ pub(crate) async fn stream_common(
                         return Err(stream_error_message(&error, config));
                     };
                     let delay = retry_delay(stream_retries, None);
-                    eprintln!("LLM stream retry {}/{} host={host} error={error} delay={}ms", stream_retries + 1, STREAM_RETRY_MAX, delay.as_millis());
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
