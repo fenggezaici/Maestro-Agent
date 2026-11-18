@@ -32,7 +32,12 @@ if (existsSync(nativeDriver)) args.push('--native-driver', nativeDriver);
 // Give WebView2 a fresh per-run user data folder: DevToolsActivePort lives
 // there, so a locked or half-written leftover profile is the classic cause
 // of "session not created: DevToolsActivePort file doesn't exist" on CI.
-const webview2Udf = path.join(os.tmpdir(), `maestro-e2e-wv2-${process.pid}`);
+// On elevated runners the env override is ignored (Runtime ≥150), so CI pins
+// the same path through an HKLM policy and exports it as WV2_E2E_UDF; the
+// webviewOptions.userDataFolder capability below then tells msedgedriver
+// where the file will actually appear.
+const webview2Udf = process.env.WV2_E2E_UDF
+  ?? path.join(os.tmpdir(), `maestro-e2e-wv2-${process.pid}`);
 
 // A debug build loads `build.devUrl` (127.0.0.1:1420), so the E2E owns a Vite
 // dev server for the run instead of requiring a slow release build.
@@ -110,7 +115,19 @@ try {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try {
       const created = await wd('POST', '/session', {
-        capabilities: { alwaysMatch: { browserName: 'wry', 'tauri:options': { application: exe } } },
+        capabilities: {
+          alwaysMatch: {
+            browserName: 'wry',
+            'tauri:options': {
+              application: exe,
+              // Forwarded to msedgedriver as ms:edgeOptions.webviewOptions.
+              // Required on elevated runners where WEBVIEW2_USER_DATA_FOLDER
+              // is dropped: the UDF is then pinned by HKLM policy, and this
+              // points the driver at DevToolsActivePort in that same folder.
+              webviewOptions: { userDataFolder: webview2Udf },
+            },
+          },
+        },
       });
       session = created.sessionId ?? created['sessionId'];
       lastSessionError = undefined;

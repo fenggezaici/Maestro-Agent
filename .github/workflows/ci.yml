@@ -117,15 +117,31 @@ jobs:
 
       # WebView2 Runtime ≥150 drops WEBVIEW2_* env vars and CLI debugging
       # switches for elevated hosts (MicrosoftEdge/WebView2Feedback#5645);
-      # GitHub runners are always elevated, so the debug port must come
+      # GitHub runners are always elevated, so both settings must come
       # through the HKLM policy channel, which survives elevation.
+      #   - AdditionalBrowserArguments restores --remote-debugging-port.
+      #   - UserDataFolder pins the profile dir: msedgedriver looks for
+      #     DevToolsActivePort in the UDF it thinks it set via env — that
+      #     env is dropped too, so without this pin the file lands in the
+      #     app's default UDF and the driver never finds it. The E2E script
+      #     repeats the same path via webviewOptions.userDataFolder.
+      # Policy layout is a per-AppId subkey: the value name is the exe name
+      # (fallback "*"), not a flat value on the WebView2 key.
       - name: Allow WebView2 remote debugging on this elevated runner
         shell: pwsh
         run: |
-          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2' -Force | Out-Null
-          New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2' `
-            -Name 'AdditionalBrowserArguments' -PropertyType String -Force `
-            -Value '--remote-debugging-port=0 --disable-gpu' | Out-Null
+          $base = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2'
+          $udf = Join-Path $env:RUNNER_TEMP 'maestro-wv2-udf'
+          New-Item -Path "$base\AdditionalBrowserArguments" -Force | Out-Null
+          New-Item -Path "$base\UserDataFolder" -Force | Out-Null
+          foreach ($app in 'maestro.exe', '*') {
+            New-ItemProperty -Path "$base\AdditionalBrowserArguments" -Name $app `
+              -PropertyType String -Force `
+              -Value '--remote-debugging-port=0 --disable-gpu' | Out-Null
+            New-ItemProperty -Path "$base\UserDataFolder" -Name $app `
+              -PropertyType String -Force -Value $udf | Out-Null
+          }
+          "WV2_E2E_UDF=$udf" >> $env:GITHUB_ENV
 
       # Distinguish "app crashes at startup" from "WebView2/driver flake" on
       # the next failure. The debug build is a console subsystem binary, so a
