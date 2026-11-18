@@ -51,6 +51,16 @@ pub struct RecommendedItem {
     pub install_payload: String,
 }
 
+/// Trust prompt payload: the workspace carries project `.maestro/` assets
+/// that stay inert until the user grants trust (per canonical path, in DB).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustStatus {
+    pub path: String,
+    /// Which asset kinds are present — `agents` / `skills` / `commands`.
+    pub assets: Vec<String>,
+}
+
 // ---- MCP servers ------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

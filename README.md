@@ -37,7 +37,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
 | 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Shiki 代码预览（`@pierre/diffs`）；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁且在飞合并去重；折叠子树按需渲染（不驻留 DOM），忽略 `__pycache__`/`venv`/`.venv` |
-| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，只读白名单命令免审、其余命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许（会话级规则，默认精确匹配完整命令或参数，可选前缀并在卡片上显示实际规则）/ 拒绝并反馈，拒绝原因回传给模型；Plan 下历史授权不能越过模式禁止 |
+| Review / 审批 | 提议 Diff 与单次计划决定；**计划批准即把会话切换为 Code**（ZCode plan→code，已完成的 run 不回写、对下一个 run 生效）；Code 模式写文件直接执行，只读白名单命令免审、其余命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许 / 拒绝并反馈，拒绝原因回传给模型；始终允许写入**持久化规则库**（SQLite，重启后仍在，`list_approval_rules`/`revoke_approval_rule` 可查看与撤销；默认精确匹配完整命令或参数，可选前缀并在卡片上显示实际规则）；审批决定**逐工具调用**做出，一批挂起调用逐张卡片独立裁决；Plan 下历史授权不能越过模式禁止 |
 | IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
 | Composer 统计 | 对齐 DSH StatsLine：`N 轮 M 步 · X tok/s · Y tok · 缓存命中 Z% · W%`；步=已完成 LLM 请求数（attempts，即 DSH step/end 计数），tok/s=输出速度 TPS=ΣdecodeTokens/ΣdecodeMs（decode 窗口=首个 content/reasoning/tool-call delta → 流结束，仅计入首 delta 与 output usage 同有的请求，reasoning 不重复计、工具时间不计入），Y=计费输入+输出（流式中为估算增量标 est.），Z=cacheRead/计费输入整数百分比，W=上下文占用；provider 多在请求结束上报 usage，会话 TPS/token 按请求边界跳变、Usage 一到达即刷新；流式期间 liveSurfaceTokens（在途请求 surface 文本估算，含 reasoning，usage 样本到达即清零）驱动 token 增量与 `≈tok/s` 本轮速度（估），永不持久化，与 DSH surfaceTokens 一致；无 Done 的失败请求仅 usage 进累计、不进 TPS/TTFT/步数（DSH tokenUsage 与 sessionStats 分离语义）；同请求多次 usage 后值替换前值；取消不计；子智能体的 LLM 调用作为真实 step 折进父会话统计（执行期间行持续跳动），但 W% 仅由主会话请求的最新 inputTokens 驱动、子调用不得覆盖（ZCode `shouldUseModelUsageForContext` 口径），百分比经 Intl percent 保留一位小数（0.2% 不显示为 0%）；点击展开详情（模型用时/工具调用用时/首 token 平均/输出速度/本轮速度（估）/最近请求 TPS + token 明细）；缺失字段显示 —，持久化速度绝不用文本估算 |
@@ -52,7 +52,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
 | 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算；Composer 960px、正文 896px |
 | 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
-| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局），SKILL.md frontmatter 解析，新建（可选全局/项目）、删除、本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
+| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局；**项目源仅在工作区被显式信任后生效**，防止克隆仓库自带扩展自动注入），SKILL.md frontmatter 解析，新建（可选全局/项目）、删除、本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
 | MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效；Windows 自动解析 PATH 中的 `.cmd`/`.bat`（npx/npm 可用），支持 env、编辑配置；`auto_start` 默认 false，只有显式启用过的服务才在启动时恢复，失败只显示行内错误 |
 | 斜杠命令 | 输入 `/` 打开分组面板：内置动作（模式切换、新建会话、停止、设置、扩展、活动、审查面板、清空）、技能（`/skill-name` 生成 load_skill 指令）、`.maestro/commands/*.md` 自定义命令（frontmatter + `$ARGUMENTS`，项目覆盖全局）；↑/↓/Enter/Tab/Esc 键盘操作，展开结果先写入输入框再发送 |
 | 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体：`explore`/`general` 内置，`~/.maestro/agents/*.md` 与 `<workspace>/.maestro/agents/*.md` 可新增自定义 agent（项目覆盖全局、覆盖内置），子循环固定按 Plan 门禁执行，写文件与命令一律拒绝；每个子智能体有独立 trace（prompt/思考/工具/正文/用量），右侧「子智能体」面板可实时下钻并在重启后回看，子工具不再混入父时间线，最近 6 份报告（≤16KB）会注入后续轮次；子智能体支持 600s 超时（`MAESTRO_SUBAGENT_TIMEOUT` 可调）、20 次工具预算、轮次耗尽保留结论与单独停止；OpenCode 网关下每个子智能体使用独立 `x-opencode-session`，默认最多 3 个并行（`MAESTRO_MAX_SUBAGENTS` 可调）；模型连接按 opencode retry 策略自动退避重试 |
@@ -61,7 +61,7 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 | 变更卡 / 撤销 | 对话结束或手动停止后显示 ZCode 风格可折叠变更卡：summary 先行、展开懒加载明细、审查/打开；撤销走 preview(safe/unsafe/ignored) → apply，只回退安全文件，已撤销保留卡片 |
 | 侧栏对齐 | 导航、项目行、会话标题统一 x=46；行盒右边界 248，计数/时间戳 244；项目/会话操作按钮 absolute 悬浮，hover 不推挤内容 |
 
-**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code applies write/patch directly and only suspends dangerous commands (rm -rf, format, git reset --hard, etc.), safe commands execute; Confirm suspends every tool call; Auto executes already-authorized tools directly. Approving a plan only records intent — it never applies a diff by itself. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
+**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code applies write/patch directly and only suspends dangerous commands (rm -rf, format, git reset --hard, etc.), safe commands execute; Confirm suspends every tool call; Auto executes already-authorized tools directly. Approving a plan transitions the session from Plan to Code — the sanction to execute — while the finished run keeps its Plan identity in history. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
 
 ## 快速开始
 
@@ -110,7 +110,7 @@ pnpm.cmd tauri dev
 
 ## 安全与数据边界
 
-> **API Key 明文保存在 WebView localStorage，不是系统凭据库。**仅在信任的本机使用，优先配置 HTTPS；开发窗口和安装版的 origin 不同，需要分别保存配置。
+> **API Key 存入系统凭据保险库（Windows DPAPI，`CryptProtectData` 绑定当前用户），不再经过前端 localStorage；**前端只在保存时一次性提交给后端。仅建议优先配置 HTTPS 的私有网关。
 
 - 配置凭据不会主动写入会话数据库、审计或日志；模型错误文本会脱敏。
 - 会话数据库包含用户消息与模型回复，请视为私人数据。位置为 Tauri `app_data_dir()/maestro.sqlite3`。
@@ -209,9 +209,14 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 
 | 程序 | 允许的只读子命令 / 参数 |
 | --- | --- |
-| `git` | `status` `diff` `log` `show` `rev-parse` `ls-files` `blame` `describe` `shortlog` `branch`（仅列表）`config`（仅 `--get`/`--get-all`/`--list`）及各自的显式 flag 表 |
+| `git` | `status` `diff` `log` `show` `rev-parse` `ls-files` `blame` `describe` `shortlog` `branch`（仅列表）`config`（仅 `--get`/`--get-all`/`--list`）`tag`（仅 `-l`/`-n` 列表）`remote`（仅 `-v`/`get-url`）`stash`（仅 `list`/`show`）`grep` 及各自的显式 flag 表 |
 | `rg` | `-n` `-i` `-l` `-c` `-S` `-w` `-F` `--files` `--hidden` `--no-heading` 与 `-g/-t/-e/-A/-B/-C/-m/--max-depth`（带值） |
-| `where` | 仅位置参数（`/R`、`-x` 等开关需审批） |
+| `cat` `head` `tail` `wc` `more` `ls` `tree` `fd` `grep` | 各自的只读 flag 表；位置参数必须是工作区相对路径（绝对路径、`..`、盘符一律转审批） |
+| `pwd` `ver` `hostname` `whoami` `echo` | 无文件副作用（`pwd`/`ver`/`hostname`/`whoami` 不接受参数） |
+| `where` `which` | 仅位置参数（`/R`、`-x` 等开关需审批） |
+| `node` `npm` `python` `cargo` `go` 等版本探测 | 仅 `-v`/`-V`/`--version`/`version` 单参数 |
+
+`-rn`/`-la` 这类合并短旗标按每个字符逐项校验，必须全部是已登记的非取值旗标。
 
 安全边界：
 
@@ -244,6 +249,18 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - ZCode 风格 context_compaction：80% 自动触发、`/compact` 手动触发、持久摘要与 pre/post token 分隔行
 - run 内工具消息持久化与回放（v12），同一 session 新 run 不再丢失上一轮工具上下文
 - ZCode 风格 reasoning/content chunk 合并（32ms/512 字符），长思考不再每 token 重渲染
+- Anthropic 协议修复：多 system 消息合并进 `system` 字段、thinking 块（含 signature）持久化回传、工具轮 assistant 正文保留、压缩切分不产生孤儿 tool 消息、`finish_reason` 透出并标记 `length` 截断
+- Run 级 workspace root 快照：run 期间切换 Explorer 目录不会重定向在途工具执行与撤销
+- 项目 `.maestro/` 扩展信任门槛：agents/skills/commands 仅在显式信任工作区后扫描与注入（持久化 `trusted_workspaces`，前端信任横幅）
+- 敏感文件 denylist：`.env`（除 example/sample/template 等模板）、私钥与凭据扩展名、`.ssh`/`.gnupg`/`.aws`/`.docker`/`.kube` 目录对模型读/写/删除一律拒绝
+- 只读搜索工具 `glob_files`/`grep_files`（全模式可用、工作区限界、敏感文件感知），`read_file` 支持 `offset`/`limit` 行窗口与行号
+- 写工具 read-before-write 与陈旧内容检测（外部修改拒绝覆写），`apply_patch` 多 hunk
+- `run_command` 模型可调 `timeout_ms`（1s–600s）与 `background` 后台任务（`task_output`/`task_stop` 管理）
+- 只读命令白名单扩充：文件读取类（cat/head/tail/wc/ls/tree/fd/grep/more）、系统探测（pwd/ver/hostname/whoami/echo）、版本探测（node/npm/python/cargo/go… 仅 -v/--version）、git 追加 `tag`/`remote`/`stash`/`grep` 只读子命令
+- 审批逐调用决定；始终允许写入 SQLite 持久化规则（可列出/撤销），重启后仍生效
+- 计划批准触发 Plan→Code 会话迁移（持久化 `record_mode` + `ModeChanged` 事件）
+- Anthropic `cache_control` 断点（system/tools/消息尾部共 3 个 ephemeral），cache read/write 用量已入 run_metrics
+- 压缩改为 provider usage 口径（`input + max_output ≥ 90%·window`，无样本回落字符估算 80%）；microcompact 先裁剪陈旧工具结果；summarize 连续失败 3 次熔断改启发式摘要
 
 后续重点：
 

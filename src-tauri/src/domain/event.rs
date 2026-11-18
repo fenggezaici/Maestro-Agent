@@ -64,6 +64,16 @@ pub enum EventData {
     SessionsChanged,
     /// A side-effecting tool finished — the workspace tree should re-scan.
     WorkspaceChanged,
+    /// The workspace carries project `.maestro/` assets that stay inert until
+    /// the user trusts the directory (ZCode workspace-hook trust analog).
+    WorkspaceTrustRequired {
+        path: String,
+        assets: Vec<String>,
+    },
+    /// The workspace was trusted — extension sources should re-scan.
+    WorkspaceTrusted {
+        path: String,
+    },
     /// Streamed answer text.
     Content {
         #[serde(rename = "runId")]

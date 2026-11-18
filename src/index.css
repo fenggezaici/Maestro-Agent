@@ -282,6 +282,16 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .session-context-strip { min-height: 29px; margin: 0 25px; display: flex; flex-wrap: wrap; align-items: center; gap: 15px; font-size: 9px; color: #818181; }
 .session-context-strip > span { display: inline-flex; align-items: center; gap: 5px; }
 .session-context-strip .preview-tag { color: #93869e; margin-left: auto; font-size: 8px; }
+.trust-banner { margin: 0 25px 10px; padding: 10px 14px; border-radius: 10px; border: 1px solid #4a3d5c; background: #1e1930; display: flex; align-items: center; gap: 10px; font-size: 11px; color: #d4d4d8; }
+.trust-banner > svg { flex-shrink: 0; color: #b8a6df; }
+.trust-banner-text { flex: 1; min-width: 0; line-height: 1.5; }
+.trust-banner-text strong { font-weight: 600; }
+.trust-banner-text .trust-path { display: block; color: #8d8d8d; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trust-banner button { flex-shrink: 0; padding: 5px 12px; border-radius: 7px; border: 1px solid transparent; font-size: 11px; cursor: pointer; }
+.trust-banner .trust-allow { background: #b8a6df; color: #191526; font-weight: 600; }
+.trust-banner .trust-allow:hover { background: #c9bdf0; }
+.trust-banner .trust-dismiss { background: transparent; color: #8d8d8d; border-color: #3f3f46; }
+.trust-banner .trust-dismiss:hover { color: #dedede; }
 .composer-caption, .editor-status { min-width: 0; flex-wrap: wrap; }
 .chat-history-shell { position: relative; flex: 1; min-height: 0; display: flex; }
 .chat-history { min-height: 0; flex: 1; overflow: auto; padding: 29px 25px 10px; overflow-anchor: none; }

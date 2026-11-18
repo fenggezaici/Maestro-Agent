@@ -2,7 +2,7 @@
 //! call — built-in workspace reads, session reads, the skill loader, and
 //! namespaced MCP tools. Authorization (mode policy) stays on the caller;
 //! the router resolves effects and executes.
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::SystemTime};
 
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -78,10 +78,32 @@ fn plan_summary(steps: &[PlanStep]) -> String {
     }
 }
 
+/// (mtime, len) the agent last observed for a file.
+type FileStamp = Option<(SystemTime, u64)>;
+
+/// One detached `run_command` entry for `task_output`/`task_stop`.
+struct BgTask {
+    command: String,
+    handle: crate::adapters::exec::BackgroundHandle,
+}
+
 pub struct ToolRouter {
     extensions: ExtensionManager,
     workspace: Mutex<Option<PathBuf>>,
     database: Arc<Database>,
+    /// Canonical path → fingerprint the agent last observed via `read_file`
+    /// (or produced via a successful write). Write tools refuse a file that
+    /// was never read or changed since — the ZCode read-before-write rule.
+    file_stamps: Mutex<HashMap<PathBuf, FileStamp>>,
+    /// Background `run_command` tasks keyed `bg-<n>`; outlives the run that
+    /// spawned them (ZCode task registry analog).
+    background: Mutex<HashMap<String, BgTask>>,
+    bg_seq: std::sync::atomic::AtomicU64,
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 impl ToolRouter {
@@ -90,6 +112,9 @@ impl ToolRouter {
             extensions: ExtensionManager::new(maestro_dir)?,
             workspace: Mutex::new(None),
             database,
+            file_stamps: Mutex::new(HashMap::new()),
+            background: Mutex::new(HashMap::new()),
+            bg_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -117,8 +142,11 @@ impl ToolRouter {
         order.into_iter().filter_map(|path| merged.remove(&path)).collect()
     }
 
-    pub async fn preview_revert_changes(&self, changes: &[RunFileChange]) -> AppResult<RevertPreview> {
-        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
+    /// `root` is the workspace the recorded run actually wrote into — the
+    /// caller resolves it from the run's project path, not the live Explorer
+    /// selection, so reverting can never hit a different directory.
+    pub async fn preview_revert_changes(&self, root: Option<&Path>, changes: &[RunFileChange]) -> AppResult<RevertPreview> {
+        let root = root.ok_or_else(|| NO_WORKSPACE.to_string())?;
         let mut safe_files = Vec::new();
         let mut unsafe_files = Vec::new();
         let mut ignored_files = Vec::new();
@@ -127,7 +155,7 @@ impl ToolRouter {
                 ignored_files.push(RevertIssue { path: change.path, reason: "checkpoint_missing".into() });
                 continue;
             }
-            match fs::read_file(&root, &change.path) {
+            match fs::read_file(root, &change.path) {
                 Err(_) => unsafe_files.push(RevertIssue { path: change.path, reason: "file_read_failed".into() }),
                 Ok(current) if current != change.after => unsafe_files.push(RevertIssue { path: change.path, reason: "external_modified".into() }),
                 Ok(_) => safe_files.push(change.path),
@@ -136,9 +164,9 @@ impl ToolRouter {
         Ok(RevertPreview { safe_files, unsafe_files, ignored_files })
     }
 
-    pub async fn revert_changes(&self, changes: &[RunFileChange]) -> AppResult<RevertResult> {
-        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
-        let preview = self.preview_revert_changes(changes).await?;
+    pub async fn revert_changes(&self, root: Option<&Path>, changes: &[RunFileChange]) -> AppResult<RevertResult> {
+        let root = root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+        let preview = self.preview_revert_changes(Some(root), changes).await?;
         let merged = Self::merge_changes(changes);
         let mut reverted = Vec::new();
         let mut conflicts: Vec<String> = preview
@@ -151,12 +179,12 @@ impl ToolRouter {
             let Some(change) = merged.iter().find(|change| &change.path == path) else { continue };
             // Re-check immediately before writing: the preview and this write are
             // not atomic, so an edit in between must win over our snapshot.
-            if fs::read_file(&root, path).ok().as_deref() != Some(change.after.as_str()) {
+            if fs::read_file(root, path).ok().as_deref() != Some(change.after.as_str()) {
                 conflicts.push(path.clone());
                 continue;
             }
-            if change.before.is_empty() { fs::remove_file(&root, path)?; }
-            else { fs::write_file(&root, path, &change.before)?; }
+            if change.before.is_empty() { fs::remove_file(root, path)?; }
+            else { fs::write_file(root, path, &change.before)?; }
             reverted.push(path.clone());
         }
         Ok(RevertResult { reverted, conflicts })
@@ -164,8 +192,9 @@ impl ToolRouter {
 
     /// Snapshot of a write target taken when the approval card is shown. The
     /// write is refused if the file changed in the meantime, so an external
-    /// edit is never silently overwritten by a stale preview.
-    pub async fn write_baseline(&self, tool: &str, arguments_json: &str) -> WriteBaseline {
+    /// edit is never silently overwritten by a stale preview. `root` is the
+    /// run-bound workspace — never re-read the global root mid-run.
+    pub async fn write_baseline(&self, root: Option<&Path>, tool: &str, arguments_json: &str) -> WriteBaseline {
         if tool != "write_file" && tool != "apply_patch" {
             return WriteBaseline::NotApplicable;
         }
@@ -175,11 +204,11 @@ impl ToolRouter {
         let Some(rel) = arguments.get("path").and_then(|value| value.as_str()) else {
             return WriteBaseline::Unverifiable;
         };
-        let Some(root) = self.workspace_root().await else {
+        let Some(root) = root else {
             return WriteBaseline::Unverifiable;
         };
-        match fs::scoped_path(&root, rel) {
-            Ok(path) if path.is_file() => match fs::read_file(&root, rel) {
+        match fs::scoped_path(root, rel) {
+            Ok(path) if path.is_file() => match fs::read_file(root, rel) {
                 Ok(content) => WriteBaseline::Content(content),
                 Err(_) => WriteBaseline::Unverifiable,
             },
@@ -190,6 +219,7 @@ impl ToolRouter {
 
     pub async fn verify_write_baseline(
         &self,
+        root: Option<&Path>,
         tool: &str,
         arguments_json: &str,
         baseline: &WriteBaseline,
@@ -202,9 +232,9 @@ impl ToolRouter {
         let arguments: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
         let rel = arguments.get("path").and_then(|value| value.as_str()).unwrap_or("");
-        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
-        let current = match fs::scoped_path(&root, rel) {
-            Ok(path) if path.is_file() => fs::read_file(&root, rel).ok(),
+        let root = root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+        let current = match fs::scoped_path(root, rel) {
+            Ok(path) if path.is_file() => fs::read_file(root, rel).ok(),
             _ => None,
         };
         if current.as_deref() == expected {
@@ -216,11 +246,34 @@ impl ToolRouter {
     }
 
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
-        *self.workspace.lock().await = root;
+        *self.workspace.lock().await = root.clone();
+        // MCP 启动器解析复用同一 root：工作区内 PATH 目录不得提供 shim。
+        self.extensions.mcp.set_workspace_root(root);
     }
 
     pub async fn workspace_root(&self) -> Option<PathBuf> {
         self.workspace.lock().await.clone()
+    }
+
+    /// Project `.maestro/` assets (agents/skills/commands) are a prompt
+    /// injection surface from cloned repos — they only load after the user
+    /// trusts the directory (ZCode workspace-hook trust analog). Returns the
+    /// root when it carries no project assets or was explicitly trusted;
+    /// `None` makes project-scope scans see an empty source.
+    pub async fn trusted_project_root(&self, root: Option<&Path>) -> Option<PathBuf> {
+        let root = root?;
+        if crate::adapters::agents::has_maestro_assets(root).is_empty() {
+            return Some(root.to_path_buf());
+        }
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        match self
+            .database
+            .is_workspace_trusted(canonical.to_string_lossy().to_string())
+            .await
+        {
+            Ok(true) => Some(root.to_path_buf()),
+            _ => None,
+        }
     }
 
     /// Whether a namespaced MCP tool declared `readOnlyHint`.
@@ -246,10 +299,11 @@ impl ToolRouter {
     /// Every tool spec offered to the model this turn: skill loader, running
     /// MCP tools, and the built-in workspace/session reads and writes — all as
     /// standard JSON Schema `ToolSpec`s. Tools the mode gate would deny
-    /// outright are stripped here so the model never sees them.
-    pub async fn tool_specs(&self, mode: Mode) -> Vec<ToolSpec> {
+    /// outright are stripped here so the model never sees them. `root` is the
+    /// run-bound workspace used to scan project `.maestro/` assets.
+    pub async fn tool_specs(&self, mode: Mode, root: Option<&Path>) -> Vec<ToolSpec> {
         let mut tools = self.extensions.tool_specs().await;
-        let workspace_root = self.workspace.lock().await.clone();
+        let workspace_root = self.trusted_project_root(root).await;
         // Subagent types come from disk so user-defined agents are selectable;
         // hidden definitions stay out of the model's enum.
         let subagents: Vec<_> =
@@ -284,11 +338,37 @@ impl ToolRouter {
         });
         tools.push(ToolSpec {
             name: "read_file".into(),
-            description: "读取工作区文件内容（只读，限文本）。path 为相对路径。".into(),
+            description: "读取工作区文件内容（只读，限文本，带行号）。path 为相对路径；offset 为起始行号（默认 1），limit 限制返回行数（最多 2000）。".into(),
             parameters: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "type": "integer", "description": "1-based 起始行号" },
+                    "limit": { "type": "integer", "description": "最多返回行数" }
+                },
                 "required": ["path"]
+            }),
+        });
+        tools.push(ToolSpec {
+            name: "glob_files".into(),
+            description: "按 glob 模式列出工作区文件（只读）。pattern 支持 *（段内）、**（跨目录）、?；不含 / 的模式匹配任意层级的文件名，如 *.rs。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "pattern": { "type": "string" } },
+                "required": ["pattern"]
+            }),
+        });
+        tools.push(ToolSpec {
+            name: "grep_files".into(),
+            description: "在工作区文件内做文本行搜索（只读，字面子串匹配）。query 为查找内容；glob 可选限定文件集（如 src/**/*.rs）；ignore_case 为 true 时忽略大小写。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "glob": { "type": "string" },
+                    "ignore_case": { "type": "boolean" }
+                },
+                "required": ["query"]
             }),
         });
         tools.push(ToolSpec {
@@ -305,13 +385,33 @@ impl ToolRouter {
         });
         tools.push(ToolSpec {
             name: "run_command".into(),
-            description: "在工作区目录执行一条 shell 命令（有副作用；调用会挂起等待用户批准，60s 超时强制终止）。command 为完整命令行。".into(),
+            description: "在工作区目录执行一条 shell 命令（有副作用；调用会挂起等待用户批准，超时强制终止）。command 为完整命令行；timeout_ms 可调（1s–600s，默认 60s）；background 为 true 时立即返回任务 id，配合 task_output/task_stop 管理。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" }
+                    "command": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "description": "超时毫秒数，1000–600000，默认 60000" },
+                    "background": { "type": "boolean", "description": "true 时后台运行并返回任务 id" }
                 },
                 "required": ["command"]
+            }),
+        });
+        tools.push(ToolSpec {
+            name: "task_output".into(),
+            description: "读取后台任务（run_command background）的当前输出与状态（只读）。task_id 形如 bg-1。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "task_id": { "type": "string" } },
+                "required": ["task_id"]
+            }),
+        });
+        tools.push(ToolSpec {
+            name: "task_stop".into(),
+            description: "终止一个后台任务（有副作用，杀进程树）。task_id 形如 bg-1。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "task_id": { "type": "string" } },
+                "required": ["task_id"]
             }),
         });
         tools.push(ToolSpec {
@@ -321,10 +421,22 @@ impl ToolRouter {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "before": { "type": "string" },
-                    "after": { "type": "string" }
+                    "before": { "type": "string", "description": "单 hunk 模式：原文件中恰好出现一次的待替换文本" },
+                    "after": { "type": "string", "description": "单 hunk 模式：替换后的文本" },
+                    "edits": {
+                        "type": "array",
+                        "description": "多 hunk 模式：按顺序应用 1-50 个 {before, after} 替换，全部定位成功才写入",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "before": { "type": "string" },
+                                "after": { "type": "string" }
+                            },
+                            "required": ["before", "after"]
+                        }
+                    }
                 },
-                "required": ["path", "before", "after"]
+                "required": ["path"]
             }),
         });
         let subagent_names: Vec<String> = subagents.iter().map(|agent| agent.name.clone()).collect();
@@ -430,6 +542,9 @@ impl ToolRouter {
             "write_file" | "apply_patch" | "read_file" | "list_dir" => {
                 arg("path").unwrap_or("").to_string()
             }
+            "glob_files" => arg("pattern").unwrap_or("").to_string(),
+            "grep_files" => arg("query").unwrap_or("").to_string(),
+            "task_output" | "task_stop" => arg("task_id").unwrap_or("").to_string(),
             "run_command" => arg("command").unwrap_or("").to_string(),
             "load_skill" => arg("name").unwrap_or("").to_string(),
             "spawn_subagent" => arg("description").unwrap_or("研究子任务").to_string(),
@@ -461,7 +576,8 @@ impl ToolRouter {
     /// Bounded preview for the approval card shown while a call is suspended.
     /// Write tools preview path plus old/new content; everything else shows
     /// the raw arguments JSON so the user sees exactly what would run.
-    pub async fn approval_preview(&self, tool: &str, arguments_json: &str) -> String {
+    /// `root` is the run-bound workspace the approval decision applies to.
+    pub async fn approval_preview(&self, root: Option<&Path>, tool: &str, arguments_json: &str) -> String {
         let arguments: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
         let preview = match tool {
@@ -470,10 +586,10 @@ impl ToolRouter {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let (exists, old) = match self.workspace_root().await {
-                    Some(root) => match fs::scoped_path(&root, rel) {
+                let (exists, old) = match root {
+                    Some(root) => match fs::scoped_path(root, rel) {
                         Ok(path) if path.is_file() => {
-                            (true, fs::read_file(&root, rel).unwrap_or_default())
+                            (true, fs::read_file(root, rel).unwrap_or_default())
                         }
                         _ => (false, String::new()),
                     },
@@ -531,12 +647,15 @@ impl ToolRouter {
     /// needs to render a diff (workspace write tools only); `plan` carries
     /// validated task steps from `update_plan`.
     /// `session_id` is the caller's own session — model arguments can never
-    /// redirect `read_session` to another session.
+    /// redirect `read_session` to another session. `workspace_root` is the
+    /// root captured when the run started; a mid-run Explorer switch must not
+    /// redirect writes/commands to a different directory.
     pub async fn execute(
         &self,
         session_id: i64,
         tool: &str,
         arguments_json: &str,
+        workspace_root: Option<&Path>,
         cancel: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> AppResult<ToolOutcome> {
         let arguments: serde_json::Value =
@@ -551,13 +670,14 @@ impl ToolRouter {
         let (text, write) = match tool {
             "load_skill" => {
                 let name = arg("name", "load_skill")?;
+                let trusted = self.trusted_project_root(workspace_root).await;
                 let body = self
                     .extensions
                     .skills
                     .body(
                         name,
                         self.extensions.maestro_dir(),
-                        self.workspace_root().await.as_deref(),
+                        trusted.as_deref(),
                     )?;
                 (
                     format!(
@@ -567,72 +687,153 @@ impl ToolRouter {
                 )
             }
             "write_file" | "apply_patch" => {
-                let root = self
-                    .workspace_root()
-                    .await
-                    .ok_or_else(|| NO_WORKSPACE.to_string())?;
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                let rel = arg("path", tool)?;
+                let target = fs::scoped_write_path(root, rel)?;
+                // Read-before-write: overwriting a file the agent has not
+                // observed (or that changed since) must fail loudly.
+                if target.is_file() {
+                    let current = file_stamp(&target);
+                    let known = self.file_stamps.lock().await.get(&target).copied().flatten();
+                    if current.is_none() || known.is_none() || current != known {
+                        return Err(format!(
+                            "{rel} 已存在但当前内容未读取过（或读取后已被外部修改）：请先 read_file 再写入"
+                        ));
+                    }
+                }
                 let report = if tool == "write_file" {
-                    fs::write_file(&root, arg("path", tool)?, arg("content", tool)?)?
+                    fs::write_file(root, rel, arg("content", tool)?)?
                 } else {
-                    fs::apply_patch(
-                        &root,
-                        arg("path", tool)?,
-                        arg("before", tool)?,
-                        arg("after", tool)?,
+                    let hunks = if let Some(edits) = arguments.get("edits").and_then(|v| v.as_array()) {
+                        if edits.is_empty() || edits.len() > 50 {
+                            return Err("apply_patch 的 edits 需为 1-50 个 hunk".into());
+                        }
+                        let mut parsed = Vec::with_capacity(edits.len());
+                        for (index, edit) in edits.iter().enumerate() {
+                            let before = edit.get("before").and_then(|v| v.as_str())
+                                .ok_or_else(|| format!("edits[{}] 缺少 before", index))?;
+                            let after = edit.get("after").and_then(|v| v.as_str())
+                                .ok_or_else(|| format!("edits[{}] 缺少 after", index))?;
+                            parsed.push((before.to_string(), after.to_string()));
+                        }
+                        parsed
+                    } else {
+                        vec![(arg("before", tool)?.to_string(), arg("after", tool)?.to_string())]
+                    };
+                    fs::apply_patch_multi(
+                        root,
+                        rel,
+                        &hunks.iter().map(|(b, a)| (b.as_str(), a.as_str())).collect::<Vec<_>>(),
                     )?
                 };
+                self.file_stamps.lock().await.insert(target.clone(), file_stamp(&target));
                 (report.summary.clone(), Some(report))
             }
             "run_command" => {
-                let root = self
-                    .workspace_root()
-                    .await
-                    .ok_or_else(|| NO_WORKSPACE.to_string())?;
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
                 let command = arg("command", tool)?;
-                let text = match crate::domain::command_policy::parse(command) {
-                    // Allowlisted: run the resolved binary directly, no shell.
-                    crate::domain::command_policy::CommandPolicy::ReadOnly { program, args } => {
-                        let Some(path) = crate::adapters::exec::resolve_in_path(&program, &root) else {
-                            return Err(format!(
-                                "只读白名单命令不可用：{program} 未在 PATH 中找到（未执行）"
-                            ));
-                        };
-                        crate::adapters::exec::run_program(
-                            &root,
-                            &path,
-                            &args,
-                            crate::adapters::exec::COMMAND_TIMEOUT,
-                            cancel,
-                        )
-                        .await?
-                    }
-                    // Everything else keeps the shell path and needs approval.
-                    crate::domain::command_policy::CommandPolicy::NeedsApproval => {
-                        crate::adapters::exec::run_command_with_cancel(
-                            &root,
-                            command,
-                            crate::adapters::exec::COMMAND_TIMEOUT,
-                            cancel,
-                        )
-                        .await?
-                    }
+                // Model-tunable within a hard bound (ZCode: bounded timeout).
+                let timeout_ms = arguments
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .map(|ms| ms.clamp(1_000, 600_000))
+                    .unwrap_or(60_000);
+                let timeout = std::time::Duration::from_millis(timeout_ms);
+                if arguments.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let handle = crate::adapters::exec::spawn_background(root, command, timeout)?;
+                    let seq = self.bg_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let id = format!("bg-{seq}");
+                    self.background.lock().await.insert(
+                        id.clone(),
+                        BgTask { command: command.to_string(), handle },
+                    );
+                    let text = format!(
+                        "已启动后台任务 {id}（超时 {}s 自动终止）。用 task_output 查看输出，task_stop 终止。",
+                        timeout.as_secs()
+                    );
+                    (text, None)
+                } else {
+                    let text = match crate::domain::command_policy::parse(command) {
+                        // Allowlisted: run the resolved binary directly, no shell.
+                        crate::domain::command_policy::CommandPolicy::ReadOnly { program, args } => {
+                            let Some(path) = crate::adapters::exec::resolve_in_path(&program, root) else {
+                                return Err(format!(
+                                    "只读白名单命令不可用：{program} 未在 PATH 中找到（未执行）"
+                                ));
+                            };
+                            crate::adapters::exec::run_program(
+                                root,
+                                &path,
+                                &args,
+                                timeout,
+                                cancel,
+                            )
+                            .await?
+                        }
+                        // Everything else keeps the shell path and needs approval.
+                        crate::domain::command_policy::CommandPolicy::NeedsApproval => {
+                            crate::adapters::exec::run_command_with_cancel(
+                                root,
+                                command,
+                                timeout,
+                                cancel,
+                            )
+                            .await?
+                        }
+                    };
+                    (text, None)
+                }
+            }
+            "task_output" => {
+                let id = arg("task_id", tool)?;
+                let tasks = self.background.lock().await;
+                let task = tasks.get(id).ok_or_else(|| format!("后台任务 {id} 不存在"))?;
+                let status = task.handle.status.lock().unwrap().clone();
+                let output = task.handle.output.lock().unwrap().clone();
+                let text = if output.is_empty() {
+                    format!("任务 {id}（{}）状态：{status}，暂无输出", task.command)
+                } else {
+                    format!("任务 {id}（{}）状态：{status}\n{output}", task.command)
                 };
                 (text, None)
             }
-            "list_dir" => {
-                let root = self
-                    .workspace_root()
+            "task_stop" => {
+                let id = arg("task_id", tool)?;
+                let task = self
+                    .background
+                    .lock()
                     .await
-                    .ok_or_else(|| NO_WORKSPACE.to_string())?;
+                    .remove(id)
+                    .ok_or_else(|| format!("后台任务 {id} 不存在"))?;
+                let _ = task.handle.cancel.send(true);
+                (format!("已请求终止后台任务 {id}"), None)
+            }
+            "list_dir" => {
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
                 let rel = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                (fs::list_dir(&root, rel)?, None)
+                (fs::list_dir(root, rel)?, None)
             }
             "read_file" => {
-                let root = self
-                    .workspace_root()
-                    .await
-                    .ok_or_else(|| NO_WORKSPACE.to_string())?;
-                (fs::read_file(&root, arg("path", tool)?)?, None)
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                let num = |key: &str| arguments.get(key).and_then(|v| v.as_u64());
+                let rel = arg("path", tool)?;
+                let text = fs::read_file_lines(root, rel, num("offset"), num("limit"))?;
+                // Record the observed fingerprint — read-before-write gate.
+                if let Ok(path) = fs::scoped_path(root, rel) {
+                    let stamp = file_stamp(&path);
+                    self.file_stamps.lock().await.insert(path, stamp);
+                }
+                (text, None)
+            }
+            "glob_files" => {
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                (fs::glob_files(root, arg("pattern", tool)?)?, None)
+            }
+            "grep_files" => {
+                let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                let glob = arguments.get("glob").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                let ignore_case = arguments.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
+                (fs::grep_files(root, arg("query", tool)?, glob, ignore_case)?, None)
             }
             "update_plan" => {
                 let steps = plan_steps(&arguments)?;

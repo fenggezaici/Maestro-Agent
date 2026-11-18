@@ -50,6 +50,25 @@ fn read_dir(dir: &Path, source: AgentSource) -> Vec<AgentDefinition> {
 pub fn global_dir(maestro: &Path) -> PathBuf { maestro.join("agents") }
 pub fn project_dir(workspace: &Path) -> PathBuf { workspace.join(".maestro").join("agents") }
 
+/// Whether the workspace carries project `.maestro/` assets that would be
+/// loaded at runtime. Any non-empty agents/skills/commands directory counts —
+/// an empty `.maestro` folder alone does not require trust.
+pub fn has_maestro_assets(workspace: &Path) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for dir in ["agents", "skills", "commands"] {
+        let present = workspace
+            .join(".maestro")
+            .join(dir)
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if present {
+            found.push(dir);
+        }
+    }
+    found
+}
+
 /// Resolved runtime list: builtin < global < project, sorted by name. A file in
 /// a higher source replaces a same-named definition from a lower one.
 pub fn effective(maestro: &Path, workspace: Option<&Path>) -> Vec<AgentDefinition> {

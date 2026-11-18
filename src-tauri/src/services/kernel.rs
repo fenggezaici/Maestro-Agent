@@ -22,9 +22,9 @@ use crate::{
         format_answers, parse_questions, validate_answers, ApprovalCandidate, ApprovalDecision, ApprovalRule, ReasoningSegment, RunPart,
         canonical_json, ContextCompaction, MAX_RULE_PATTERN_CHARS,
         CommandScope, Question, QuestionAnswer, RunMessage, SubagentStatus,
-        SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
+        SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec, WorkspaceTrustStatus,
     },
-    services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter, WriteBaseline}},
+    services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
 };
 
 fn now_ms() -> i64 {
@@ -41,6 +41,10 @@ struct Control {
     cancel: watch::Sender<bool>,
     done: watch::Receiver<bool>,
     finishing: bool,
+    /// Workspace root captured when this run started. Tool execution must use
+    /// this snapshot — a mid-run Explorer/project switch can change the global
+    /// root, and writes/commands must stay in the directory the run began in.
+    workspace_root: Option<PathBuf>,
     /// A tool call suspended awaiting the user's approval decision. At most
     /// one can exist (the agent loop is serial); dropping the responder
     /// without answering counts as rejection.
@@ -211,8 +215,56 @@ impl Kernel {
     }
 
     /// stream_chat supplies the workspace so skills/tools resolve project files.
+    /// A directory carrying untrusted `.maestro/` assets raises a one-shot
+    /// trust request — project-scope scans stay empty until `trust_workspace`.
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
+        if let Some(status) = self.workspace_trust_status(root.as_deref()).await {
+            let mut state = self.state.lock().await;
+            self.emit_locked(&mut state, EventData::WorkspaceTrustRequired {
+                path: status.path,
+                assets: status.assets,
+            });
+        }
         self.router.set_workspace_root(root).await;
+    }
+
+    /// `Some` when the root carries project `.maestro/` assets the user has
+    /// not yet trusted — the payload the UI needs for its trust prompt.
+    pub async fn workspace_trust_status(&self, root: Option<&std::path::Path>) -> Option<WorkspaceTrustStatus> {
+        let root = root?;
+        let assets = crate::adapters::agents::has_maestro_assets(root);
+        if assets.is_empty() {
+            return None;
+        }
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let trusted = self
+            .database
+            .is_workspace_trusted(canonical.to_string_lossy().to_string())
+            .await
+            .unwrap_or(false);
+        (!trusted).then(|| WorkspaceTrustStatus {
+            path: root.to_string_lossy().to_string(),
+            assets: assets.iter().map(|dir| dir.to_string()).collect(),
+        })
+    }
+
+    /// Trust grant recorded against the canonical path so junction/relative
+    /// spellings of the same directory cannot bypass the gate.
+    pub async fn trust_workspace(&self, path: String) -> AppResult<()> {
+        let root = PathBuf::from(&path);
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        self.database
+            .trust_workspace(canonical.to_string_lossy().to_string())
+            .await?;
+        let mut state = self.state.lock().await;
+        self.emit_locked(&mut state, EventData::WorkspaceTrusted { path });
+        Ok(())
+    }
+
+    /// Project-scope asset scans resolve through this — `None` when the
+    /// workspace is untrusted so `.maestro/` content stays inert.
+    pub async fn trusted_project_root(&self, root: Option<&std::path::Path>) -> Option<PathBuf> {
+        self.router.trusted_project_root(root).await
     }
 
     fn emit_locked(&self, state: &mut RuntimeState, data: EventData) {
@@ -339,6 +391,7 @@ impl Kernel {
             error: None,
             created_at: crate::domain::unix_now(),
         };
+        let run_root = self.router.workspace_root().await;
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(false);
         {
@@ -348,6 +401,7 @@ impl Kernel {
                 cancel: cancel_tx,
                 done: done_rx,
                 finishing: false,
+                workspace_root: run_root,
                 pending: None,
                 pending_question: None,
             });
@@ -891,7 +945,11 @@ impl Kernel {
             self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
             return Err(reason);
         }
-        let text = self.router.execute(run.session_id, tool, "{}", None).await?.text;
+        let root = {
+            let state = self.state.lock().await;
+            state.control.as_ref().and_then(|control| control.workspace_root.clone())
+        };
+        let text = self.router.execute(run.session_id, tool, "{}", root.as_deref(), None).await?.text;
         self.database
             .record_tool(run_id, tool.into(), "read-only".into(), true)
             .await?;
@@ -906,8 +964,21 @@ impl Kernel {
 
     /// Tool definitions offered to the model this run, already filtered by the
     /// run's mode: denied tools never reach the request sent to the provider.
-    pub async fn agent_tools(&self, mode: Mode) -> Vec<ToolSpec> {
-        self.router.tool_specs(mode).await
+    /// `root` is the run-bound workspace (agents/skills scan source).
+    pub async fn agent_tools(&self, mode: Mode, root: Option<&std::path::Path>) -> Vec<ToolSpec> {
+        self.router.tool_specs(mode, root).await
+    }
+
+    /// The workspace root bound to `run_id` at start (None when no run is
+    /// active or the run never had one).
+    pub(crate) async fn run_workspace_root(&self, run_id: i64) -> Option<PathBuf> {
+        let state = self.state.lock().await;
+        state
+            .active_run
+            .as_ref()
+            .filter(|run| run.id == run_id)
+            .and_then(|_| state.control.as_ref())
+            .and_then(|control| control.workspace_root.clone())
     }
 
     async fn block_tool_scoped(
@@ -946,12 +1017,26 @@ impl Kernel {
             .and_then(|control| control.pending.take())
             .ok_or("没有等待批准的工具调用")?;
         if decision == ApprovalDecision::AllowAlways {
-            let mut rules = self.approval_rules.lock().unwrap();
-            let entry = rules.entry(pending.session_id).or_default();
-            for candidate in &pending.candidates {
-                let Some(rule) = ApprovalRule::from_candidate(candidate, command_scope) else { continue };
-                if !entry.contains(&rule) {
-                    entry.push(rule);
+            let mut new_rules = Vec::new();
+            {
+                let mut rules = self.approval_rules.lock().unwrap();
+                let entry = rules.entry(pending.session_id).or_default();
+                for candidate in &pending.candidates {
+                    let Some(rule) = ApprovalRule::from_candidate(candidate, command_scope) else { continue };
+                    if !entry.contains(&rule) {
+                        entry.push(rule.clone());
+                        new_rules.push(rule);
+                    }
+                }
+            }
+            // Persist before resolving so a crash can never grant without
+            // recording. Rules live per project (not in `.maestro/` on disk) —
+            // a cloned repo must never ship its own pre-approvals.
+            if !new_rules.is_empty() {
+                if let Ok(Some(project_id)) = self.database.project_id_for_session(pending.session_id).await {
+                    for rule in &new_rules {
+                        let _ = self.database.save_approval_rule(project_id, rule).await;
+                    }
                 }
             }
         }
@@ -1090,6 +1175,24 @@ impl Kernel {
         ApprovalCandidate { tool: tool.into(), target, command, scopable }
     }
 
+    /// Seed the session's in-memory rules from the persisted project set —
+    /// once per session, so later grants propagate to future sessions while
+    /// the live view stays stable.
+    async fn ensure_rules_loaded(&self, session_id: i64) {
+        if self.approval_rules.lock().unwrap().contains_key(&session_id) {
+            return;
+        }
+        let loaded = match self.database.project_id_for_session(session_id).await {
+            Ok(Some(project_id)) => self
+                .database
+                .approval_rules_for_project(project_id)
+                .await
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        self.approval_rules.lock().unwrap().entry(session_id).or_insert(loaded);
+    }
+
     fn is_auto_approved(&self, session_id: i64, candidate: &ApprovalCandidate) -> bool {
         self.approval_rules
             .lock()
@@ -1102,6 +1205,7 @@ impl Kernel {
     /// Addressed by run id so the UI never has to trust a session it inferred.
     pub async fn list_approval_rules(&self, run_id: i64) -> AppResult<Vec<ApprovalRule>> {
         let session_id = self.session_for_run(run_id).await?;
+        self.ensure_rules_loaded(session_id).await;
         Ok(self
             .approval_rules
             .lock()
@@ -1113,11 +1217,20 @@ impl Kernel {
 
     pub async fn revoke_approval_rule(&self, run_id: i64, rule: &ApprovalRule) -> AppResult<bool> {
         let session_id = self.session_for_run(run_id).await?;
-        let mut rules = self.approval_rules.lock().unwrap();
-        let Some(entry) = rules.get_mut(&session_id) else { return Ok(false) };
-        let before = entry.len();
-        entry.retain(|item| item != rule);
-        Ok(entry.len() != before)
+        self.ensure_rules_loaded(session_id).await;
+        let removed = {
+            let mut rules = self.approval_rules.lock().unwrap();
+            let Some(entry) = rules.get_mut(&session_id) else { return Ok(false) };
+            let before = entry.len();
+            entry.retain(|item| item != rule);
+            entry.len() != before
+        };
+        if removed {
+            if let Ok(Some(project_id)) = self.database.project_id_for_session(session_id).await {
+                let _ = self.database.delete_approval_rule(project_id, rule).await;
+            }
+        }
+        Ok(removed)
     }
 
     async fn session_for_run(&self, run_id: i64) -> AppResult<i64> {
@@ -1207,23 +1320,31 @@ impl Kernel {
         enum Gate {
             Denied(AppResult<String>),
             Allow(ToolEffect),
-            Suspended(ToolEffect),
+            Suspended(ToolEffect, ApprovalCandidate),
         }
-        let run = {
+        let (run, run_root) = {
             let _command = self.commands.lock().await;
-            match Self::active_run_locked(&*self.state.lock().await, run_id) {
-                Ok(run) => run,
+            let state = self.state.lock().await;
+            match Self::active_run_locked(&state, run_id) {
+                Ok(run) => (
+                    run,
+                    state
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.workspace_root.clone()),
+                ),
                 Err(reason) => return calls.iter().map(|_| Err(reason.clone())).collect(),
             }
         };
         let mode = mode.unwrap_or(run.mode);
         // Phase 1: classify + gate every call before any execution so the
-        // whole batch can share one approval wait.
+        // batch knows which calls suspend. Each suspended call carries its own
+        // approval candidate — decisions are resolved per call, never shared.
         let mut gates = Vec::with_capacity(calls.len());
-        let mut suspended = Vec::new();
         let mut auto_approved = Vec::new();
         let mut read_only_allowlisted = Vec::with_capacity(calls.len());
-        let mut candidates = Vec::new();
+        let mut any_suspended = false;
+        self.ensure_rules_loaded(run.session_id).await;
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             let target = ToolRouter::call_target(tool, arguments_json);
             self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
@@ -1254,74 +1375,22 @@ impl Kernel {
                         Gate::Allow(effect)
                     }
                     ToolGate::RequireApproval => {
-                        suspended.push(index);
-                        candidates.push(candidate);
-                        Gate::Suspended(effect)
+                        any_suspended = true;
+                        Gate::Suspended(effect, candidate)
                     }
                     ToolGate::Allow => Gate::Allow(effect),
                 },
             };
             gates.push(gate);
         }
-        // Phase 2: one shared suspension — every gated call reports
-        // AwaitingApproval (with its own preview) before the single wait.
-        // Snapshot write targets before the card is shown, so an edit made
-        // while the user decides is detected instead of overwritten.
-        let mut baselines: Vec<(usize, WriteBaseline)> = Vec::new();
-        for &index in &suspended {
-            let baseline = self
-                .router
-                .write_baseline(&calls[index].0, &calls[index].1)
-                .await;
-            baselines.push((index, baseline));
-        }
-        let (approved, feedback) = if suspended.is_empty() {
-            (true, None)
-        } else {
-            let (tx, rx) = oneshot::channel();
-            let mut waiting = false;
-            {
-                let mut state = self.state.lock().await;
-                if Self::active_run_locked(&state, run_id).is_ok() {
-                    if let Some(control) = state.control.as_mut() {
-                        control.pending = Some(PendingApproval {
-                            responder: tx,
-                            session_id: run.session_id,
-                            candidates: candidates.clone(),
-                        });
-                        waiting = true;
-                    }
-                }
-            }
-            for &index in &suspended {
-                let preview = self
-                    .router
-                    .approval_preview(&calls[index].0, &calls[index].1)
-                    .await;
-                self.emit_tool_scoped(run_id, subagent_id, &calls[index].0, ToolPhase::AwaitingApproval, &preview)
-                    .await;
-            }
-            if !waiting {
-                (false, None)
-            } else {
-                let response = rx.await.unwrap_or(ApprovalResponse {
-                    decision: ApprovalDecision::Deny,
-                    feedback: None,
-                });
-                match response.decision {
-                    ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => (true, None),
-                    ApprovalDecision::Deny => (false, response.feedback),
-                }
-            }
-        };
         // Pure read-only batches run concurrently. Started events were already
         // emitted in call order; Finished events are emitted in the same order,
         // so the UI can match pending rows without extra call ids.
-        if suspended.is_empty() && !calls.is_empty()
+        if !any_suspended && !calls.is_empty()
             && gates.iter().all(|gate| matches!(gate, Gate::Allow(ToolEffect::ReadOnly)))
         {
             let outcomes = futures_util::future::join_all(
-                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json, None)),
+                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json, run_root.as_deref(), None)),
             )
             .await;
             let mut results = Vec::with_capacity(calls.len());
@@ -1335,7 +1404,10 @@ impl Kernel {
             return results;
         }
 
-        // Phase 3: execute (or reject) each call in order.
+        // Phase 2: execute calls in order. Every suspended call gets its own
+        // preview, its own wait, and its own decision — a single approval can
+        // no longer smuggle a batch of mixed side effects through (ZCode
+        // per-call approval baseline).
         let mut results = Vec::with_capacity(calls.len());
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             // A batch can be large; stop before the next side effect instead of
@@ -1353,32 +1425,51 @@ impl Kernel {
             }
             match &mut gates[index] {
                 Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
-                Gate::Suspended(_) if !approved => {
-                    let reason = feedback
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(|value| format!("用户拒绝了该操作：{value}"))
-                        .unwrap_or_else(|| "用户拒绝了该操作".into());
-                    results.push(self.block_tool_scoped(run_id, subagent_id, tool, reason).await);
-                }
-                Gate::Allow(effect) | Gate::Suspended(effect) => {
-                    // An approved write must still match what the user saw.
-                    if suspended.contains(&index) {
-                        if let Some((_, baseline)) = baselines.iter().find(|(call, _)| *call == index) {
-                            if let Err(conflict) = self
-                                .router
-                                .verify_write_baseline(tool, arguments_json, baseline)
-                                .await
-                            {
-                                results.push(self.block_tool_scoped(run_id, subagent_id, tool, conflict).await);
-                                continue;
-                            }
-                        }
+                Gate::Suspended(effect, candidate) => {
+                    // Snapshot the write target right before the card is
+                    // shown, so an edit made while the user decides is
+                    // detected instead of overwritten.
+                    let baseline = self
+                        .router
+                        .write_baseline(run_root.as_deref(), tool, arguments_json)
+                        .await;
+                    let preview = self
+                        .router
+                        .approval_preview(run_root.as_deref(), tool, arguments_json)
+                        .await;
+                    self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::AwaitingApproval, &preview)
+                        .await;
+                    let (approved, feedback) = self
+                        .wait_for_approval(run_id, run.session_id, candidate.clone())
+                        .await;
+                    if !approved {
+                        let reason = feedback
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(|value| format!("用户拒绝了该操作：{value}"))
+                            .unwrap_or_else(|| "用户拒绝了该操作".into());
+                        results.push(self.block_tool_scoped(run_id, subagent_id, tool, reason).await);
+                        continue;
                     }
+                    // An approved write must still match what the user saw.
+                    if let Err(conflict) = self
+                        .router
+                        .verify_write_baseline(run_root.as_deref(), tool, arguments_json, &baseline)
+                        .await
+                    {
+                        results.push(self.block_tool_scoped(run_id, subagent_id, tool, conflict).await);
+                        continue;
+                    }
+                    let target = ToolRouter::call_target(tool, arguments_json);
+                    results.push(
+                        self.finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "user approved", *effect)
+                            .await,
+                    );
+                }
+                Gate::Allow(effect) => {
                     let audit = Self::audit_label(
                         auto_approved.contains(&index),
-                        suspended.contains(&index),
                         read_only_allowlisted.get(index).copied().unwrap_or(false),
                     );
                     let target = ToolRouter::call_target(tool, arguments_json);
@@ -1392,13 +1483,50 @@ impl Kernel {
         results
     }
 
+    /// One call's approval wait: installs the responder on the run's control
+    /// channel and returns the decision. `allow_always` rules are recorded by
+    /// `resolve_approval` against exactly this call's candidate.
+    async fn wait_for_approval(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        candidate: ApprovalCandidate,
+    ) -> (bool, Option<String>) {
+        let (tx, rx) = oneshot::channel();
+        let waiting = {
+            let mut state = self.state.lock().await;
+            if Self::active_run_locked(&state, run_id).is_ok() {
+                if let Some(control) = state.control.as_mut() {
+                    control.pending = Some(PendingApproval {
+                        responder: tx,
+                        session_id,
+                        candidates: vec![candidate],
+                    });
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if !waiting {
+            return (false, None);
+        }
+        match rx.await {
+            Ok(ApprovalResponse { decision, feedback }) => match decision {
+                ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => (true, None),
+                ApprovalDecision::Deny => (false, feedback),
+            },
+            Err(_) => (false, None),
+        }
+    }
+
 /// Why a call ran without a prompt. A historical rule and an explicit user
 /// decision are stronger evidence than the read-only allowlist.
-fn audit_label(auto_approved: bool, suspended: bool, read_only_allowlisted: bool) -> &'static str {
+fn audit_label(auto_approved: bool, read_only_allowlisted: bool) -> &'static str {
     if auto_approved {
         "auto-approved"
-    } else if suspended {
-        "user approved"
     } else if read_only_allowlisted {
         "read-only allowlist"
     } else {
@@ -1497,16 +1625,19 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
     ) -> AppResult<String> {
         // A running command must stop when the user stops the run, instead of
         // waiting out its timeout: hand the exec adapter the run's cancel signal.
-        let cancel = {
+        let (cancel, run_root) = {
             let state = self.state.lock().await;
-            state
+            let control = state
                 .active_run
                 .as_ref()
                 .filter(|active| active.id == run_id)
-                .and_then(|_| state.control.as_ref())
-                .map(|control| control.cancel.subscribe())
+                .and_then(|_| state.control.as_ref());
+            (
+                control.map(|control| control.cancel.subscribe()),
+                control.and_then(|control| control.workspace_root.clone()),
+            )
         };
-        let outcome = self.router.execute(session_id, tool, arguments_json, cancel).await;
+        let outcome = self.router.execute(session_id, tool, arguments_json, run_root.as_deref(), cancel).await;
         self.finish_tool_outcome(run_id, session_id, subagent_id, tool, target, audit, effect, outcome)
             .await
     }
@@ -1586,6 +1717,14 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
 
     pub async fn list_agents(&self, scope: String) -> AppResult<Vec<crate::domain::AgentDefinition>> {
         let workspace = self.router.workspace_root().await;
+        // "all" is the runtime/spawn view — untrusted project agents stay out.
+        // Explicit scopes keep the raw root so the UI can still inspect or
+        // delete a hostile definition from an untrusted checkout.
+        let workspace = if scope == "all" {
+            self.router.trusted_project_root(workspace.as_deref()).await
+        } else {
+            workspace
+        };
         Ok(crate::adapters::agents::list(self.router.extensions().maestro_dir(), workspace.as_deref(), &scope))
     }
 
@@ -1607,19 +1746,40 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         self.database.run_changes(run_id).await
     }
 
+    /// Revert writes must target the directory the run actually used — resolve
+    /// the project path bound to the run's session, not the live Explorer
+    /// root (the user may have switched directories since).
+    async fn workspace_root_for_session(&self, session_id: i64) -> Option<PathBuf> {
+        match self.database.project_path_for_session(session_id).await {
+            Ok(Some(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+            _ => self.router.workspace_root().await,
+        }
+    }
+
     pub async fn preview_revert_run_changes(&self, run_id: i64) -> AppResult<crate::domain::RevertPreview> {
         let changes = self.database.run_changes(run_id).await?;
-        self.router.preview_revert_changes(&changes).await
+        let session_id = self
+            .database
+            .list_runs()
+            .await?
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .map(|run| run.session_id);
+        let root = match session_id {
+            Some(id) => self.workspace_root_for_session(id).await,
+            None => self.router.workspace_root().await,
+        };
+        self.router.preview_revert_changes(root.as_deref(), &changes).await
     }
 
     pub async fn revert_run_changes(&self, run_id: i64, session_id: i64) -> AppResult<crate::domain::RevertResult> {
         let changes = self.database.run_changes(run_id).await?;
-        let result = self.router.revert_changes(&changes).await?;
+        let root = self.workspace_root_for_session(session_id).await;
+        let result = self.router.revert_changes(root.as_deref(), &changes).await?;
         let _ = self.database.mark_run_changes_reverted(run_id, &result.reverted).await;
         let _ = self.database.record_tool(run_id, "revert_run_changes".into(), format!("reverted {} files", result.reverted.len()), true).await;
         let mut state = self.state.lock().await;
         self.emit_locked(&mut state, EventData::WorkspaceChanged);
-        let _ = session_id;
         Ok(result)
     }
 
@@ -1800,6 +1960,18 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
             .database
             .decide_plan(session_id, plan_id, decision)
             .await?;
+        // Approving the plan is the user's sanction to execute: leave the
+        // read-only Plan mode behind (ZCode plan→code handoff). Rejected or
+        // revised plans keep the current mode.
+        // Plans are decided after their run completed (decide_plan requires a
+        // completed run), so approval escalates the session mode for the next
+        // run rather than the finished one.
+        if matches!(decision, PlanDecision::Approve) && self.state.lock().await.mode == Mode::Plan {
+            self.database.record_mode(Mode::Code).await?;
+            let mut state = self.state.lock().await;
+            state.mode = Mode::Code;
+            self.emit_locked(&mut state, EventData::ModeChanged { mode: Mode::Code });
+        }
         self.emit_locked(
             &mut *self.state.lock().await,
             EventData::PlanUpdated { plan: plan.clone() },
@@ -2245,7 +2417,14 @@ mod tests {
                 let _ = events.send(StreamEvent::Token("Hello".into()));
                 let _ = events.send(StreamEvent::Token(" 世界".into()));
                 let _ = events.send(StreamEvent::Done);
-                Ok(TurnOutcome { done: true, tool_calls: Vec::new() })
+                Ok(TurnOutcome {
+                    done: true,
+                    tool_calls: Vec::new(),
+                    content: String::new(),
+                    thinking: None,
+                    finish_reason: None,
+                    input_tokens: None,
+                })
             })
         }
     }
@@ -2416,6 +2595,7 @@ mod tests {
             finishing: false,
             pending: None,
             pending_question: None,
+            workspace_root: kernel.router.workspace_root().await,
         });
         (id, receiver)
     }
@@ -2495,8 +2675,12 @@ mod tests {
             .decide_plan(card.session_id, card.id, PlanDecision::Approve)
             .await
             .unwrap();
-        assert_eq!(kernel.snapshot().await.mode, Mode::Plan);
-        assert!(kernel.authorize_tool(id, "apply_patch").await.is_err());
+        // Approving the plan is the execution sanction: the session hands off
+        // to Code so the next run may write (ZCode plan→code transition).
+        assert_eq!(kernel.snapshot().await.mode, Mode::Code);
+        let (next, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        assert!(kernel.authorize_tool(next, "apply_patch").await.is_ok());
+        kernel.finish(next, RunStatus::Completed, None).await;
         assert!(kernel
             .decide_plan(card.session_id, card.id, PlanDecision::Reject)
             .await
@@ -2579,7 +2763,7 @@ mod tests {
     async fn tool_specs_are_filtered_by_mode() {
         let (kernel, _) = test_kernel().await;
         let plan: Vec<String> = kernel
-            .agent_tools(Mode::Plan)
+            .agent_tools(Mode::Plan, None)
             .await
             .into_iter()
             .map(|tool| tool.name)
@@ -2592,7 +2776,7 @@ mod tests {
         assert!(!plan.iter().any(|name| name == "run_command"));
         for mode in [Mode::Code, Mode::Confirm, Mode::Auto] {
             let names: Vec<String> = kernel
-                .agent_tools(mode)
+                .agent_tools(mode, None)
                 .await
                 .into_iter()
                 .map(|tool| tool.name)
@@ -3033,10 +3217,9 @@ mod tests {
 
     #[test]
     fn audit_labels_prefer_the_strongest_reason() {
-        assert_eq!(Kernel::audit_label(true, false, false), "auto-approved");
-        assert_eq!(Kernel::audit_label(false, true, true), "user approved");
-        assert_eq!(Kernel::audit_label(false, false, true), "read-only allowlist");
-        assert_eq!(Kernel::audit_label(false, false, false), "extension");
+        assert_eq!(Kernel::audit_label(true, false), "auto-approved");
+        assert_eq!(Kernel::audit_label(false, true), "read-only allowlist");
+        assert_eq!(Kernel::audit_label(false, false), "extension");
     }
 
     #[cfg(windows)]
@@ -3149,6 +3332,23 @@ mod tests {
             .await;
         std::fs::write(workspace.path().join("a.txt"), "original").unwrap();
         let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        // Read-before-write: the model must observe the file before edits.
+        // In Confirm mode the read itself also needs approval.
+        let reader = kernel.clone();
+        let read_call = tokio::spawn(async move {
+            reader
+                .execute_model_tool(id, "read_file", r#"{"path":"a.txt"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        read_call.await.unwrap().unwrap();
+        // Clear the read's stale approval event so the next wait tracks the
+        // write call only.
+        events.lock().unwrap().clear();
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker
@@ -3190,9 +3390,9 @@ mod tests {
         };
         // Simulate an edit between the revert preview and the write itself by
         // checking the write path directly (the preview would have said safe).
-        assert_eq!(kernel.router.preview_revert_changes(std::slice::from_ref(&change)).await.unwrap().safe_files.len(), 1);
+        assert_eq!(kernel.router.preview_revert_changes(Some(workspace.path()), std::slice::from_ref(&change)).await.unwrap().safe_files.len(), 1);
         std::fs::write(workspace.path().join("a.txt"), "edited-outside").unwrap();
-        let result = kernel.router.revert_changes(&[change]).await.unwrap();
+        let result = kernel.router.revert_changes(Some(workspace.path()), &[change]).await.unwrap();
         assert!(result.reverted.is_empty());
         assert_eq!(result.conflicts, vec!["a.txt".to_string()]);
         assert_eq!(

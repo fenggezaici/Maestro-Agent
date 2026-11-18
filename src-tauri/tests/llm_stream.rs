@@ -456,7 +456,16 @@ async fn anthropic_messages_sse_and_usage_are_adapted_without_mixing_system_role
         .await
         .unwrap()
         .unwrap();
-    assert!(body["system"].as_str().unwrap().contains("只读计划模式"));
+    // The system prompt ships as text blocks carrying an ephemeral cache
+    // breakpoint on the last block.
+    let system_blocks = body["system"].as_array().unwrap();
+    assert!(system_blocks
+        .iter()
+        .any(|block| block["text"].as_str().unwrap().contains("只读计划模式")));
+    assert_eq!(
+        system_blocks.last().unwrap()["cache_control"]["type"],
+        "ephemeral"
+    );
     assert!(body["messages"]
         .as_array()
         .unwrap()

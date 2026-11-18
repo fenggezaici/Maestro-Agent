@@ -44,8 +44,24 @@ pub fn parse(command: &str) -> CommandPolicy {
     let args = &tokens[1..];
     let safe = match program.as_str() {
         "git" => git_args(args),
-        "rg" => args_match(args, RG_FLAGS, true),
-        "where" => where_args(args),
+        "rg" => args_match(args, RG_FLAGS, true) && positionals_are_relative(args),
+        "fd" => args_match(args, FD_FLAGS, true) && positionals_are_relative(args),
+        "grep" => args_match(args, GREP_FLAGS, true) && positionals_are_relative(args),
+        "cat" => args_match(args, CAT_FLAGS, true) && positionals_are_relative(args),
+        "head" | "tail" => args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args),
+        "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
+        "more" => positionals_are_relative(args) && args.iter().all(|arg| !arg.starts_with('-')),
+        "ls" => args_match(args, LS_FLAGS, true) && positionals_are_relative(args),
+        "tree" => args_match(args, TREE_FLAGS, true) && positionals_are_relative(args),
+        "pwd" | "ver" | "hostname" | "whoami" => args.is_empty(),
+        "echo" => true,
+        "which" | "where" => where_args(args),
+        // Version probes only: `npm -v` is safe, `npm <anything-else>` is not.
+        "node" | "npm" | "python" | "python3" | "pip" | "pip3" | "cargo" | "rustc"
+        | "go" | "dotnet" | "java" | "javac" | "php" | "ruby" | "deno" | "bun"
+        | "pnpm" | "yarn" | "cmake" | "tsc" | "sqlite3" => {
+            matches!(args, [arg] if matches!(arg.as_str(), "-v" | "-V" | "--version" | "version"))
+        }
         _ => false,
     };
     if safe {
@@ -148,6 +164,24 @@ fn args_match(args: &[String], flags: &[FlagSpec], allow_positional: bool) -> bo
     while index < args.len() {
         let arg = &args[index];
         if arg.starts_with('-') {
+            // Bundled short flags like `-rn` are accepted when every letter
+            // is a listed non-valued flag (`grep -rn`, `ls -la`).
+            if !arg.starts_with("--") && arg.len() > 2 {
+                let bundled = arg[1..]
+                    .chars()
+                    .all(|letter| {
+                        flags.iter().any(|spec| {
+                            !spec.takes_value
+                                && spec.name.len() == 2
+                                && spec.name.starts_with('-')
+                                && spec.name.ends_with(letter)
+                        })
+                    });
+                if bundled {
+                    index += 1;
+                    continue;
+                }
+            }
             let Some(spec) = flags.iter().find(|spec| spec.name == arg) else {
                 return false;
             };
@@ -238,6 +272,26 @@ const GIT_BRANCH: &[FlagSpec] = &[
     flag("--verbose"),
     flag("--no-color"),
 ];
+const GIT_TAG: &[FlagSpec] = &[
+    flag("-l"),
+    flag("--list"),
+    valued("-n"),
+    valued("--sort"),
+    valued("--points-at"),
+    flag("--"),
+];
+const GIT_STASH: &[FlagSpec] = &[flag("--stat"), flag("-p"), valued("-n"), flag("--")];
+const GIT_GREP: &[FlagSpec] = &[
+    flag("-n"),
+    flag("-i"),
+    flag("-l"),
+    flag("-c"),
+    flag("-w"),
+    flag("-E"),
+    flag("-F"),
+    flag("--name-only"),
+    flag("--"),
+];
 const RG_FLAGS: &[FlagSpec] = &[
     flag("-n"),
     flag("--line-number"),
@@ -293,6 +347,18 @@ fn git_args(args: &[String]) -> bool {
         // A positional argument would create/rename/delete a branch.
         "branch" => args_match(rest, GIT_BRANCH, false),
         "config" => git_config(rest),
+        // `git tag` only in its list forms: bare, or -l/-n filters — a bare
+        // positional would create a tag.
+        "tag" => rest.is_empty() || (rest.iter().any(|arg| matches!(arg.as_str(), "-l" | "--list" | "-n"))
+            && args_match(rest, GIT_TAG, true)),
+        // `git remote` only in read forms.
+        "remote" => rest.is_empty()
+            || (rest.len() == 1 && rest[0] == "-v")
+            || (rest.len() == 2 && rest[0] == "get-url"),
+        // `git stash` only the read subcommands.
+        "stash" => matches!(rest.first().map(String::as_str), Some("list") | Some("show"))
+            && args_match(&rest[1..], GIT_STASH, true),
+        "grep" => args_match(rest, GIT_GREP, true),
         _ => false,
     }
 }
@@ -321,10 +387,105 @@ fn git_config(args: &[String]) -> bool {
     read
 }
 
-/// `where` takes names/patterns only; `/R` and `-` style switches need approval.
+/// File-reading tools must stay inside the workspace: positional arguments
+/// are file paths, and an absolute/`..`/drive-qualified path would let a
+/// read-only command exfiltrate data `read_file` is scoped away from
+/// (`C:\Windows\…`, `/etc/passwd`). Relative names only.
+fn positionals_are_relative(args: &[String]) -> bool {
+    args.iter().all(|arg| {
+        arg.starts_with('-')
+            || (!arg.contains(':')
+                && !arg.starts_with('/')
+                && !arg.starts_with('\\')
+                && !arg.split(['/', '\\']).any(|part| part == ".."))
+    })
+}
+
+/// `where`/`which` take names/patterns only; `/R` and `-` style switches need
+/// approval.
 fn where_args(args: &[String]) -> bool {
     !args.is_empty() && args.iter().all(|arg| !arg.starts_with('-') && !arg.starts_with('/'))
 }
+
+const FD_FLAGS: &[FlagSpec] = &[
+    flag("-H"),
+    flag("--hidden"),
+    flag("-I"),
+    flag("--no-ignore"),
+    flag("-s"),
+    flag("--case-sensitive"),
+    flag("-i"),
+    flag("--ignore-case"),
+    flag("-g"),
+    flag("--glob"),
+    flag("-l"),
+    flag("--list-details"),
+    flag("-a"),
+    flag("--absolute-path"),
+    flag("--full-path"),
+    valued("-t"),
+    valued("--type"),
+    valued("-e"),
+    valued("--extension"),
+    valued("-d"),
+    valued("--max-depth"),
+    valued("-j"),
+    valued("--threads"),
+];
+const GREP_FLAGS: &[FlagSpec] = &[
+    flag("-n"),
+    flag("-i"),
+    flag("-r"),
+    flag("-R"),
+    flag("-l"),
+    flag("-c"),
+    flag("-w"),
+    flag("-v"),
+    flag("-E"),
+    flag("-F"),
+    flag("--color"),
+    valued("-A"),
+    valued("-B"),
+    valued("-C"),
+    valued("-m"),
+    valued("--include"),
+    valued("--exclude"),
+];
+const CAT_FLAGS: &[FlagSpec] = &[flag("-n"), flag("-b"), flag("-A"), flag("-E"), flag("-T"), flag("-s")];
+const HEAD_TAIL_FLAGS: &[FlagSpec] = &[
+    valued("-n"),
+    valued("-c"),
+    flag("-q"),
+    flag("-v"),
+    flag("-f"),
+    flag("--follow"),
+];
+const WC_FLAGS: &[FlagSpec] = &[flag("-l"), flag("-w"), flag("-c"), flag("-m"), flag("-L")];
+const LS_FLAGS: &[FlagSpec] = &[
+    flag("-l"),
+    flag("-a"),
+    flag("-R"),
+    flag("-h"),
+    flag("-t"),
+    flag("-S"),
+    flag("-r"),
+    flag("-1"),
+    flag("-d"),
+    flag("-F"),
+    flag("--color"),
+];
+const TREE_FLAGS: &[FlagSpec] = &[
+    flag("/F"),
+    flag("/A"),
+    flag("-a"),
+    flag("-d"),
+    flag("-f"),
+    flag("-i"),
+    flag("--dirsfirst"),
+    valued("-L"),
+    valued("-I"),
+    valued("-P"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -429,11 +590,55 @@ mod tests {
             "npm install",
             "python -c \"print(1)\"",
             "find . -exec rm {} ;",
-            "ls",
             "dir",
-            "echo hi",
             "cmd /C git status",
             "powershell -enc AAAA",
+        ] {
+            assert!(!safe(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn file_reading_tools_only_accept_relative_workspace_paths() {
+        for command in [
+            "cat src/main.rs",
+            "head -n 20 Cargo.toml",
+            "tail -f logs/app.log",
+            "wc -l src/lib.rs",
+            "ls src",
+            "tree src",
+            "fd -e rs",
+            "grep -rn TODO src",
+            "echo hello world",
+            "pwd",
+            "whoami",
+            "node --version",
+            "python -V",
+            "git tag -l",
+            "git tag -n 5",
+            "git remote -v",
+            "git stash list",
+            "git grep -n TODO",
+        ] {
+            assert!(safe(command), "{command}");
+        }
+        for command in [
+            "cat C:/Windows/system.ini",
+            "cat /etc/passwd",
+            "cat ../outside.txt",
+            "head ..\\\\secret.txt",
+            "more C:\\\\autoexec.bat",
+            "fd -x rm",
+            "grep -r x /etc",
+            "ls /",
+            "tree C:\\\\",
+            "echo $PATH",
+            "pwd x",
+            "node -e print(1)",
+            "npm config list",
+            "git tag v1.0",
+            "git remote add x y",
+            "git stash drop",
         ] {
             assert!(!safe(command), "{command}");
         }

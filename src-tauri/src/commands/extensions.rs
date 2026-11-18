@@ -37,7 +37,9 @@ pub async fn scan_skills(
     workspace: State<'_, WorkspaceService>,
 ) -> AppResult<Vec<SkillView>> {
     require_main(&window)?;
-    let root = workspace.current_root();
+    let root = kernel
+        .trusted_project_root(workspace.current_root().as_deref())
+        .await;
     let dir = kernel.extensions().maestro_dir().to_path_buf();
     Ok(kernel.extensions().skills.scan(&dir, root.as_deref()))
 }
@@ -89,7 +91,9 @@ pub async fn scan_commands(
     workspace: State<'_, WorkspaceService>,
 ) -> AppResult<Vec<CommandView>> {
     require_main(&window)?;
-    let root = workspace.current_root();
+    let root = kernel
+        .trusted_project_root(workspace.current_root().as_deref())
+        .await;
     Ok(crate::adapters::commands::scan(
         kernel.extensions().maestro_dir(),
         root.as_deref(),
@@ -104,7 +108,9 @@ pub async fn read_command(
     name: String,
 ) -> AppResult<String> {
     require_main(&window)?;
-    let root = workspace.current_root();
+    let root = kernel
+        .trusted_project_root(workspace.current_root().as_deref())
+        .await;
     crate::adapters::commands::read(
         kernel.extensions().maestro_dir(),
         root.as_deref(),

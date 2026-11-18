@@ -39,6 +39,8 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
     case 'task_plan_updated':
     case 'sessions_changed':
     case 'workspace_changed':
+    case 'workspace_trust_required':
+    case 'workspace_trusted':
     case 'tool_call': return next;
     case 'subagent_started':
     case 'subagent_tool':

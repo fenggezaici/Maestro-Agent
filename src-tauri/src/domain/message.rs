@@ -17,6 +17,14 @@ pub struct ChatMessage {
     /// Data-URL images attached to a user message (frontend sends `data:*;base64,*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
+    /// Provider reasoning/thinking blocks to replay verbatim (Anthropic
+    /// `thinking`/`redacted_thinking` content blocks). Opaque JSON array —
+    /// OpenAI wire format ignores it entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+    /// True when a tool message carries a failure result (Anthropic `is_error`).
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -36,6 +44,8 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             images: None,
+            thinking: None,
+            is_error: false,
         }
     }
 }
@@ -65,8 +75,19 @@ pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
             .map(|message| message.content.len())
             .sum::<usize>()
             > 262144
+        // images 此前完全不校验：单条 ≤8 张、总量 ≤24MB（provider 侧另有
+        // 单张 3.5MB 上限；这里先挡住明显失控的 payload 才进网络层）。
+        || messages.iter().any(|message| {
+            message.images.as_ref().is_some_and(|images| images.len() > 8)
+        })
+        || messages
+            .iter()
+            .flat_map(|message| message.images.iter().flatten())
+            .map(|url| url.len())
+            .sum::<usize>()
+            > 25_165_824
     {
-        return Err("聊天消息为空、过大，或包含不支持的 role（仅 user/assistant）".into());
+        return Err("聊天消息为空、过大、包含不支持的 role（仅 user/assistant），或图片超限".into());
     }
     let last = messages.last().ok_or("缺少用户消息")?;
     if last.role != "user" || last.content.trim().is_empty() || last.content.trim().len() > 8192 {

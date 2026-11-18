@@ -1,4 +1,4 @@
-import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, ShieldCheck, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, Search, ShieldCheck, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
 import { memo, useState } from 'react';
 import type { ApprovalDecision, CommandScope, SubagentView, ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
@@ -28,6 +28,10 @@ const TOOL_META: Record<string, { icon: LucideIcon; verb: string }> = {
   read_file: { icon: FileText, verb: '读取' },
   list_dir: { icon: Folder, verb: '查阅' },
   run_command: { icon: SquareTerminal, verb: '执行' },
+  glob_files: { icon: Search, verb: '查找文件' },
+  grep_files: { icon: Search, verb: '搜索内容' },
+  task_output: { icon: SquareTerminal, verb: '任务输出' },
+  task_stop: { icon: SquareTerminal, verb: '终止任务' },
   load_skill: { icon: Puzzle, verb: '加载技能' },
   update_plan: { icon: ListTodo, verb: '更新计划' },
   spawn_subagent: { icon: Bot, verb: '子智能体' },

@@ -100,6 +100,10 @@ pub(crate) struct OpenAiParser {
     saw_finish: bool,
     inside_think: bool,
     think_buf: String,
+    /// Visible正文累计 —— 回放给下一轮 `messages`（reasoning 不回放，
+    /// DeepSeek/OpenAI 要求历史只带 content）。
+    content: String,
+    finish_reason: Option<String>,
 }
 
 impl OpenAiParser {
@@ -113,7 +117,7 @@ impl OpenAiParser {
             match self.think_buf.find(tag) {
                 Some(pos) => {
                     let (head, rest) = self.think_buf.split_at(pos);
-                    push_piece(head, self.inside_think, events);
+                    push_piece(head, self.inside_think, &mut self.content, events);
                     self.think_buf = rest[tag.len()..].to_string();
                     self.inside_think = !self.inside_think;
                 }
@@ -125,7 +129,7 @@ impl OpenAiParser {
                         .unwrap_or(0);
                     let cut = self.think_buf.len() - keep;
                     let head: String = self.think_buf.drain(..cut).collect();
-                    push_piece(&head, self.inside_think, events);
+                    push_piece(&head, self.inside_think, &mut self.content, events);
                     break;
                 }
             }
@@ -133,15 +137,16 @@ impl OpenAiParser {
     }
 }
 
-fn push_piece(piece: &str, inside: bool, events: &mut Vec<StreamEvent>) {
+fn push_piece(piece: &str, inside: bool, content: &mut String, events: &mut Vec<StreamEvent>) {
     if piece.is_empty() {
         return;
     }
-    events.push(if inside {
-        StreamEvent::Reasoning(piece.into())
+    if inside {
+        events.push(StreamEvent::Reasoning(piece.into()));
     } else {
-        StreamEvent::Token(piece.into())
-    });
+        content.push_str(piece);
+        events.push(StreamEvent::Token(piece.into()));
+    }
 }
 
 impl FrameParser for OpenAiParser {
@@ -173,11 +178,12 @@ impl FrameParser for OpenAiParser {
             });
         }
         if let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) {
-            if choice
+            if let Some(reason) = choice
                 .get("finish_reason")
-                .is_some_and(|reason| !reason.is_null())
+                .and_then(|reason| reason.as_str())
             {
                 self.saw_finish = true;
+                self.finish_reason = Some(reason.to_string());
             }
             if let Some(content) = choice
                 .pointer("/delta/content")
@@ -233,7 +239,8 @@ impl FrameParser for OpenAiParser {
         // reasoning (some local models never emit the closing tag).
         let mut events = Vec::new();
         let tail = std::mem::take(&mut self.think_buf);
-        push_piece(&tail, self.inside_think, &mut events);
+        let inside = self.inside_think;
+        push_piece(&tail, inside, &mut self.content, &mut events);
         if !self.saw_finish {
             return Err("模型流提前结束，未收到结束标记".into());
         }
@@ -246,6 +253,14 @@ impl FrameParser for OpenAiParser {
             .into_values()
             .filter(|call| !call.name.is_empty())
             .collect()
+    }
+
+    fn take_content(&mut self) -> String {
+        std::mem::take(&mut self.content)
+    }
+
+    fn finish_reason(&self) -> Option<String> {
+        self.finish_reason.clone()
     }
 
     fn reset(&mut self) {

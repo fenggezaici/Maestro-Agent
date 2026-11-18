@@ -205,6 +205,109 @@ enum End {
     Cancelled,
 }
 
+/// A detached command: pipes drain into the shared bounded buffer, the
+/// waiter task applies the same timeout/cancel/tree-kill semantics as the
+/// foreground path, and `status` transitions to a terminal label exactly
+/// once (`exited:<code>` / `timeout` / `cancelled` / `failed`).
+pub struct BackgroundHandle {
+    pub output: std::sync::Arc<std::sync::Mutex<String>>,
+    pub status: std::sync::Arc<std::sync::Mutex<String>>,
+    pub cancel: watch::Sender<bool>,
+}
+
+/// Spawn `command` without awaiting it (ZCode `run_in_background`): returns a
+/// handle for `task_output`/`task_stop`. The process tree is still bound to a
+/// job object and killed on timeout/cancel — nothing escapes the sandbox.
+pub fn spawn_background(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+) -> AppResult<BackgroundHandle> {
+    let command = command.trim();
+    if command.is_empty() || command.len() > MAX_COMMAND_CHARS {
+        return Err("命令为空或超过 4096 字符限制".into());
+    }
+    let cwd = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+    let mut process = if cfg!(windows) {
+        let mut process = Command::new("cmd");
+        process.args(["/C", command]);
+        process
+    } else {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+    let mut child = process
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "无法启动 shell 进程".to_string())?;
+    let stdout_pipe = child.stdout.take().ok_or("无法获取 stdout")?;
+    let stderr_pipe = child.stderr.take().ok_or("无法获取 stderr")?;
+    let mut tree = ProcessTree::attach(&child);
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let status = std::sync::Arc::new(std::sync::Mutex::new("running".to_string()));
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let sink = output.clone();
+    tokio::spawn(drain_labelled(stdout_pipe, "stdout", sink));
+    let sink = output.clone();
+    tokio::spawn(drain_labelled(stderr_pipe, "stderr", sink));
+    let status_slot = status.clone();
+    tokio::spawn(async move {
+        let end = tokio::select! {
+            result = child.wait() => End::Exited(result),
+            () = tokio::time::sleep(timeout) => End::TimedOut,
+            () = wait_for_cancel(Some(&mut cancel_rx)) => End::Cancelled,
+        };
+        let label = match end {
+            End::Exited(Ok(status)) => {
+                format!("exited:{}", status.code().unwrap_or(-1))
+            }
+            End::Exited(Err(_)) => "failed".to_string(),
+            End::TimedOut => "timeout".to_string(),
+            End::Cancelled => "cancelled".to_string(),
+        };
+        if !matches!(end, End::Exited(_)) {
+            tree.terminate(&mut child);
+            let _ = child.wait().await;
+        }
+        *status_slot.lock().unwrap() = label;
+    });
+    Ok(BackgroundHandle { output, status, cancel: cancel_tx })
+}
+
+/// Drain one stream into the shared buffer with a header once it produces
+/// content; retention stays bounded so a chatty server cannot grow memory.
+async fn drain_labelled<R>(mut pipe: R, label: &str, out: std::sync::Arc<std::sync::Mutex<String>>)
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut header_written = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let chunk = String::from_utf8_lossy(&buf[..read]);
+                let mut guard = out.lock().unwrap();
+                let room = MAX_OUTPUT_CHARS.saturating_sub(guard.len());
+                if room == 0 {
+                    continue;
+                }
+                if !header_written {
+                    guard.push_str(&format!("--- {label} ---\n"));
+                    header_written = true;
+                }
+                let take = chunk.chars().take(room).collect::<String>();
+                guard.push_str(&take);
+            }
+        }
+    }
+}
+
 async fn wait_for_cancel(cancel: Option<&mut watch::Receiver<bool>>) {
     let Some(receiver) = cancel else {
         std::future::pending::<()>().await;

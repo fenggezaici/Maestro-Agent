@@ -212,6 +212,8 @@ pub fn run() {
             commands::models::model_catalog,
             commands::workspace::get_workspace_info,
             commands::workspace::select_workspace,
+            commands::kernel::workspace_trust_status,
+            commands::kernel::trust_workspace,
             commands::workspace::read_directory_tree,
             commands::workspace::read_workspace_text,
         ])

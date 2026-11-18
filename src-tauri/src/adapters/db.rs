@@ -457,6 +457,104 @@ impl Database {
         .await
     }
 
+    /// Whether the canonical workspace path was explicitly trusted for
+    /// loading project `.maestro/` assets.
+    pub async fn is_workspace_trusted(&self, path: String) -> AppResult<bool> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM trusted_workspaces WHERE path = ?1",
+                    [&path],
+                    |_| Ok(()),
+                )
+                .map(|_| true)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(db_error(other)),
+                })
+        })
+        .await
+    }
+
+    pub async fn trust_workspace(&self, path: String) -> AppResult<()> {
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO trusted_workspaces (path) VALUES (?1)",
+                    [&path],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Persisted "always allow" rules for one project — seeded into a
+    /// session's rule set on first use.
+    pub async fn approval_rules_for_project(&self, project_id: i64) -> AppResult<Vec<crate::domain::ApprovalRule>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT tool, pattern, prefix FROM approval_rules WHERE project_id = ?1 ORDER BY created_at")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([project_id], |row| {
+                    Ok(crate::domain::ApprovalRule {
+                        tool: row.get(0)?,
+                        pattern: row.get(1)?,
+                        prefix: row.get::<_, i64>(2)? != 0,
+                    })
+                })
+                .map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
+    }
+
+    pub async fn save_approval_rule(&self, project_id: i64, rule: &crate::domain::ApprovalRule) -> AppResult<()> {
+        let rule = rule.clone();
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO approval_rules (project_id, tool, pattern, prefix) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![project_id, rule.tool, rule.pattern, rule.prefix as i64],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_approval_rule(&self, project_id: i64, rule: &crate::domain::ApprovalRule) -> AppResult<()> {
+        let rule = rule.clone();
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM approval_rules WHERE project_id = ?1 AND tool = ?2 AND pattern = ?3 AND prefix = ?4",
+                    rusqlite::params![project_id, rule.tool, rule.pattern, rule.prefix as i64],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn project_id_for_session(&self, session_id: i64) -> AppResult<Option<i64>> {
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    "SELECT project_id FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(db_error(other)),
+                })
+        })
+        .await
+    }
+
     pub async fn record_mode(&self, mode: Mode) -> AppResult<()> {
         self.call(move |connection| {
             connection
@@ -587,7 +685,7 @@ impl Database {
             };
             let run_messages = {
                 let mut statement = connection
-                    .prepare("SELECT run_id, session_id, seq, role, content, tool_calls, tool_call_id, name FROM run_messages WHERE session_id=?1 ORDER BY run_id, seq")
+                    .prepare("SELECT run_id, session_id, seq, role, content, tool_calls, tool_call_id, name, thinking, is_error FROM run_messages WHERE session_id=?1 ORDER BY run_id, seq")
                     .map_err(db_error)?;
                 let rows = statement.query_map([session_id], run_message_row).map_err(db_error)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
@@ -727,14 +825,22 @@ impl Database {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|error| error.to_string())?;
+                let thinking = message
+                    .thinking
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
                 transaction
                     .execute(
-                        "INSERT INTO run_messages (run_id, session_id, seq, role, content, tool_calls, tool_call_id, name)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                        "INSERT INTO run_messages (run_id, session_id, seq, role, content, tool_calls, tool_call_id, name, thinking, is_error)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                          ON CONFLICT(run_id, seq) DO UPDATE SET role=excluded.role, content=excluded.content,
-                         tool_calls=excluded.tool_calls, tool_call_id=excluded.tool_call_id, name=excluded.name",
+                         tool_calls=excluded.tool_calls, tool_call_id=excluded.tool_call_id, name=excluded.name,
+                         thinking=excluded.thinking, is_error=excluded.is_error",
                         params![message.run_id, message.session_id, message.seq, message.role,
-                            message.content, tool_calls, message.tool_call_id, message.name],
+                            message.content, tool_calls, message.tool_call_id, message.name,
+                            thinking, message.is_error as i64],
                     )
                     .map_err(db_error)?;
             }
@@ -1147,6 +1253,7 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
 
 fn run_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunMessage> {
     let tool_calls: Option<String> = row.get(5)?;
+    let thinking: Option<String> = row.get(8)?;
     Ok(RunMessage {
         run_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -1156,6 +1263,8 @@ fn run_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunMessage> {
         tool_calls: tool_calls.and_then(|value| serde_json::from_str(&value).ok()),
         tool_call_id: row.get(6)?,
         name: row.get(7)?,
+        thinking: thinking.and_then(|value| serde_json::from_str(&value).ok()),
+        is_error: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -1288,9 +1397,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 15 {
+    if version > 18 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 15"
+            "Database schema {version} is newer than supported version 18"
         ));
     }
     connection
@@ -1563,6 +1672,49 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 16 {
+        // v16: run_messages carries provider thinking blocks (Anthropic) and the
+        // tool-result error flag so replay can reconstruct the exact wire shape.
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_messages ADD COLUMN thinking TEXT;
+                 ALTER TABLE run_messages ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 16;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 17 {
+        // v17: workspace trust — project `.maestro/` assets (agents/skills/
+        // commands) only load after the user trusts the directory, mirroring
+        // ZCode's workspace-hook trust gate.
+        transaction
+            .execute_batch(
+                "CREATE TABLE trusted_workspaces (
+                    path TEXT PRIMARY KEY,
+                    trusted_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 PRAGMA user_version = 17;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 18 {
+        // v18: "always allow" decisions persist per project and apply to every
+        // session of it. Stored in the DB rather than `.maestro/` on disk — a
+        // cloned repo must never be able to ship its own pre-approvals.
+        transaction
+            .execute_batch(
+                "CREATE TABLE approval_rules (
+                    project_id INTEGER NOT NULL,
+                    tool TEXT NOT NULL,
+                    pattern TEXT NOT NULL,
+                    prefix INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    PRIMARY KEY (project_id, tool, pattern, prefix)
+                 );
+                 PRAGMA user_version = 18;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -1779,6 +1931,10 @@ mod tests {
                          ALTER TABLE run_metrics DROP COLUMN decode_ms;
                          ALTER TABLE run_metrics DROP COLUMN decode_tokens;
                          ALTER TABLE run_metrics DROP COLUMN tool_ms;
+                         ALTER TABLE run_messages DROP COLUMN thinking;
+                         ALTER TABLE run_messages DROP COLUMN is_error;
+                         DROP TABLE trusted_workspaces;
+                         DROP TABLE approval_rules;
                          PRAGMA user_version = 13;",
                     )
                     .map_err(db_error)
@@ -1808,7 +1964,7 @@ mod tests {
         for column in ["reasoning_tokens", "first_token_ms", "elapsed_ms", "last_input_tokens"] {
             assert!(columns.iter().any(|name| name == column), "missing {column}");
         }
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
         reopened.shutdown().await.unwrap();
     }
 
@@ -1834,6 +1990,10 @@ mod tests {
                          ALTER TABLE run_metrics DROP COLUMN decode_ms;
                          ALTER TABLE run_metrics DROP COLUMN decode_tokens;
                          ALTER TABLE run_metrics DROP COLUMN tool_ms;
+                         ALTER TABLE run_messages DROP COLUMN thinking;
+                         ALTER TABLE run_messages DROP COLUMN is_error;
+                         DROP TABLE trusted_workspaces;
+                         DROP TABLE approval_rules;
                          PRAGMA user_version = 12;",
                     )
                     .map_err(db_error)
@@ -1860,7 +2020,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(has_parts, 1, "run_parts must be created when upgrading from v12");
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
         reopened.shutdown().await.unwrap();
     }
 
@@ -1872,7 +2032,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 16)
+                    .pragma_update(None, "user_version", 19)
                     .map_err(db_error)
             })
             .await

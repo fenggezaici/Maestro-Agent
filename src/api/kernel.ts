@@ -31,6 +31,10 @@ export const kernelApi = {
   answerQuestion: (runId: number, requestId: string, answers: QuestionAnswer[]) =>
     invoke<void>('answer_user_question', { runId, requestId, answers }),
   compactSession: (sessionId: number) => invoke<void>('compact_session', { sessionId }),
+  /// Untrusted `.maestro/` assets in the live workspace, if any — polled on
+  /// mount because the `workspace_trust_required` event does not replay.
+  workspaceTrustStatus: () => invoke<import('./types').WorkspaceTrustStatus | null>('workspace_trust_status'),
+  trustWorkspace: (path: string) => invoke<void>('trust_workspace', { path }),
   listen: async (receive: (event: KernelEvent) => void) => {
     // Single channel: the backend emits normalized typed events (content,
     // reasoning, tool_call, status…) — no client-side reassembly.

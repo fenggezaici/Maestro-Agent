@@ -36,6 +36,8 @@ export interface KernelStore {
   /// Bumped on every `workspace_changed` kernel event — workspace views
   /// subscribe and refresh their tree/preview without polling.
   workspaceTick: number;
+  /// Untrusted `.maestro/` assets awaiting a trust decision (null = none).
+  trustPrompt: { path: string; assets: string[] } | null;
   /** Ordered reasoning bursts and tool rows for the live run. */
   liveTimeline: Record<number, TimelineItem[]>;
   /** Run whose stop was requested but not yet acknowledged by the backend. */
@@ -81,6 +83,13 @@ export interface KernelStore {
   resolveApproval: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => Promise<void>;
   setMode: (mode: Mode) => Promise<void>;
   decidePlan: (card: PlanCard, decision: PlanDecision) => Promise<PlanCard | undefined>;
+  /** Grant `.maestro/` trust for the workspace path; the `workspace_trusted`
+   * event clears the prompt and rescans extension sources. */
+  trustWorkspace: (path: string) => Promise<void>;
+  /** Poll the live workspace for untrusted assets (mount/project change —
+   * the `workspace_trust_required` event does not replay). */
+  refreshTrustStatus: () => Promise<void>;
+  dismissTrustPrompt: () => void;
 }
 
 // Non-reactive bookkeeping shared across StrictMode remounts of the
@@ -198,6 +207,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     pendingQuestion: null,
     compactions: [],
     workspaceTick: 0,
+    trustPrompt: null,
     liveTimeline: {},
     stoppingRunId: null,
     queuedStart: null,
@@ -301,6 +311,14 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
       if (event.type === 'workspace_changed') {
         set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
+      }
+      if (event.type === 'workspace_trust_required') {
+        set({ trustPrompt: { path: event.path, assets: event.assets } });
+      }
+      if (event.type === 'workspace_trusted') {
+        // Trusted: clear the prompt and bump the tick so skills/commands and
+        // workspace views rescan with project `.maestro/` assets included.
+        set((s) => ({ trustPrompt: null, workspaceTick: s.workspaceTick + 1 }));
       }
       if (event.type === 'task_plan_updated') {
         set((s) => ({
@@ -586,6 +604,13 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       await refreshDetail(card.sessionId);
       return plan;
     }),
+    trustWorkspace: (path) => kernelApi.trustWorkspace(path),
+    refreshTrustStatus: async () => {
+      const status = await kernelApi.workspaceTrustStatus();
+      if (!mounted) return;
+      set({ trustPrompt: status });
+    },
+    dismissTrustPrompt: () => set({ trustPrompt: null }),
   };
 });
 

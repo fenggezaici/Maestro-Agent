@@ -24,9 +24,10 @@ pub enum ToolGate {
 pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     Ok(match tool {
         "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file"
+        | "glob_files" | "grep_files" | "task_output"
         | "update_plan" | "spawn_subagent" | "ask_user" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
-        "run_command" => ToolEffect::ProcessExecution,
+        "run_command" | "task_stop" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
         _ => return Err(format!("Unknown or unregistered tool: {tool}")),
     })

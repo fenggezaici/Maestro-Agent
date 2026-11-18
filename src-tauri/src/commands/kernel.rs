@@ -74,6 +74,32 @@ pub async fn stream_chat(
     kernel.inner().start_chat(session_id, messages, config).await
 }
 
+/// Whether the live workspace carries untrusted `.maestro/` assets — the
+/// trust prompt reloads this on mount since the event does not replay.
+#[tauri::command]
+pub async fn workspace_trust_status(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
+) -> AppResult<Option<crate::domain::WorkspaceTrustStatus>> {
+    require_main(&window)?;
+    Ok(kernel
+        .workspace_trust_status(workspace.current_root().as_deref())
+        .await)
+}
+
+/// Grant trust for the workspace path: project `.maestro/` assets start
+/// loading on the next scan. Recorded per canonical path.
+#[tauri::command]
+pub async fn trust_workspace(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    path: String,
+) -> AppResult<()> {
+    require_main(&window)?;
+    kernel.trust_workspace(path).await
+}
+
 #[tauri::command]
 pub async fn cancel_agent(
     window: WebviewWindow,

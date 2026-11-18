@@ -8,6 +8,75 @@ use crate::domain::AppResult;
 const MAX_DIR_ENTRIES: usize = 200;
 const MAX_FILE_BYTES: u64 = 262144;
 const MAX_TEXT_CHARS: usize = 65536;
+/// `read_file` line window: `cat -n`-style output never exceeds this many
+/// lines or MAX_TEXT_CHARS, whichever comes first.
+const MAX_READ_LINES: usize = 2000;
+const MAX_SEARCH_RESULTS: usize = 100;
+const MAX_SEARCH_VISITED: usize = 8000;
+/// Heavy/derived trees a code search never wants — mirrors the ZCode/rg
+/// default junk list (`.gitignore` semantics are intentionally not emulated).
+const IGNORED_DIRS: &[&str] = &[
+    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out",
+    ".next", ".nuxt", "__pycache__", ".venv", "venv", "vendor", ".idea", ".vscode",
+];
+
+/// 敏感文件保护（对齐 Claude Code/ZCode 的默认敏感路径规则）：私钥、凭据
+/// 与 dotenv 内容一旦被模型读到就会随 prompt 上行到远端 provider；被写入
+/// 则会覆盖/破坏密钥。命中即硬拒绝，不走审批——审批语义无法表达"这条路径
+/// 的数据不该离开本机"。示例/模板文件除外（`.env.example` 等本就该入库）。
+pub fn is_sensitive_path(rel: &str) -> bool {
+    let rel_path = Path::new(rel);
+    let name = rel_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return false;
+    }
+    // .env 及全部变体（生产/本地环境文件），示例与模板例外。
+    if name == ".env"
+        || (name.starts_with(".env.")
+            && !matches!(
+                name.as_str(),
+                ".env.example" | ".env.sample" | ".env.template" | ".env.defaults" | ".env.schema"
+            ))
+    {
+        return true;
+    }
+    // 私钥与密钥库。
+    if matches!(name.as_str(), "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.ends_with(".keystore")
+        || name.ends_with(".jks")
+    {
+        return true;
+    }
+    // 凭据文件（含 token 的包管理/容器/云配置）。
+    if matches!(
+        name.as_str(),
+        "credentials" | ".netrc" | ".npmrc" | ".pypirc" | ".dockercfg" | ".htpasswd"
+    ) {
+        return true;
+    }
+    // 整目录敏感：.ssh/.gnupg/.aws/.docker/.kube 下任何文件都按凭据处理。
+    rel_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(part)
+                if matches!(
+                    part.to_string_lossy().to_ascii_lowercase().as_str(),
+                    ".ssh" | ".gnupg" | ".aws" | ".docker" | ".kube"
+                )
+        )
+    })
+}
+
+fn sensitive_denied() -> String {
+    "路径命中敏感文件保护（凭据/私钥/dotenv），禁止读写".into()
+}
 
 /// Resolve a workspace-relative path under `root`.
 pub fn scoped_path(root: &Path, rel: &str) -> AppResult<PathBuf> {
@@ -50,8 +119,197 @@ pub fn list_dir(root: &Path, rel: &str) -> AppResult<String> {
     Ok(serde_json::to_string_pretty(&entries).unwrap_or_default())
 }
 
+/// Depth-first file walk bounded by `MAX_SEARCH_VISITED`; results are
+/// workspace-relative `/`-joined paths. Symlinks are never traversed —
+/// `DirEntry::file_type` reports the link itself, and collected files are
+/// re-canonicalized under `base` before being returned.
+fn walk_files(base: &Path, out: &mut Vec<String>) {
+    fn visit(dir: &Path, base: &Path, visited: &mut usize, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else { return };
+        for entry in read.flatten() {
+            if *visited >= MAX_SEARCH_VISITED {
+                return;
+            }
+            *visited += 1;
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    if !IGNORED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                        visit(&path, base, visited, out);
+                    }
+                }
+                Ok(kind) if kind.is_file() => {
+                    let Ok(canonical) = path.canonicalize() else { continue };
+                    if !canonical.starts_with(base) {
+                        continue;
+                    }
+                    if let Ok(rel) = canonical.strip_prefix(base) {
+                        out.push(rel.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut visited = 0;
+    visit(base, base, &mut visited, out);
+}
+
+/// Minimal glob: `*` matches within a path segment, `?` one char, `**` spans
+/// segments. A pattern without `/` matches the file name at any depth.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn seg_match(pat: &[char], text: &[char]) -> bool {
+        match (pat.first(), text.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                seg_match(&pat[1..], text) || (!text.is_empty() && seg_match(pat, &text[1..]))
+            }
+            (Some('?'), Some(_)) => seg_match(&pat[1..], &text[1..]),
+            (Some(a), Some(b)) => a == b && seg_match(&pat[1..], &text[1..]),
+            _ => false,
+        }
+    }
+    fn parts_match(pats: &[&str], segs: &[&str]) -> bool {
+        match (pats.first(), segs.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                (0..=segs.len()).any(|skip| parts_match(&pats[1..], &segs[skip..]))
+            }
+            (Some(p), Some(s)) => {
+                seg_match(&p.chars().collect::<Vec<_>>(), &s.chars().collect::<Vec<_>>())
+                    && parts_match(&pats[1..], &segs[1..])
+            }
+            _ => false,
+        }
+    }
+    if pattern.is_empty() {
+        return false;
+    }
+    let pats: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    if pats.len() == 1 {
+        // Basename glob — `*.rs` means "any .rs file, any depth".
+        return segs.last().is_some_and(|name| {
+            seg_match(&pattern.chars().collect::<Vec<_>>(), &name.chars().collect::<Vec<_>>())
+        });
+    }
+    parts_match(&pats, &segs)
+}
+
+/// `glob_files` tool body: workspace-relative paths matching the pattern.
+pub fn glob_files(root: &Path, pattern: &str) -> AppResult<String> {
+    let base = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+    let mut files = Vec::new();
+    walk_files(&base, &mut files);
+    let mut hits: Vec<String> = files
+        .into_iter()
+        .filter(|rel| glob_match(&pattern.replace('\\', "/"), rel))
+        .collect();
+    hits.sort();
+    let truncated = hits.len() > MAX_SEARCH_RESULTS;
+    hits.truncate(MAX_SEARCH_RESULTS);
+    let mut body = hits.join("\n");
+    if body.is_empty() {
+        body = "（无匹配文件）".into();
+    } else if truncated {
+        body.push_str(&format!("\n…已截断，仅显示前 {MAX_SEARCH_RESULTS} 个结果"));
+    }
+    Ok(body)
+}
+
+/// `grep_files` tool body: literal substring line search across text files.
+/// `glob` narrows the file set (`src/**/*.rs`); `ignore_case` folds case.
+/// Results are `path:行号: 行内容`, bounded at MAX_SEARCH_RESULTS.
+pub fn grep_files(
+    root: &Path,
+    query: &str,
+    glob: Option<&str>,
+    ignore_case: bool,
+) -> AppResult<String> {
+    if query.is_empty() {
+        return Err("grep_files 需要非空 query".into());
+    }
+    let base = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+    let needle = if ignore_case { query.to_lowercase() } else { query.to_string() };
+    let mut files = Vec::new();
+    walk_files(&base, &mut files);
+    let mut matches_out = Vec::new();
+    'files: for rel in files {
+        if let Some(pattern) = glob {
+            if !glob_match(&pattern.replace('\\', "/"), &rel) {
+                continue;
+            }
+        }
+        let path = base.join(&rel);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if bytes.iter().take(4096).any(|b| *b == 0) {
+            continue; // binary file
+        }
+        let Ok(text) = String::from_utf8(bytes) else { continue };
+        for (index, line) in text.lines().enumerate() {
+            let hay = if ignore_case { line.to_lowercase() } else { line.to_string() };
+            if hay.contains(&needle) {
+                let trimmed: String = line.trim().chars().take(200).collect();
+                matches_out.push(format!("{}:{}: {}", rel, index + 1, trimmed));
+                if matches_out.len() >= MAX_SEARCH_RESULTS {
+                    break 'files;
+                }
+            }
+        }
+    }
+    if matches_out.is_empty() {
+        return Ok("（无匹配行）".into());
+    }
+    let mut body = matches_out.join("\n");
+    if matches_out.len() >= MAX_SEARCH_RESULTS {
+        body.push_str(&format!("\n…已截断，仅显示前 {MAX_SEARCH_RESULTS} 条匹配"));
+    }
+    Ok(body)
+}
+
+/// `read_file` tool body with line numbers (`cat -n` style). `offset` is the
+/// 1-based first line (default 1), `limit` caps at MAX_READ_LINES (default
+/// full). Output stays under MAX_TEXT_CHARS with a truncation notice.
+pub fn read_file_lines(
+    root: &Path,
+    rel: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> AppResult<String> {
+    let text = read_file(root, rel)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1) as usize;
+    let take = limit.unwrap_or(MAX_READ_LINES as u64).min(MAX_READ_LINES as u64) as usize;
+    if start > total && total > 0 {
+        return Err(format!("offset {start} 超出文件范围（共 {total} 行）"));
+    }
+    let mut out = String::new();
+    let mut rendered = 0usize;
+    for (index, line) in lines.iter().enumerate().skip(start - 1).take(take) {
+        let row = format!("{:>6}\t{}\n", index + 1, line);
+        if out.len() + row.len() > MAX_TEXT_CHARS {
+            out.push_str(&format!("…输出达到字符上限（共 {total} 行，已显示 {rendered} 行）"));
+            return Ok(out);
+        }
+        out.push_str(&row);
+        rendered += 1;
+    }
+    if start - 1 + rendered < total {
+        out.push_str(&format!("…还有 {} 行未显示（offset 续读）", total - start + 1 - rendered));
+    }
+    Ok(out)
+}
+
 /// `read_file` tool body: bounded UTF-8 text.
 pub fn read_file(root: &Path, rel: &str) -> AppResult<String> {
+    if is_sensitive_path(rel) {
+        return Err(sensitive_denied());
+    }
     let file = scoped_path(root, rel)?;
     let meta = std::fs::metadata(&file).map_err(|_| "文件不可读".to_string())?;
     if meta.len() > MAX_FILE_BYTES {
@@ -118,6 +376,9 @@ pub struct WriteReport {
 
 /// Remove a workspace file; used only by the explicit undo command.
 pub fn remove_file(root: &Path, rel: &str) -> AppResult<()> {
+    if is_sensitive_path(rel) {
+        return Err(sensitive_denied());
+    }
     let file = scoped_write_path(root, rel)?;
     if file.is_file() { std::fs::remove_file(&file).map_err(|_| "文件删除失败".to_string())?; }
     Ok(())
@@ -125,6 +386,9 @@ pub fn remove_file(root: &Path, rel: &str) -> AppResult<()> {
 
 /// `write_file` tool body: create or overwrite a text file inside the workspace.
 pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<WriteReport> {
+    if is_sensitive_path(rel) {
+        return Err(sensitive_denied());
+    }
     if content.len() > MAX_FILE_BYTES as usize {
         return Err("内容超过 256KB 限制".into());
     }
@@ -147,10 +411,28 @@ pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<WriteRepor
 /// exactly once in the file; an empty `before` creates a new file with
 /// `after` as its content (the target must not exist yet).
 pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResult<WriteReport> {
-    if after.len() > MAX_FILE_BYTES as usize {
+    apply_patch_multi(root, rel, &[(before, after)])
+}
+
+/// Multi-hunk patch: each `(before, after)` is applied in order against the
+/// evolving text — every `before` must occur exactly once at its turn. All
+/// hunks validate before the single final write, so a bad hunk never leaves
+/// a half-patched file (ZCode-style atomic edits).
+pub fn apply_patch_multi(root: &Path, rel: &str, hunks: &[(&str, &str)]) -> AppResult<WriteReport> {
+    if is_sensitive_path(rel) {
+        return Err(sensitive_denied());
+    }
+    if hunks.is_empty() {
+        return Err("补丁为空".into());
+    }
+    if hunks.iter().any(|(_, after)| after.len() > MAX_FILE_BYTES as usize) {
         return Err("内容超过 256KB 限制".into());
     }
-    if before.is_empty() {
+    // Empty `before` means "create the file" — only allowed as the sole hunk.
+    if let Some((_, after)) = hunks.iter().find(|(before, _)| before.is_empty()) {
+        if hunks.len() > 1 {
+            return Err("新建文件（before 为空）只能作为唯一 hunk".into());
+        }
         let file = scoped_write_path(root, rel)?;
         if file.exists() {
             return Err("目标文件已存在，无法新建".into());
@@ -163,12 +445,18 @@ pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResu
             after: after.to_string(),
         });
     }
-    let current = read_file(root, rel)?;
-    let matches = current.matches(before).count();
-    if matches != 1 {
-        return Err(format!("补丁定位失败：before 出现 {matches} 次（需要恰好 1 次）"));
+    let original = read_file(root, rel)?;
+    let mut updated = original.clone();
+    for (index, (before, after)) in hunks.iter().enumerate() {
+        let matches = updated.matches(before).count();
+        if matches != 1 {
+            return Err(format!(
+                "补丁第 {} 个 hunk 定位失败：before 出现 {matches} 次（需要恰好 1 次）",
+                index + 1
+            ));
+        }
+        updated = updated.replacen(before, after, 1);
     }
-    let updated = current.replacen(before, after, 1);
     if updated.len() > MAX_FILE_BYTES as usize {
         return Err("修改后文件超过 256KB 限制".into());
     }
@@ -176,8 +464,14 @@ pub fn apply_patch(root: &Path, rel: &str, before: &str, after: &str) -> AppResu
     std::fs::write(&file, &updated).map_err(|_| "文件写入失败".to_string())?;
     Ok(WriteReport {
         path: rel.to_string(),
-        summary: format!("已修改 {}（{} → {} bytes）", rel, current.len(), updated.len()),
-        before: current,
+        summary: format!(
+            "已修改 {}（{} 个 hunk，{} → {} bytes）",
+            rel,
+            hunks.len(),
+            original.len(),
+            updated.len()
+        ),
+        before: original,
         after: updated,
     })
 }

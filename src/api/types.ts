@@ -148,6 +148,10 @@ export interface PersistedReasoning { text: string; startedAt: number; endedAt?:
 export interface PersistedPart { kind: 'reasoning' | 'tool' | 'content'; text?: string; index?: number; startedAt: number; endedAt?: number | null }
 export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[]; reasoning?: Record<number, PersistedReasoning[]>; parts?: Record<number, PersistedPart[]> }
 
+/// Trust prompt payload — workspace carries project `.maestro/` assets that
+/// stay inert until the user grants trust.
+export interface WorkspaceTrustStatus { path: string; assets: string[] }
+
 /// Single `kernel-event` channel contract. Streamed text arrives already
 /// classified as `content` (answer) or `reasoning` (thinking); tool execution
 /// is reported as structured `tool_call` lifecycle events.
@@ -163,6 +167,8 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'task_plan_updated'; runId: number; sessionId: number; steps: PlanStep[] }
   | { type: 'sessions_changed' }
   | { type: 'workspace_changed' }
+  | { type: 'workspace_trust_required'; path: string; assets: string[] }
+  | { type: 'workspace_trusted'; path: string }
   | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string; subagentId?: string }
   | { type: 'subagent_started'; runId: number; subagent: SubagentView }
   | { type: 'subagent_tool'; runId: number; subagentId: string; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }

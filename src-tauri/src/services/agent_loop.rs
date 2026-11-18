@@ -167,6 +167,8 @@ pub fn conversation(detail: &SessionDetail, run: &RunView, context_window: Optio
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
                     images: None,
+                    thinking: message.thinking.clone(),
+                    is_error: message.is_error,
                 });
             }
         }
@@ -746,7 +748,8 @@ async fn run_subagent(
     };
     let provider = kernel.llm_provider(&child_config);
     let allowed = definition.tools.clone();
-    let tools: Vec<_> = kernel.agent_tools(Mode::Plan).await.into_iter()
+    let run_root = kernel.run_workspace_root(run_id).await;
+    let tools: Vec<_> = kernel.agent_tools(Mode::Plan, run_root.as_deref()).await.into_iter()
         .filter(|tool| tool.name != "spawn_subagent" && (allowed.is_empty() || allowed.iter().any(|name| name == &tool.name)))
         .collect();
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
@@ -894,6 +897,8 @@ async fn run_subagent(
                 tool_call_id: None,
                 name: None,
                 images: None,
+                thinking: outcome.thinking.clone(),
+                is_error: false,
             });
             let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
             let mut runnable: Vec<(String, String)> = Vec::new();
@@ -915,16 +920,19 @@ async fn run_subagent(
                 }
             }
             for (call, result) in outcome.tool_calls.iter().zip(results) {
+                let (text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+                    Ok(value) => (value.chars().take(MAX_TOOL_RESULT_BYTES).collect(), false),
+                    Err(error) => (format!("子智能体工具失败：{error}"), true),
+                };
                 messages.push(ChatMessage {
                     role: "tool".into(),
-                    content: match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                        Ok(value) => value.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
-                        Err(error) => format!("子智能体工具失败：{error}"),
-                    },
+                    content: text,
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     tool_calls: None,
                     images: None,
+                    thinking: None,
+                    is_error,
                 });
             }
         }
@@ -977,14 +985,18 @@ pub(crate) async fn run(
         let mut messages = conversation_with_reports(&detail, &run, &reports, config.context_window);
         let mut saved_upto = messages.len();
         let mut next_seq = 0i64;
-        let tools = kernel.agent_tools(run.mode).await;
+        let run_root = kernel.run_workspace_root(run.id).await;
+        let tools = kernel.agent_tools(run.mode, run_root.as_deref()).await;
         let provider = kernel.llm_provider(&config);
         let max_rounds = max_tool_rounds();
+        let mut last_input_tokens: Option<u64> = None;
+        let mut compaction_failures = 0u32;
         for _round in 0..max_rounds {
             if kernel.is_cancelled(run.id).await {
                 return Ok(false);
             }
-            if needs_compaction(&messages, config.context_window) {
+            microcompact(&mut messages);
+            if needs_compaction(&messages, config.context_window, last_input_tokens, config.max_output) {
                 messages = compact_messages(
                     &kernel,
                     &provider,
@@ -993,6 +1005,7 @@ pub(crate) async fn run(
                     &run,
                     "auto",
                     &mut cancel,
+                    &mut compaction_failures,
                 )
                 .await?;
                 saved_upto = messages.len();
@@ -1024,6 +1037,7 @@ pub(crate) async fn run(
                         &run,
                         "auto",
                         &mut cancel,
+                        &mut compaction_failures,
                     )
                     .await?;
                     saved_upto = messages.len();
@@ -1034,16 +1048,28 @@ pub(crate) async fn run(
             if !outcome.done {
                 return Ok(false);
             }
+            if outcome.input_tokens.is_some() {
+                last_input_tokens = outcome.input_tokens;
+            }
             if outcome.tool_calls.is_empty() {
+                // 长度截断的回复与正常完成不可区分是误导性的——
+                // finish_reason 透出后向用户标记（DSH 同款语义）。
+                if let Some(reason) = outcome.finish_reason.as_deref() {
+                    if matches!(reason, "length" | "max_tokens" | "model_context_window_exceeded") {
+                        kernel.token(run.id, "\n\n[输出达到生成长度上限（max_tokens），回复已被截断]".into()).await;
+                    }
+                }
                 return Ok(true);
             }
             messages.push(ChatMessage {
                 role: "assistant".into(),
-                content: String::new(),
+                content: outcome.content.clone(),
                 tool_calls: Some(outcome.tool_calls.clone()),
                 tool_call_id: None,
                 name: None,
                 images: None,
+                thinking: outcome.thinking.clone(),
+                is_error: false,
             });
             // Authorization, audit and tool_call events all happen inside the
             // kernel; suspended calls share ONE approval for the whole turn.
@@ -1095,9 +1121,9 @@ pub(crate) async fn run(
                 }
             }
             for (call, result) in outcome.tool_calls.iter().zip(results) {
-                let text = match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                    Ok(text) => text,
-                    Err(error) => format!("工具调用失败：{error}"),
+                let (text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+                    Ok(text) => (text, false),
+                    Err(error) => (format!("工具调用失败：{error}"), true),
                 };
                 messages.push(ChatMessage {
                     role: "tool".into(),
@@ -1106,6 +1132,8 @@ pub(crate) async fn run(
                     name: Some(call.name.clone()),
                     tool_calls: None,
                     images: None,
+                    thinking: None,
+                    is_error,
                 });
             }
             let new_messages: Vec<RunMessage> = messages[saved_upto..]
@@ -1120,6 +1148,8 @@ pub(crate) async fn run(
                     tool_calls: message.tool_calls.as_ref().and_then(|calls| serde_json::to_value(calls).ok()),
                     tool_call_id: message.tool_call_id.clone(),
                     name: message.name.clone(),
+                    thinking: message.thinking.clone(),
+                    is_error: message.is_error,
                 })
                 .collect();
             if !new_messages.is_empty() {
@@ -1180,8 +1210,57 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
-fn needs_compaction(messages: &[ChatMessage], context_window: Option<u64>) -> bool {
-    context_window.is_some_and(|window| window > 0 && estimate_tokens(messages) as f64 >= window as f64 * 0.8)
+fn needs_compaction(
+    messages: &[ChatMessage],
+    context_window: Option<u64>,
+    last_input_tokens: Option<u64>,
+    max_output: Option<u64>,
+) -> bool {
+    let Some(window) = context_window.filter(|window| *window > 0) else {
+        return false;
+    };
+    // Provider usage is authoritative: it counts the system prompt, tool
+    // schemas and wire framing the char estimate cannot see. Reserve the
+    // output budget so the next turn is not pushed over the edge (ZCode
+    // provider_usage + output-reserve semantics).
+    if let Some(input) = last_input_tokens {
+        let reserve = max_output.unwrap_or(4096);
+        return input.saturating_add(reserve) as f64 >= window as f64 * 0.9;
+    }
+    estimate_tokens(messages) as f64 >= window as f64 * 0.8
+}
+
+/// Microcompact (ZCode): cheap pass that clips stale tool results before a
+/// paid model-summary compaction is even considered. Only results older than
+/// the recent tail are touched — fresh output stays verbatim for the model.
+const MICRO_KEEP_RECENT: usize = 6;
+const MICRO_LIMIT_CHARS: usize = 2000;
+
+fn microcompact(messages: &mut Vec<ChatMessage>) {
+    if messages.len() <= MICRO_KEEP_RECENT + 2 {
+        return;
+    }
+    let cutoff = messages.len() - MICRO_KEEP_RECENT;
+    for message in messages.iter_mut().take(cutoff) {
+        if message.role != "tool" {
+            continue;
+        }
+        let total = message.content.chars().count();
+        if total <= MICRO_LIMIT_CHARS {
+            continue;
+        }
+        let head: String = message.content.chars().take(1500).collect();
+        let tail: String = message
+            .content
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        message.content = format!("{head}\n\n…[工具输出已截断，原长 {total} 字符]…\n\n{tail}");
+    }
 }
 
 fn is_context_error(error: &str) -> bool {
@@ -1256,10 +1335,17 @@ async fn compact_messages(
     run: &RunView,
     trigger: &str,
     cancel: &mut watch::Receiver<bool>,
+    failures: &mut u32,
 ) -> AppResult<Vec<ChatMessage>> {
     let keep = 8.min(messages.len().saturating_sub(1));
-    let split = messages.len().saturating_sub(keep);
-    if split <= 1 {
+    let mut split = messages.len().saturating_sub(keep);
+    // 切点不能落在 tool 消息上：tool_result 与其 assistant tool_calls 必须
+    // 同侧，否则保留段以孤儿 tool 消息开头，两个 provider 都会 400。
+    // 前移会破坏配对，因此只能后移（把整段调用+结果一起交给摘要）。
+    while split < messages.len() && messages[split].role == "tool" {
+        split += 1;
+    }
+    if split <= 1 || split >= messages.len() {
         return Ok(messages.to_vec());
     }
     let pre = estimate_tokens(messages) as u64;
@@ -1282,9 +1368,23 @@ async fn compact_messages(
         created_at: crate::domain::unix_now(),
     };
     let _ = kernel.save_compaction(running.clone()).await;
-    let summary = summarize_with_model(provider, config, &transcript, cancel)
-        .await
-        .unwrap_or_else(|| heuristic_summary(older));
+    // 熔断（ZCode）：付费 summarize 连续失败 3 次后不再尝试，直接走启发式
+    // 摘要——否则每一轮都会为一个注定失败的请求付一次全量输入费用。
+    const COMPACTION_FAILURE_BREAKER: u32 = 3;
+    let summary = if *failures >= COMPACTION_FAILURE_BREAKER {
+        heuristic_summary(older)
+    } else {
+        match summarize_with_model(provider, config, &transcript, cancel).await {
+            Some(text) => {
+                *failures = 0;
+                text
+            }
+            None => {
+                *failures += 1;
+                heuristic_summary(older)
+            }
+        }
+    };
     let mut next = vec![
         messages[0].clone(),
         ChatMessage::text("system", format!("[上下文压缩摘要]\n{summary}")),
@@ -1318,6 +1418,45 @@ mod tests {
         assert!(other > 0);
         let est = cjk + other.div_ceil(4);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn provider_usage_gates_compaction_with_an_output_reserve() {
+        let messages = vec![ChatMessage::text("user", "hi")];
+        let window = Some(200_000);
+        // input + max_output(4k) < 90% window → no compaction.
+        assert!(!needs_compaction(&messages, window, Some(100_000), Some(4_096)));
+        // 180k input + 4k reserve ≥ 90% of 200k → compact.
+        assert!(needs_compaction(&messages, window, Some(180_000), Some(4_096)));
+        // Larger output reserves trigger earlier.
+        assert!(needs_compaction(&messages, window, Some(160_000), Some(32_000)));
+        // No provider sample → fall back to the char estimate.
+        assert!(!needs_compaction(&messages, window, None, Some(4_096)));
+        assert!(!needs_compaction(&messages, None, Some(190_000), Some(4_096)));
+    }
+
+    #[test]
+    fn microcompact_clips_only_stale_tool_results() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![ChatMessage::text("system", "sys")];
+        for index in 0..8 {
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: big.clone(),
+                tool_call_id: Some(format!("call-{index}")),
+                name: Some("read_file".into()),
+                tool_calls: None,
+                images: None,
+                thinking: None,
+                is_error: false,
+            });
+        }
+        microcompact(&mut messages);
+        // Older tool results (beyond the recent tail) are clipped…
+        assert!(messages[1].content.contains("工具输出已截断"), "{}", messages[1].content.len());
+        // …while the six most recent stay verbatim.
+        assert_eq!(messages[8].content.len(), 5000);
+        assert_eq!(messages[7].content.len(), 5000);
     }
 
     #[test]
@@ -1392,6 +1531,8 @@ mod tests {
             ])),
             tool_call_id: None,
             name: None,
+            thinking: None,
+            is_error: false,
         });
         detail.run_messages.push(RunMessage {
             run_id: 1,
@@ -1402,6 +1543,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call-1".into()),
             name: Some("read_file".into()),
+            thinking: None,
+            is_error: false,
         });
         let messages = conversation(&detail, &current, None);
         assert!(messages.iter().any(|message| message.role == "tool" && message.content == "file body"));

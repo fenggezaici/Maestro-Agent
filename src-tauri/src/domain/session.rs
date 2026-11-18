@@ -144,6 +144,13 @@ pub struct RunMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Provider thinking blocks replayed verbatim (Anthropic); NULL on disk
+    /// for OpenAI providers and for rows written before v16.
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
+    /// Tool message carried a failure result (Anthropic `is_error`).
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

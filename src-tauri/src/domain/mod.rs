@@ -20,7 +20,7 @@ pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
 pub use extension::{
     CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, RecommendedItem,
-    SkillImportOutcome, SkillSource, SkillView,
+    SkillImportOutcome, SkillSource, SkillView, WorkspaceTrustStatus,
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use activity::{ActivityDay, ActivitySnapshot};

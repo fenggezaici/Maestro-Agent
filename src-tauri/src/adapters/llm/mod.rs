@@ -175,9 +175,40 @@ pub enum StreamEvent {
 
 /// One model turn: either the stream completed (`done`, possibly with
 /// `tool_calls` to execute) or it was cancelled.
+#[derive(Default)]
 pub struct TurnOutcome {
     pub done: bool,
     pub tool_calls: Vec<ToolCallSpec>,
+    /// Streamed assistant text for this turn. Replayed into `messages` so the
+    /// model keeps its own narration between tool calls.
+    pub content: String,
+    /// Provider thinking blocks replayed verbatim (Anthropic `thinking` /
+    /// `redacted_thinking`); `None` for OpenAI-compatible providers.
+    pub thinking: Option<serde_json::Value>,
+    /// Provider stop/finish reason (`stop`, `length`, `end_turn`, `max_tokens`…).
+    pub finish_reason: Option<String>,
+    /// Last input-token usage the provider reported on this turn. Feeds the
+    /// compaction trigger (provider usage is authoritative over char
+    /// estimates: it counts system prompt, tool schemas and framing).
+    pub input_tokens: Option<u64>,
+}
+
+impl TurnOutcome {
+    /// Cancelled/aborted turn: nothing the provider produced gets replayed.
+    fn cancelled() -> Self {
+        Self::default()
+    }
+
+    fn completed(parser: &mut dyn FrameParser) -> Self {
+        Self {
+            done: true,
+            tool_calls: parser.drain_tool_calls(),
+            content: parser.take_content(),
+            thinking: parser.take_thinking(),
+            finish_reason: parser.finish_reason(),
+            input_tokens: None,
+        }
+    }
 }
 
 /// A model provider: builds its wire payload and interprets its own frames.
@@ -213,6 +244,17 @@ pub(crate) trait FrameParser: Send {
     /// never seen (truncated stream).
     fn finish(&mut self) -> AppResult<Vec<StreamEvent>>;
     fn drain_tool_calls(&mut self) -> Vec<ToolCallSpec>;
+    /// Streamed assistant text accumulated this attempt; taken when the turn
+    /// completes so the caller can replay it into `messages`.
+    fn take_content(&mut self) -> String;
+    /// Provider thinking blocks captured this attempt (Anthropic only).
+    fn take_thinking(&mut self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Provider stop/finish reason observed on this attempt, if any.
+    fn finish_reason(&self) -> Option<String> {
+        None
+    }
     /// 中流重试清空 per-attempt 状态：半截 tool-call 参数、`<think>` 缓冲等
     /// 不得拼接到重发 attempt 的流上。
     fn reset(&mut self);
@@ -340,7 +382,7 @@ pub(crate) async fn stream_common(
     events: mpsc::UnboundedSender<StreamEvent>,
 ) -> AppResult<TurnOutcome> {
     if *cancel.borrow() {
-        return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
+        return Ok(TurnOutcome::cancelled());
     }
     let host = request
         .try_clone()
@@ -354,7 +396,7 @@ pub(crate) async fn stream_common(
         };
         let result = tokio::select! {
             biased;
-            _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+            _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
             response = builder.send() => response,
         };
         match result {
@@ -366,7 +408,7 @@ pub(crate) async fn stream_common(
                 let delay = retry_delay(attempt, retry_after_ms(&response));
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                    _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
                 }
                 attempt += 1;
             }
@@ -375,7 +417,7 @@ pub(crate) async fn stream_common(
                     let delay = retry_delay(attempt, None);
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                        _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
                     }
                     attempt += 1;
                     continue;
@@ -418,9 +460,22 @@ pub(crate) async fn stream_common(
     let mut deltas_seen = 0u64;
     let mut stream_retries = 0usize;
     let mut content_seen = 0u64;
+    let mut last_input_tokens: Option<u64> = None;
+    macro_rules! finish_turn {
+        () => {{
+            let mut outcome = TurnOutcome::completed(parser);
+            outcome.input_tokens = last_input_tokens;
+            return Ok(outcome);
+        }};
+    }
     let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>, deltas_seen: &mut u64, content_seen: &mut u64| -> AppResult<bool> {
         for frame in frames {
             for event in parser.handle(frame)? {
+                if let StreamEvent::Usage { input, .. } = &event {
+                    if input.is_some() {
+                        last_input_tokens = *input;
+                    }
+                }
                 if let StreamEvent::Token(ref token) = event {
                     output_bytes += token.len();
                     *content_seen += 1;
@@ -442,16 +497,16 @@ pub(crate) async fn stream_common(
     };
     loop {
         if *cancel.borrow() {
-            return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
+            return Ok(TurnOutcome::cancelled());
         }
         let chunk = tokio::select! {
             biased;
-            _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+            _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
             // Watch notifications can be missed around receiver clones; polling
             // the value guarantees stop within 250ms regardless.
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if *cancel.borrow() {
-                    return Ok(TurnOutcome { done: false, tool_calls: Vec::new() });
+                    return Ok(TurnOutcome::cancelled());
                 }
                 continue;
             }
@@ -460,7 +515,7 @@ pub(crate) async fn stream_common(
         match chunk {
             Some(Ok(bytes)) => {
                 if process(decoder.push(&bytes)?, parser, &events, &mut deltas_seen, &mut content_seen)? {
-                    return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
+                    finish_turn!();
                 }
             }
             Some(Err(error)) => {
@@ -471,11 +526,11 @@ pub(crate) async fn stream_common(
                     let delay = retry_delay(stream_retries, None);
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                        _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
                     }
                     let retried = tokio::select! {
                         biased;
-                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                        _ = cancel.changed() => return Ok(TurnOutcome::cancelled()),
                         response = builder.send() => response,
                     };
                     match retried {
@@ -505,16 +560,16 @@ pub(crate) async fn stream_common(
             }
             None => {
                 if process(decoder.finish()?, parser, &events, &mut deltas_seen, &mut content_seen)? {
-                    return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
+                    finish_turn!();
                 }
                 for event in parser.finish()? {
                     let done = matches!(event, StreamEvent::Done);
                     let _ = events.send(event);
                     if done {
-                        return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
+                        finish_turn!();
                     }
                 }
-                return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
+                finish_turn!();
             }
         }
     }

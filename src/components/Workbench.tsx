@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Popover from '@radix-ui/react-popover';
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, ListTodo, Monitor, Moon, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, ListTodo, Monitor, Moon, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldAlert, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
 import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
 import MaestroLogo from './MaestroLogo';
@@ -93,6 +93,11 @@ export interface WorkbenchController {
   resolveApproval?: (runId: number, decision: import('../api/types').ApprovalDecision, commandScope?: import('../api/types').CommandScope, feedback?: string) => unknown;
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
+  /** Untrusted `.maestro/` assets awaiting a trust decision. */
+  trustPrompt?: import('../api/types').WorkspaceTrustStatus | null;
+  trustWorkspace?: (path: string) => Promise<void>;
+  refreshTrustStatus?: () => Promise<void>;
+  dismissTrustPrompt?: () => void;
 }
 
 function fallbackChanges(files: { path: string; before: string; after: string }[]): RunFileChange[] {
@@ -354,7 +359,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     const trace = c.subagents?.[id];
     if (trace) void subagentsApi.cancel(trace.runId, id);
   }, [c.subagents]);
-  const slashSources = useSlashSources(!preview && c.state.ready, currentProject.id);
+  const slashSources = useSlashSources(!preview && c.state.ready, `${currentProject.id}:${c.workspaceTick ?? 0}`);
   const slashActions: SlashAction[] = [
     { id: 'plan', description: '切换到 Plan 模式（只读分析）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
     { id: 'code', description: '切换到 Code 模式（写入直接执行）', disabled: running || c.state.mode === 'code', run: () => void c.setMode('code') },
@@ -397,6 +402,11 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   }, [openTabs, listTab]);
 
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
+  // The `workspace_trust_required` event does not replay — poll once per
+  // mount/project so a reload still surfaces the prompt.
+  useEffect(() => {
+    if (!preview && c.state.ready && c.refreshTrustStatus) void c.refreshTrustStatus().catch(() => {});
+  }, [preview, c.state.ready, currentProject.id]);
   useEffect(() => { autoFollowChanges.current = true; }, [c.state.activeRun?.id]);
   useEffect(() => {
     if (!reviewOpen || listTab !== 'changes' || !autoFollowChanges.current || !lastChangedPath) return;
@@ -638,6 +648,11 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
               compactions={compactions}
               footer={footerNode}
               onScroll={scroll.onScroll} />
+            {!preview && c.trustPrompt && (
+              <TrustBanner prompt={c.trustPrompt} pending={c.pending}
+                onTrust={(path) => { void c.trustWorkspace?.(path).catch((reason: unknown) => setToastError(reason instanceof Error ? reason.message : String(reason))); }}
+                onDismiss={() => c.dismissTrustPrompt?.()} />
+            )}
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               ref={composerRef} onSubmit={submit} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked}
@@ -689,5 +704,28 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
       <RevertChangesDialog open={revertOpen} onOpenChange={setRevertOpen} preview={revertPreview}
         loading={revertLoading} applying={reverting} error={revertError} onApply={applyRevert} />
   </Tooltip.Provider></I18nProvider>;
+}
+
+/// Folder-trust prompt (ZCode analog): the workspace ships project `.maestro/`
+/// agents/skills/commands that stay inert until the user explicitly trusts
+/// the directory — a cloned repo must not auto-inject prompts.
+function TrustBanner({ prompt, pending, onTrust, onDismiss }: {
+  prompt: import('../api/types').WorkspaceTrustStatus;
+  pending: boolean;
+  onTrust: (path: string) => void;
+  onDismiss: () => void;
+}) {
+  const kinds = prompt.assets.map((kind) => kind === 'agents' ? '子智能体' : kind === 'skills' ? '技能' : '命令').join('、');
+  return (
+    <div className="trust-banner" role="alert">
+      <ShieldAlert size={16} strokeWidth={1.75} />
+      <span className="trust-banner-text">
+        此目录包含项目级 <strong>.maestro/</strong> 扩展（{kinds}），信任前不会注入到对话。仅信任你了解的项目。
+        <span className="trust-path">{prompt.path}</span>
+      </span>
+      <button type="button" className="trust-dismiss" onClick={onDismiss}>暂不</button>
+      <button type="button" className="trust-allow" disabled={pending} onClick={() => onTrust(prompt.path)}>信任并启用</button>
+    </div>
+  );
 }
 

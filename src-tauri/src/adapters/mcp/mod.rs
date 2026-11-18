@@ -8,7 +8,7 @@ mod transport;
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
@@ -37,8 +37,11 @@ const MAX_SERVERS: usize = 32;
 
 /// Windows cannot CreateProcess a `.cmd`/`.bat` shim, so resolve the real
 /// launcher through PATHEXT and report whether it must run under `cmd /C`.
+/// `workspace_root` mirrors exec::resolve_program: a PATH directory inside the
+/// workspace must never supply the launcher — a cloned repo could plant
+/// `npx.cmd`/`node.exe` and hijack every MCP server start.
 #[cfg(windows)]
-fn resolve_program(command: &str, path_var: Option<&std::ffi::OsStr>) -> (PathBuf, bool) {
+fn resolve_program(command: &str, path_var: Option<&std::ffi::OsStr>, workspace_root: Option<&Path>) -> (PathBuf, bool) {
     let direct = PathBuf::from(command);
     let needs_shell = |path: &PathBuf| {
         path.extension()
@@ -49,8 +52,22 @@ fn resolve_program(command: &str, path_var: Option<&std::ffi::OsStr>) -> (PathBu
         let shell = needs_shell(&direct);
         return (direct, shell);
     }
+    let root = workspace_root.and_then(|root| root.canonicalize().ok());
     if let Some(path) = path_var {
         for dir in std::env::split_paths(path) {
+            if dir.as_os_str().is_empty() {
+                // An empty PATH entry means "current directory" on Windows.
+                continue;
+            }
+            if let Some(root) = &root {
+                let inside_workspace = dir
+                    .canonicalize()
+                    .map(|resolved| resolved.starts_with(root))
+                    .unwrap_or(false);
+                if inside_workspace {
+                    continue;
+                }
+            }
             for extension in ["exe", "cmd", "bat"] {
                 let candidate = dir.join(format!("{command}.{extension}"));
                 if candidate.is_file() {
@@ -74,11 +91,18 @@ pub struct McpManager {
     running: AsyncMutex<HashMap<String, RunningServer>>,
     /// Last startup error per server, surfaced in list_mcp_servers.
     errors: Mutex<HashMap<String, String>>,
+    /// Current workspace root: PATH directories inside it are excluded from
+    /// launcher resolution (repo-planted `npx.cmd` hijack prevention).
+    workspace_root: Mutex<Option<PathBuf>>,
 }
 
 impl McpManager {
     pub fn set_config_path(&self, path: PathBuf) {
         *self.config_path.lock().unwrap() = Some(path);
+    }
+
+    pub fn set_workspace_root(&self, root: Option<PathBuf>) {
+        *self.workspace_root.lock().unwrap() = root;
     }
 
     fn config_path(&self) -> AppResult<PathBuf> {
@@ -249,7 +273,8 @@ impl McpManager {
 
     async fn spawn(&self, name: &str, config: &McpServerConfig) -> AppResult<RunningServer> {
         let path_var = std::env::var_os("PATH");
-        let (program, needs_shell) = resolve_program(config.command.trim(), path_var.as_deref());
+        let workspace_root = self.workspace_root.lock().unwrap().clone();
+        let (program, needs_shell) = resolve_program(config.command.trim(), path_var.as_deref(), workspace_root.as_deref());
         let mut builder = if needs_shell {
             let mut command = Command::new("cmd");
             command.arg("/C").arg(&program);
@@ -505,13 +530,23 @@ mod tests {
     fn resolves_cmd_shims_through_path() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("fake-npx.cmd"), "@echo off\r\n").unwrap();
-        let (path, needs_shell) = resolve_program("fake-npx", Some(dir.path().as_os_str()));
+        let (path, needs_shell) = resolve_program("fake-npx", Some(dir.path().as_os_str()), None);
         assert!(needs_shell);
         assert!(path.ends_with("fake-npx.cmd"));
 
-        let (direct, needs_shell) = resolve_program("C:/tools/run.exe", None);
+        let (direct, needs_shell) = resolve_program("C:/tools/run.exe", None, None);
         assert!(!needs_shell);
         assert!(direct.ends_with("run.exe"));
+
+        // A PATH directory inside the workspace must not supply the launcher —
+        // the planted shim is skipped and resolution falls through.
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = workspace.path().join("bin");
+        fs::create_dir_all(&fake_dir).unwrap();
+        fs::write(fake_dir.join("fake-npx.cmd"), "@echo off\r\n").unwrap();
+        let path_var = std::ffi::OsString::from(&fake_dir);
+        let (fallback, _) = resolve_program("fake-npx", Some(&path_var), Some(workspace.path()));
+        assert_eq!(fallback, PathBuf::from("fake-npx"));
     }
 
     #[tokio::test]
