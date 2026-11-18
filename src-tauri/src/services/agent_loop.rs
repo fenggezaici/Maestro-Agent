@@ -1002,10 +1002,12 @@ pub(crate) async fn run(
                     &provider,
                     &config,
                     &messages,
-                    &run,
-                    "auto",
-                    &mut cancel,
-                    &mut compaction_failures,
+                    &mut CompactionCtx {
+                        run: &run,
+                        trigger: "auto",
+                        cancel: &mut cancel,
+                        failures: &mut compaction_failures,
+                    },
                 )
                 .await?;
                 saved_upto = messages.len();
@@ -1034,10 +1036,12 @@ pub(crate) async fn run(
                         &provider,
                         &config,
                         &messages,
-                        &run,
-                        "auto",
-                        &mut cancel,
-                        &mut compaction_failures,
+                        &mut CompactionCtx {
+                            run: &run,
+                            trigger: "auto",
+                            cancel: &mut cancel,
+                            failures: &mut compaction_failures,
+                        },
                     )
                     .await?;
                     saved_upto = messages.len();
@@ -1236,7 +1240,7 @@ fn needs_compaction(
 const MICRO_KEEP_RECENT: usize = 6;
 const MICRO_LIMIT_CHARS: usize = 2000;
 
-fn microcompact(messages: &mut Vec<ChatMessage>) {
+fn microcompact(messages: &mut [ChatMessage]) {
     if messages.len() <= MICRO_KEEP_RECENT + 2 {
         return;
     }
@@ -1327,15 +1331,21 @@ async fn summarize_with_model(
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// Compaction call context: the owning run, the audit trigger label, the
+/// cancel channel and the consecutive-failure breaker counter.
+struct CompactionCtx<'a> {
+    run: &'a RunView,
+    trigger: &'a str,
+    cancel: &'a mut watch::Receiver<bool>,
+    failures: &'a mut u32,
+}
+
 async fn compact_messages(
     kernel: &Arc<Kernel>,
     provider: &Arc<dyn LlmProvider>,
     config: &ChatConfig,
     messages: &[ChatMessage],
-    run: &RunView,
-    trigger: &str,
-    cancel: &mut watch::Receiver<bool>,
-    failures: &mut u32,
+    ctx: &mut CompactionCtx<'_>,
 ) -> AppResult<Vec<ChatMessage>> {
     let keep = 8.min(messages.len().saturating_sub(1));
     let mut split = messages.len().saturating_sub(keep);
@@ -1355,13 +1365,13 @@ async fn compact_messages(
         .map(|message| format!("{}: {}", message.role, message.content.chars().take(1000).collect::<String>()))
         .collect::<Vec<_>>()
         .join("\n");
-    let operation_id = format!("compact-{}-{}", run.id, crate::domain::unix_now());
+    let operation_id = format!("compact-{}-{}", ctx.run.id, crate::domain::unix_now());
     let running = ContextCompaction {
         operation_id: operation_id.clone(),
-        session_id: run.session_id,
-        through_run_id: run.id - 1,
+        session_id: ctx.run.session_id,
+        through_run_id: ctx.run.id - 1,
         summary: String::new(),
-        trigger: trigger.into(),
+        trigger: ctx.trigger.into(),
         status: "running".into(),
         pre_tokens: pre,
         post_tokens: None,
@@ -1371,16 +1381,16 @@ async fn compact_messages(
     // 熔断（ZCode）：付费 summarize 连续失败 3 次后不再尝试，直接走启发式
     // 摘要——否则每一轮都会为一个注定失败的请求付一次全量输入费用。
     const COMPACTION_FAILURE_BREAKER: u32 = 3;
-    let summary = if *failures >= COMPACTION_FAILURE_BREAKER {
+    let summary = if *ctx.failures >= COMPACTION_FAILURE_BREAKER {
         heuristic_summary(older)
     } else {
-        match summarize_with_model(provider, config, &transcript, cancel).await {
+        match summarize_with_model(provider, config, &transcript, ctx.cancel).await {
             Some(text) => {
-                *failures = 0;
+                *ctx.failures = 0;
                 text
             }
             None => {
-                *failures += 1;
+                *ctx.failures += 1;
                 heuristic_summary(older)
             }
         }

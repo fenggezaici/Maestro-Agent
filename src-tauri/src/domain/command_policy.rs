@@ -166,10 +166,9 @@ fn args_match(args: &[String], flags: &[FlagSpec], allow_positional: bool) -> bo
         if arg.starts_with('-') {
             // Bundled short flags like `-rn` are accepted when every letter
             // is a listed non-valued flag (`grep -rn`, `ls -la`).
-            if !arg.starts_with("--") && arg.len() > 2 {
-                let bundled = arg[1..]
-                    .chars()
-                    .all(|letter| {
+            if let Some(stripped) = arg.strip_prefix('-') {
+                if !stripped.starts_with('-') && stripped.len() > 1 {
+                    let bundled = stripped.chars().all(|letter| {
                         flags.iter().any(|spec| {
                             !spec.takes_value
                                 && spec.name.len() == 2
@@ -177,9 +176,10 @@ fn args_match(args: &[String], flags: &[FlagSpec], allow_positional: bool) -> bo
                                 && spec.name.ends_with(letter)
                         })
                     });
-                if bundled {
-                    index += 1;
-                    continue;
+                    if bundled {
+                        index += 1;
+                        continue;
+                    }
                 }
             }
             let Some(spec) = flags.iter().find(|spec| spec.name == arg) else {
