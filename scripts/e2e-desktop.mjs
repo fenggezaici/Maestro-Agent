@@ -29,6 +29,11 @@ const driverBinary = existsSync(path.join(os.homedir(), '.cargo', 'bin', 'tauri-
 const args = ['--port', '4444'];
 if (existsSync(nativeDriver)) args.push('--native-driver', nativeDriver);
 
+// Give WebView2 a fresh per-run user data folder: DevToolsActivePort lives
+// there, so a locked or half-written leftover profile is the classic cause
+// of "session not created: DevToolsActivePort file doesn't exist" on CI.
+const webview2Udf = path.join(os.tmpdir(), `maestro-e2e-wv2-${process.pid}`);
+
 // A debug build loads `build.devUrl` (127.0.0.1:1420), so the E2E owns a Vite
 // dev server for the run instead of requiring a slow release build.
 const vite = spawn(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js')], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -49,7 +54,10 @@ async function waitForVite() {
   throw new Error(`vite did not start: ${viteLogs}`);
 }
 
-const driver = spawn(driverBinary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+const driver = spawn(driverBinary, args, {
+  stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: webview2Udf },
+});
 let driverLogs = '';
 driver.stdout.on('data', (data) => { driverLogs = (driverLogs + data).slice(-4000); });
 driver.stderr.on('data', (data) => { driverLogs = (driverLogs + data).slice(-4000); });
@@ -95,10 +103,23 @@ async function check(name, run) {
 try {
   await waitForVite();
   await waitForDriver();
-  const created = await wd('POST', '/session', {
-    capabilities: { alwaysMatch: { browserName: 'wry', 'tauri:options': { application: exe } } },
-  });
-  session = created.sessionId ?? created['sessionId'];
+  // WebView2 cold start on shared runners can outrun DevToolsActivePort:
+  // retry session creation a few times before declaring the run failed.
+  let lastSessionError;
+  for (const delay of [0, 3_000, 8_000]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      const created = await wd('POST', '/session', {
+        capabilities: { alwaysMatch: { browserName: 'wry', 'tauri:options': { application: exe } } },
+      });
+      session = created.sessionId ?? created['sessionId'];
+      lastSessionError = undefined;
+      break;
+    } catch (error) {
+      lastSessionError = error;
+    }
+  }
+  if (!session) throw lastSessionError;
   await mkdir(output, { recursive: true });
 
   // The window exists before the embedded UI finishes mounting (Monaco preload,
@@ -161,6 +182,16 @@ try {
 } catch (error) {
   failures.push(`session: ${error.message}`);
   console.error(`  FAIL session: ${error.message}\n${driverLogs}`);
+  // WebView2 writes its own verbose log into the user data folder when it
+  // fails to expose a debugging port — dump the tail for CI diagnosis.
+  try {
+    const { readdir, readFile } = await import('node:fs/promises');
+    const entries = await readdir(webview2Udf, { recursive: true, withFileTypes: true }).catch(() => []);
+    for (const entry of entries.filter((e) => e.isFile() && /webview|\.log$/i.test(e.name)).slice(0, 3)) {
+      const text = await readFile(path.join(entry.parentPath ?? webview2Udf, entry.name), 'utf8').catch(() => '');
+      if (text.trim()) console.error(`--- ${entry.name} ---\n${text.trim().split('\n').slice(-20).join('\n')}`);
+    }
+  } catch { /* no webview logs to report */ }
 } finally {
   if (session) { try { await wd('DELETE', `/session/${session}`); } catch { /* already gone */ } }
   driver.kill();

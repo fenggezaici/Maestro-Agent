@@ -88,6 +88,7 @@ jobs:
   # 因此单独成 job 并允许失败；稳定后去掉 continue-on-error 即可作为发布门槛。
   e2e-desktop:
     runs-on: windows-latest
+    continue-on-error: true
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +115,27 @@ jobs:
       - name: Install matching msedgedriver
         run: node scripts/e2e-driver-setup.mjs
 
+      # Distinguish "app crashes at startup" from "WebView2/driver flake" on
+      # the next failure. The debug build is a console subsystem binary, so a
+      # startup panic reaches stderr. The process must be killed afterwards —
+      # the single-instance mutex would otherwise hand the E2E's own launch
+      # to this stray instance and no WebView2 would ever appear.
+      - name: Launch smoke check (12s)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $proc = Start-Process -FilePath target\debug\maestro.exe -PassThru `
+            -RedirectStandardError artifacts\app-stderr.log `
+            -RedirectStandardOutput artifacts\app-stdout.log
+          Start-Sleep 12
+          if ($proc.HasExited) {
+            Write-Host "maestro.exe exited early: $($proc.ExitCode)"
+            Get-Content artifacts\app-stderr.log -Tail 40
+          } else {
+            Write-Host "maestro.exe stayed up"
+            Stop-Process -Id $proc.Id -Force
+          }
+
       - name: Desktop E2E (real IPC)
         run: node scripts/e2e-desktop.mjs
 
@@ -122,5 +144,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-desktop-artifacts
-          path: artifacts/e2e
+          path: artifacts
           if-no-files-found: ignore
