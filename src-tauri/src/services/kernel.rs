@@ -2750,9 +2750,11 @@ mod tests {
         kernel.subagents.lock().unwrap().insert("sa-1".into(), subagent_fixture("sa-1", SubagentStatus::Running));
         kernel.subagents.lock().unwrap().insert("sa-2".into(), subagent_fixture("sa-2", SubagentStatus::Completed));
         kernel.cancel(1).await.unwrap();
-        let map = kernel.subagents.lock().unwrap();
-        assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
-        assert_eq!(map["sa-2"].status, SubagentStatus::Completed, "finished children must not be touched");
+        {
+            let map = kernel.subagents.lock().unwrap();
+            assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
+            assert_eq!(map["sa-2"].status, SubagentStatus::Completed, "finished children must not be touched");
+        }
         kernel.shutdown().await.unwrap();
     }
 
@@ -2775,8 +2777,29 @@ mod tests {
         kernel.subagents.lock().unwrap().insert("sa-1".into(), subagent_fixture("sa-1", SubagentStatus::Cancelled));
         kernel.cancel_subagent(1, "sa-1").await.unwrap();
         kernel.cancel_subagent(1, "sa-1").await.unwrap();
-        let map = kernel.subagents.lock().unwrap();
-        assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
+        {
+            let map = kernel.subagents.lock().unwrap();
+            assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
+        }
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_updates_round_trip_through_list_projects() {
+        let (kernel, _events) = test_kernel().await;
+        let project = kernel.create_project("旧名".into(), None).await.unwrap();
+        kernel
+            .update_project_name(project.id, "新名".into())
+            .await
+            .unwrap();
+        kernel
+            .update_project_path(project.id, "D:/workspace/demo".into())
+            .await
+            .unwrap();
+        let listed = kernel.list_projects().await.unwrap();
+        let updated = listed.iter().find(|item| item.id == project.id).unwrap();
+        assert_eq!(updated.name, "新名");
+        assert_eq!(updated.path.as_deref(), Some("D:/workspace/demo"));
         kernel.shutdown().await.unwrap();
     }
 

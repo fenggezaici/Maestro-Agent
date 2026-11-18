@@ -1,4 +1,4 @@
-# 暂未启用：远端 Actions 尚未配置。本地等价门禁见 scripts/ci.mjs（corepack pnpm verify）。
+# 本地等价门禁见 scripts/ci.mjs（corepack pnpm ci）。
 name: CI
 
 on:

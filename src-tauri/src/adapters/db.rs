@@ -18,6 +18,9 @@ pub const DEFAULT_PROJECT_ID: i64 = 1;
 
 type Operation = Box<dyn FnOnce(&mut Connection) + Send>;
 
+/// (seq, kind, text, tool_index, started_at, ended_at) for a run_parts insert.
+type RunPartRow = (i64, String, String, Option<i64>, i64, Option<i64>);
+
 enum Request {
     Execute(Operation),
     Shutdown(oneshot::Sender<AppResult<()>>),
@@ -852,7 +855,7 @@ impl Database {
 
     /// Persist one run's ordered timeline parts (called once when it finishes).
     pub async fn save_run_parts(&self, run_id: i64, parts: &[crate::domain::RunPart]) -> AppResult<()> {
-        let rows: Vec<(i64, String, String, Option<i64>, i64, Option<i64>)> = parts
+        let rows: Vec<RunPartRow> = parts
             .iter()
             .enumerate()
             .map(|(seq, part)| {

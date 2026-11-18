@@ -188,6 +188,68 @@ fn every_invoked_command_is_allowed_by_a_capability() {
     );
 }
 
+/// `State<'_, T>` parameters in command modules. `T` must be one of the types
+/// `lib.rs` manages: `update_project_*` once asked for `State<'_, Kernel>`
+/// while the app manages `Arc<Kernel>` — the signature compiled, and every
+/// project edit failed at dispatch until a user pressed Enter.
+fn command_state_argument_types() -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(manifest_dir().join("src/commands")).expect("commands dir") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read command module");
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        let mut index = 0;
+        while let Some(offset) = text[index..].find("State<") {
+            let start = index + offset;
+            // `myState<` or `Field::State<`-style suffixes do not count.
+            let preceded = text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|value| value.is_alphanumeric() || matches!(value, '.' | '_' | '$'));
+            if preceded {
+                index = start + "State<".len();
+                continue;
+            }
+            let mut cursor = start + "State<".len();
+            let inner_start = cursor;
+            let mut depth = 1usize;
+            let bytes = text.as_bytes();
+            while cursor < bytes.len() && depth > 0 {
+                match bytes[cursor] {
+                    b'<' => depth += 1,
+                    b'>' => depth -= 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            if let Some((_, ty)) = text[inner_start..cursor - 1].split_once(',') {
+                found.push((file.clone(), ty.trim().to_string()));
+            }
+            index = cursor;
+        }
+    }
+    found
+}
+
+/// Managed-state types registered in `lib.rs` via `app.manage(…)`. A command
+/// taking `State<'_, T>` with any other `T` can only fail at dispatch time.
+const MANAGED_STATE_TYPES: [&str; 2] = ["Arc<Kernel>", "WorkspaceService"];
+
+#[test]
+fn command_state_arguments_use_managed_types() {
+    let bad: Vec<_> = command_state_argument_types()
+        .into_iter()
+        .filter(|(_, ty)| !MANAGED_STATE_TYPES.contains(&ty.as_str()))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "command params request State types the app never manages: {bad:?}"
+    );
+}
+
 #[test]
 fn every_registered_command_is_reachable_by_the_webview() {
     // The reverse direction: a command nobody calls is either dead code or a

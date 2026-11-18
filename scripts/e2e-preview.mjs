@@ -92,6 +92,19 @@ try {
     assert.equal(Number(await separator.getAttribute('aria-valuenow')), 220);
   });
 
+  await check('project editor dialog renames a project', async () => {
+    const row = page.locator('.project-row').first();
+    const name = (await row.locator('.project-name').textContent()).trim();
+    await row.getByLabel(new RegExp(`项目 .* 操作`)).click();
+    await page.getByText('编辑项目', { exact: true }).click();
+    const input = page.getByLabel('项目名称');
+    await input.waitFor({ timeout: 5_000 });
+    assert.equal(await input.inputValue(), name);
+    await input.fill(`${name}-改`);
+    await page.getByRole('button', { name: '保存' }).click();
+    await page.locator('.project-name', { hasText: `${name}-改` }).first().waitFor({ timeout: 5_000 });
+  });
+
   await check('no uncaught page errors', async () => {
     assert.deepEqual(consoleErrors, []);
   });
