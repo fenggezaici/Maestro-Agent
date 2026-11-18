@@ -127,9 +127,9 @@ mod tests {
     fn tokens(frames: Vec<Frame>) -> Vec<String> {
         frames
             .into_iter()
-            .filter_map(|frame| match frame {
-                Frame::Done => Some("[DONE]".into()),
-                Frame::Data(value) => Some(value.to_string()),
+            .map(|frame| match frame {
+                Frame::Done => "[DONE]".into(),
+                Frame::Data(value) => value.to_string(),
             })
             .collect()
     }

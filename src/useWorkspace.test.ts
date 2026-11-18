@@ -67,3 +67,47 @@ it('ignores an old file error after a newer selection succeeds', async () => {
   expect(hook.result.current.fileError).toBeNull();
   expect(hook.result.current.fileLoading).toBe(false);
 });
+
+it('settles the spinner and reports the backend error when a read fails', async () => {
+  api.text.mockRejectedValueOnce('无法读取该文件');
+  const hook = renderHook(() => useWorkspace(true));
+  await waitFor(() => expect(hook.result.current.tree).toHaveLength(1));
+  await act(async () => { await hook.result.current.selectFile('broken.ts'); });
+  expect(hook.result.current.fileLoading).toBe(false);
+  expect(hook.result.current.fileError).toContain('无法读取该文件');
+});
+
+it('reports a missing workspace instead of spinning forever', async () => {
+  const hook = renderHook(() => useWorkspace(false));
+  await act(async () => { await hook.result.current.selectFile('orphan.ts'); });
+  expect(hook.result.current.fileLoading).toBe(false);
+  expect(hook.result.current.fileError).toContain('工作区尚未加载');
+});
+
+it('times out a read that never answers and leaves the pane usable', async () => {
+  const hook = renderHook(() => useWorkspace(true));
+  await waitFor(() => expect(hook.result.current.tree).toHaveLength(1));
+  vi.useFakeTimers();
+  try {
+    api.text.mockImplementationOnce(() => new Promise<string>(() => {}));
+    const pending = hook.result.current.selectFile('slow.ts');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await act(async () => { await pending; });
+    expect(hook.result.current.fileLoading).toBe(false);
+    expect(hook.result.current.fileError).toContain('读取超时');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('serves a repeated file from the cache without another IPC read', async () => {
+  const hook = renderHook(() => useWorkspace(true));
+  await waitFor(() => expect(hook.result.current.tree).toHaveLength(1));
+  await act(async () => { await hook.result.current.selectFile('file.ts'); });
+  expect(api.text).toHaveBeenCalledTimes(1);
+  await act(async () => { await hook.result.current.selectFile('other.ts'); });
+  await act(async () => { await hook.result.current.selectFile('file.ts'); });
+  // file.ts was cached, so only other.ts needed a round trip.
+  expect(api.text).toHaveBeenCalledTimes(2);
+  expect(hook.result.current.file?.path).toBe('file.ts');
+});

@@ -56,8 +56,14 @@ pub struct ChatConfig {
     pub session: Option<String>,
 }
 
-impl ChatConfig {
-    pub fn validate(&self) -> AppResult<Url> {
+/// Loopback hosts may keep plaintext HTTP (local Ollama and proxies).
+fn is_local_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        || host.ends_with(".localhost")
+}
+
+impl ChatConfig {    pub fn validate(&self) -> AppResult<Url> {
         if (self.api_key.trim().is_empty() && !matches!(self.provider, Provider::Ollama))
             || self.api_key.len() > 8192
             || self.api_key.chars().any(char::is_control)
@@ -77,6 +83,11 @@ impl ChatConfig {
             || url.fragment().is_some()
         {
             return Err("Base URL 必须为 HTTP(S)，且不能含账号、查询参数或片段".into());
+        }
+        // Plaintext HTTP would expose the key on the wire; only local endpoints
+        // (Ollama, local proxies) keep the http exception.
+        if url.scheme() == "http" && !is_local_host(url.host_str().unwrap_or_default()) {
+            return Err("Base URL 必须使用 HTTPS（本地地址除外）".into());
         }
         let path = url.path().trim_end_matches('/').to_string();
         let suffix = if matches!(self.provider, Provider::Anthropic) {
@@ -143,6 +154,10 @@ pub enum StreamEvent {
     /// Model reasoning/thinking channel (DeepSeek `reasoning_content`,
     /// Anthropic `thinking_delta`, inline `<think>` blocks).
     Reasoning(String),
+    /// 计时边界事件：一段工具调用参数 delta 到达（DSH `isTokenDelta` 口径 —
+    /// 非空 argumentsDelta 或 name 已知的 tool-call-delta 也算可见输出）。
+    /// 只用于首 token/decode 窗口打点，不转发 UI、不计入输出大小上限。
+    ToolCallDelta,
     Usage {
         input: Option<u64>,
         output: Option<u64>,
@@ -236,6 +251,13 @@ const MAX_OUTPUT_BYTES: usize = 1048576;
 const RETRY_MAX_RETRIES: usize = 5;
 const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
+/// 流中途断开的整请求重发上限：只允许在还没产出任何可见 delta 时重发，
+/// 否则会让模型从头生成、UI 出现重复文本。
+const STREAM_RETRY_MAX: usize = 3;
+
+fn should_retry_stream(deltas_seen: u64, stream_retries: usize, retryable: bool) -> bool {
+    deltas_seen == 0 && stream_retries < STREAM_RETRY_MAX && retryable
+}
 
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 524)
@@ -387,9 +409,9 @@ pub(crate) async fn stream_common(
     let mut body = response.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut output_bytes = 0usize;
-    let mut bytes_seen = 0usize;
+    let mut deltas_seen = 0u64;
     let mut stream_retries = 0usize;
-    let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>| -> AppResult<bool> {
+    let mut process = |frames: Vec<Frame>, parser: &mut dyn FrameParser, events: &mpsc::UnboundedSender<StreamEvent>, deltas_seen: &mut u64| -> AppResult<bool> {
         for frame in frames {
             for event in parser.handle(frame)? {
                 if let StreamEvent::Token(ref token) = event {
@@ -397,6 +419,9 @@ pub(crate) async fn stream_common(
                     if output_bytes > MAX_OUTPUT_BYTES {
                         return Err("模型回复超过 1 MiB 限制".into());
                     }
+                }
+                if matches!(event, StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta) {
+                    *deltas_seen += 1;
                 }
                 let done = matches!(event, StreamEvent::Done);
                 let _ = events.send(event);
@@ -426,16 +451,21 @@ pub(crate) async fn stream_common(
         };
         match chunk {
             Some(Ok(bytes)) => {
-                bytes_seen += bytes.len();
-                if process(decoder.push(&bytes)?, parser, &events)? {
+                if process(decoder.push(&bytes)?, parser, &events, &mut deltas_seen)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
             }
             Some(Err(error)) => {
-                if bytes_seen == 0 && stream_retries == 0 && retryable_stream_error(&error) {
+                if should_retry_stream(deltas_seen, stream_retries, retryable_stream_error(&error)) {
                     let Some(builder) = request.try_clone() else {
                         return Err(stream_error_message(&error, config));
                     };
+                    let delay = retry_delay(stream_retries, None);
+                    eprintln!("LLM stream retry {}/{} host={host} error={error} delay={}ms", stream_retries + 1, STREAM_RETRY_MAX, delay.as_millis());
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
+                    }
                     let retried = tokio::select! {
                         biased;
                         _ = cancel.changed() => return Ok(TurnOutcome { done: false, tool_calls: Vec::new() }),
@@ -457,10 +487,15 @@ pub(crate) async fn stream_common(
                         Err(next_error) => return Err(stream_error_message(&next_error, config)),
                     }
                 }
-                return Err(stream_error_message(&error, config));
+                let message = stream_error_message(&error, config);
+                return Err(if deltas_seen > 0 {
+                    format!("{message}；已生成内容已保留")
+                } else {
+                    message
+                });
             }
             None => {
-                if process(decoder.finish()?, parser, &events)? {
+                if process(decoder.finish()?, parser, &events, &mut deltas_seen)? {
                     return Ok(TurnOutcome { done: true, tool_calls: parser.drain_tool_calls() });
                 }
                 for event in parser.finish()? {
@@ -518,9 +553,14 @@ mod tests {
             "file:///tmp/model",
             "https://user:pass@example.com/v1",
             "https://example.com/v1?key=test-secret",
+            "http://remote.example.com/v1",
         ] {
             config.base_url = url.into();
-            assert!(config.validate().is_err());
+            assert!(config.validate().is_err(), "{url}");
+        }
+        for url in ["http://localhost:11434/v1", "http://127.0.0.1:1234/v1"] {
+            config.base_url = url.into();
+            assert!(config.validate().is_ok(), "{url}");
         }
         assert!(crate::domain::validate_messages(&[ChatMessage::text("system", "bypass")]).is_err());
     }
@@ -564,5 +604,17 @@ mod tests {
             .build()
             .unwrap();
         assert!(request.headers().get("x-opencode-session").is_none());
+    }
+
+    #[test]
+    fn stream_retry_only_before_the_first_visible_delta() {
+        // 字节已到达但尚无可见 delta（role/message_start/usage 帧）→ 允许重发。
+        assert!(should_retry_stream(0, 0, true));
+        assert!(should_retry_stream(0, STREAM_RETRY_MAX - 1, true));
+        // 已产出可见 delta → 重发会从头生成导致重复文本，禁止。
+        assert!(!should_retry_stream(1, 0, true));
+        // 重试耗尽、错误不可重试 → 禁止。
+        assert!(!should_retry_stream(0, STREAM_RETRY_MAX, true));
+        assert!(!should_retry_stream(0, 0, false));
     }
 }

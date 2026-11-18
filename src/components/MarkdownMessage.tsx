@@ -1,4 +1,4 @@
-import { Children, useState, type ReactElement, type ReactNode } from 'react';
+import { Children, memo, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Light as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -13,6 +13,9 @@ import { Check, Copy } from 'lucide-react';
 
 for (const [name, grammar] of Object.entries({ javascript, typescript, python, cpp, bash, json })) SyntaxHighlighter.registerLanguage(name, grammar);
 
+/// Stable plugin list: a fresh array would re-parse every message on each render.
+const REMARK_PLUGINS = [remarkGfm];
+
 function CodeBlock({ code, language, light }: { code: string; language: string; light: boolean }) {
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -26,14 +29,21 @@ function CodeBlock({ code, language, light }: { code: string; language: string; 
   </div>;
 }
 
-export default function MarkdownMessage({ content, light }: { content: string; light: boolean }) {
-  return <div className="markdown-message"><ReactMarkdown skipHtml remarkPlugins={[remarkGfm]} components={{
-    img: ({ alt }) => <span className="blocked-remote-media">[远程图片未加载：{alt || 'image'}]</span>,
-    a: ({ children, href }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-    pre: ({ children }) => {
+function MarkdownMessage({ content, light }: { content: string; light: boolean }) {
+  // Component types must keep their identity: a fresh object here makes React
+  // unmount and rebuild every code block (and re-run highlighting) on render.
+  const components = useMemo(() => ({
+    img: ({ alt }: { alt?: string }) => <span className="blocked-remote-media">[远程图片未加载：{alt || 'image'}]</span>,
+    a: ({ children, href }: { children?: ReactNode; href?: string }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
+    pre: ({ children }: { children?: ReactNode }) => {
       const child = Children.only(children) as ReactElement<{ className?: string; children?: ReactNode }>;
       const language = /language-([\w+-]+)/.exec(child.props.className ?? '')?.[1] ?? '';
       return <CodeBlock code={String(child.props.children ?? '').replace(/\n$/, '')} language={language} light={light} />;
     },
-  }}>{content}</ReactMarkdown></div>;
+  }), [light]);
+  return <div className="markdown-message"><ReactMarkdown skipHtml remarkPlugins={REMARK_PLUGINS} components={components}>{content}</ReactMarkdown></div>;
 }
+
+/// Streaming re-renders the timeline on every token; only the growing message
+/// should re-parse, so unchanged history skips markdown + highlighting.
+export default memo(MarkdownMessage);

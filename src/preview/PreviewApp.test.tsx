@@ -1,15 +1,13 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import PreviewApp from './PreviewApp';
-import type { ProposedDiff } from '../api/types';
 import type { ExplorerFile } from '../components/workbenchMock';
 import { LLM_SETTINGS_KEY } from '../settings';
 
 const ipc = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: ipc.invoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: ipc.listen }));
-vi.mock('../components/MonacoDiff', () => ({ default: ({ diff }: { diff: ProposedDiff }) => <section aria-label={`Diff ${diff.path}`}>{diff.after}</section> }));
-vi.mock('../components/MonacoCode', () => ({ default: ({ file }: { file: ExplorerFile }) => <section aria-label={`文件预览 ${file.path}`}>{file.content}</section> }));
+vi.mock('../components/CodeViewer', () => ({ default: ({ file }: { file: ExplorerFile }) => <section aria-label={`文件预览 ${file.path}`}>{file.content}</section> }));
 
 beforeEach(() => localStorage.clear());
 
@@ -122,7 +120,7 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
   render(<PreviewApp />);
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   expect(screen.getByLabelText('选择模型')).toHaveTextContent('deepseek-chat');
-  expect(screen.getByLabelText('会话统计')).toHaveTextContent(/Input.*Output/);
+  expect(screen.getByLabelText('会话统计')).toHaveTextContent(/轮.*步.*tok\/s/);
   expect(screen.getByLabelText('会话统计')).not.toHaveTextContent('上下文用量不可用');
   expect(screen.queryByRole('button', { name: '模型参数' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByLabelText('选择模型'));

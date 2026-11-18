@@ -13,3 +13,9 @@ export function getRenderableContextUsage(
 /// ZCode hides low cache-hit rates in production; the detail popover keeps the
 /// exact value.
 export const CACHE_HIT_RATE_DISPLAY_THRESHOLD = 78;
+
+/// ZCode context meter 同款格式（`Intl` percent + 至多 1 位小数）：0.2%
+/// 显示为 "0.2%" 而不是 Math.round 出的 "0%"，避免把真实小用量误报成 0。
+export function formatContextPercent(ratio: number): string {
+  return new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 }).format(ratio);
+}

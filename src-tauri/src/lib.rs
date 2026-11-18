@@ -3,16 +3,104 @@ mod commands;
 pub mod domain;
 pub mod services;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use tauri::{Emitter, Manager};
+use tokio::sync::mpsc;
 
 use adapters::fs::workspace::WorkspaceService;
-use domain::KernelEvent;
+use domain::{EventData, KernelEvent};
 use services::kernel::{Kernel, EVENT_NAME};
+
+/// Burst window for coalescing kernel events before they reach the webview.
+/// Every `emit_to` costs one JS evaluation on the webview main thread; during
+/// streaming, per-token events arrive faster than the UI can consume them and
+/// starve `invoke` responses (e.g. file preview reads looked permanently
+/// "正在读取文件内容…"). Consecutive same-key stream events merge their token
+/// strings so ordering and payload semantics stay identical.
+const EVENT_FLUSH_WINDOW: Duration = Duration::from_millis(32);
+/// Safety cap so a sustained flood cannot delay the flush loop forever.
+const EVENT_BATCH_LIMIT: usize = 512;
+
+/// Merge `next` into `into` when both are the same kind of streamed text for
+/// the same target. Returns false for any other pair so callers emit in order.
+fn try_merge_stream_event(into: &mut KernelEvent, next: &mut KernelEvent) -> bool {
+    let sequence = next.sequence;
+    let merged = match (&mut into.data, &mut next.data) {
+        (
+            EventData::Content { run_id: into_run, token: into_token, .. },
+            EventData::Content { run_id, token, .. },
+        ) if *into_run == *run_id => {
+            into_token.push_str(token);
+            true
+        }
+        (
+            EventData::Reasoning { run_id: into_run, token: into_token },
+            EventData::Reasoning { run_id, token },
+        ) if *into_run == *run_id => {
+            into_token.push_str(token);
+            true
+        }
+        (
+            EventData::SubagentToken {
+                run_id: into_run,
+                subagent_id: into_subagent,
+                kind: into_kind,
+                token: into_token,
+            },
+            EventData::SubagentToken {
+                run_id,
+                subagent_id,
+                kind,
+                token,
+            },
+        ) if *into_run == *run_id && *into_subagent == *subagent_id && *into_kind == *kind => {
+            into_token.push_str(token);
+            true
+        }
+        _ => false,
+    };
+    if merged {
+        into.sequence = sequence;
+    }
+    merged
+}
+
+/// Drain `rx` for up to the burst window, merging adjacent same-key stream
+/// events into `out`. Event order is preserved: only adjacent same-key token
+/// events collapse into one emission.
+async fn collect_events(
+    rx: &mut mpsc::UnboundedReceiver<KernelEvent>,
+    out: &mut Vec<KernelEvent>,
+) {
+    let deadline = Instant::now() + EVENT_FLUSH_WINDOW;
+    loop {
+        if out.len() >= EVENT_BATCH_LIMIT {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(mut next)) => {
+                let merged = out
+                    .last_mut()
+                    .is_some_and(|last| try_merge_stream_event(last, &mut next));
+                if !merged {
+                    out.push(next);
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
 
 pub fn run() {
     let shutdown_started = Arc::new(AtomicBool::new(false));
@@ -30,9 +118,22 @@ pub fn run() {
         .setup(|app| {
             let path = app.path().app_data_dir()?.join("maestro.sqlite3");
             let handle = app.handle().clone();
+            let (tx, mut rx) = mpsc::unbounded_channel::<KernelEvent>();
             let sink = Arc::new(move |event: KernelEvent| {
-                if let Err(error) = handle.emit_to("main", EVENT_NAME, &event) {
-                    eprintln!("Cannot emit kernel event: {error}");
+                // emit_locked calls this while holding the state lock — the
+                // unbounded send never blocks.
+                let _ = tx.send(event);
+            });
+            tauri::async_runtime::spawn(async move {
+                let mut batch: Vec<KernelEvent> = Vec::new();
+                while let Some(first) = rx.recv().await {
+                    batch.push(first);
+                    collect_events(&mut rx, &mut batch).await;
+                    for event in batch.drain(..) {
+                        if let Err(error) = handle.emit_to("main", EVENT_NAME, &event) {
+                            eprintln!("Cannot emit kernel event: {error}");
+                        }
+                    }
                 }
             });
             // setup is synchronous; SQLite initialization still runs on its OS thread.
@@ -66,6 +167,11 @@ pub fn run() {
             commands::kernel::cancel_agent,
             commands::kernel::abort_chat,
             commands::kernel::resolve_tool_approval,
+            commands::kernel::list_approval_rules,
+            commands::kernel::revoke_approval_rule,
+            commands::credentials::save_provider_credential,
+            commands::credentials::provider_credential_status,
+            commands::credentials::clear_provider_credential,
             commands::kernel::list_runs,
             commands::kernel::list_subagent_traces,
             commands::kernel::cancel_subagent,
@@ -145,4 +251,86 @@ pub fn run() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::SubagentTokenKind;
+
+    fn event(sequence: u64, data: EventData) -> KernelEvent {
+        KernelEvent { sequence, data }
+    }
+
+    fn content(run_id: i64, token: &str) -> EventData {
+        EventData::Content { run_id, session_id: 1, token: token.into() }
+    }
+
+    #[test]
+    fn adjacent_content_tokens_merge_and_keep_the_later_sequence() {
+        let mut first = event(1, content(7, "Hello"));
+        assert!(try_merge_stream_event(&mut first, &mut event(2, content(7, " world"))));
+        match &first.data {
+            EventData::Content { token, run_id, .. } => {
+                assert_eq!(token, "Hello world");
+                assert_eq!(*run_id, 7);
+            }
+            other => panic!("expected content, got {other:?}"),
+        }
+        assert_eq!(first.sequence, 2);
+    }
+
+    #[test]
+    fn different_targets_and_kinds_do_not_merge() {
+        let mut base = event(1, content(7, "a"));
+        assert!(!try_merge_stream_event(&mut base.clone(), &mut event(2, content(8, "b"))));
+        assert!(!try_merge_stream_event(
+            &mut base,
+            &mut event(2, EventData::Reasoning { run_id: 7, token: "r".into() }),
+        ));
+        assert!(!try_merge_stream_event(
+            &mut event(
+                1,
+                EventData::SubagentToken {
+                    run_id: 7,
+                    subagent_id: "s1".into(),
+                    kind: SubagentTokenKind::Content,
+                    token: "x".into(),
+                },
+            ),
+            &mut event(
+                2,
+                EventData::SubagentToken {
+                    run_id: 7,
+                    subagent_id: "s1".into(),
+                    kind: SubagentTokenKind::Reasoning,
+                    token: "y".into(),
+                },
+            ),
+        ));
+    }
+
+    #[tokio::test]
+    async fn collect_events_preserves_order_and_merges_only_adjacent_tokens() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<KernelEvent>();
+        tx.send(event(1, content(7, "a"))).unwrap();
+        tx.send(event(2, content(7, "b"))).unwrap();
+        tx.send(event(3, EventData::SessionsChanged)).unwrap();
+        tx.send(event(4, content(7, "c"))).unwrap();
+        drop(tx);
+        let mut out = Vec::new();
+        collect_events(&mut rx, &mut out).await;
+        assert_eq!(out.len(), 3);
+        match &out[0].data {
+            EventData::Content { token, .. } => assert_eq!(token, "ab"),
+            other => panic!("expected merged content, got {other:?}"),
+        }
+        assert!(matches!(out[1].data, EventData::SessionsChanged));
+        match &out[2].data {
+            EventData::Content { token, .. } => assert_eq!(token, "c"),
+            other => panic!("expected content, got {other:?}"),
+        }
+        assert_eq!(out[0].sequence, 2);
+        assert_eq!(out[2].sequence, 4);
+    }
 }

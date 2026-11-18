@@ -1,9 +1,9 @@
 /// Dumb chat stream: renders conversation turns, tool-call blocks, reasoning
 /// panes and plan cards. Everything arrives as props — no IPC, no stores.
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { BrainCircuit, ChevronDown, ChevronRight, Clock3, Copy, Pencil, ThumbsDown, ThumbsUp, WandSparkles, Wrench } from 'lucide-react';
 
-import type { ApprovalDecision, CommandScope, ContextCompaction, PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
+import type { ApprovalDecision, CommandScope, ContextCompaction, PersistedPart, PersistedReasoning, PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
 import { relativeTime, type ReasoningSegment, type TimelineItem } from '../lib/conversation';
 import type { UiPreferences } from '../uiPreferences';
 import CollapsibleBlock from './CollapsibleBlock';
@@ -85,13 +85,17 @@ function ExecutionGroup({ timeline, running, children }: { timeline: TimelineIte
   const label = ms > 0
     ? `${seconds >= 60 ? `思考 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `思考 ${seconds} 秒`} · ${tools} 个工具`
     : `已执行 ${tools} 个工具`;
-  return <div className={`execution-group ${open ? 'open' : ''}`}>
-    <button type="button" className="execution-summary" aria-expanded={open}
-      onClick={() => { manual.current = true; setOpen((value) => !value); }}>
-      <Clock3 size={12} /><span>{label}</span><ChevronRight size={12} className="execution-chevron" />
-    </button>
-    <div className="execution-body" aria-hidden={!open}>{children}</div>
-  </div>;
+  return <>
+    <div className={`execution-group ${open ? 'open' : ''}`}>
+      <button type="button" className="execution-summary" aria-expanded={open}
+        onClick={() => { manual.current = true; setOpen((value) => !value); }}>
+        <Clock3 size={12} /><span>{label}</span><ChevronRight size={12} className="execution-chevron" />
+      </button>
+      <div className="execution-body" aria-hidden={!open}>{children}</div>
+    </div>
+    {/* ZCode 式段落分隔线：每个思考/工具执行段结束后用细线划界。 */}
+    <div className="timeline-divider" aria-hidden="true" />
+  </>;
 }
 
 /// Copy / feedback / timestamp under the final answer. Votes are local UI state
@@ -137,12 +141,25 @@ function TurnCard({ run, calls, preview }: { run: RunView; calls: ToolCallView[]
   </>;
 }
 
-export default function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById, footer, compactions = [] }: {
+/// Persisted parts map 1:1 to the live timeline, so replay uses the exact same
+/// renderer (and therefore the exact same interleaving) as a live run.
+function partsToTimeline(parts?: PersistedPart[]): TimelineItem[] | undefined {
+  if (!parts?.length) return undefined;
+  return parts.map((part) => part.kind === 'reasoning'
+    ? { kind: 'reasoning', segment: { text: part.text ?? '', startedAt: part.startedAt, ...(part.endedAt == null ? {} : { endedAt: part.endedAt }) } }
+    : part.kind === 'tool'
+      ? { kind: 'tool', index: part.index ?? 0 }
+      : { kind: 'content', text: part.text ?? '' });
+}
+
+const ChatStream = memo(function ChatStream({ historyRef, onScroll, runs, loadingSession, detailTools, detailReasoning, detailParts, liveTools, liveTimeline, plans, reasoningDisplay, theme, preview, messageAttachments, pending, onCopyError, onReviewPlan, onDecidePlan, onSelectFile, onEditPrompt, onJumpToTurn, onOpenFile, onResolveApproval, onOpenSubagent, subagentById, footer, compactions = [] }: {
   historyRef: RefObject<HTMLDivElement | null>;
   onScroll: () => void;
   runs: RunView[];
   loadingSession: boolean;
   detailTools: ToolCallView[] | undefined;
+  detailReasoning?: Record<number, PersistedReasoning[]>;
+  detailParts?: Record<number, PersistedPart[]>;
   liveTools?: Record<number, ToolCallView[]>;
   liveTimeline?: Record<number, TimelineItem[]>;
   plans: Plan[];
@@ -198,11 +215,18 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
       const rootTop = root.getBoundingClientRect().top;
       const nodes = root.querySelectorAll<HTMLElement>('[data-turn-id]');
       let active: number | null = null;
-      for (const node of nodes) {
-        if (node.getBoundingClientRect().top <= rootTop + 48) active = Number(node.dataset.turnId);
-        else break;
+      // 触底时最后一轮直接认领指示器：较短的最新轮其顶部不一定越过下方
+      // +48px spy 阈值，否则刻度永远停在倒数第二个（scroll-spy bottom-snap）。
+      const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 48;
+      if (atBottom && nodes.length) {
+        active = Number(nodes[nodes.length - 1].dataset.turnId);
+      } else {
+        for (const node of nodes) {
+          if (node.getBoundingClientRect().top <= rootTop + 48) active = Number(node.dataset.turnId);
+          else break;
+        }
+        if (active === null && nodes.length) active = Number(nodes[0].dataset.turnId);
       }
-      if (active === null && nodes.length) active = Number(nodes[0].dataset.turnId);
       setActiveRunId((current) => (current === active ? current : active));
     };
     const handleScroll = () => {
@@ -267,7 +291,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
           const body = cleanRunOutput(content);
           const liveCalls = liveTools?.[run.id] ?? [];
           const calls = liveCalls.length ? liveCalls : (detailTools ?? []).filter((call) => call.runId === run.id);
-          const timeline = liveTimeline?.[run.id];
+          const timeline = liveTimeline?.[run.id] ?? partsToTimeline(detailParts?.[run.id]);
           // Historical runs have no persisted segmentation: fall back to the
           // audit tool list plus one inline-thinking block.
           return <>
@@ -287,7 +311,7 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
                     : <ExecutionGroup key={block.key} timeline={block.items!} running={run.status === 'running' && index === blocks.length - 1}>
                         {block.items!.map((item, itemIndex) => {
                           if (item.kind === 'reasoning') return <ReasoningNode key={`r${itemIndex}`} segment={item.segment} display={reasoningDisplay} />;
-                          const call = item.kind === 'tool' ? liveCalls[item.index] : undefined;
+                          const call = item.kind === 'tool' ? (liveCalls[item.index] ?? calls[item.index]) : undefined;
                           return call ? <div key={`t${itemIndex}`} className="tool-events" role="list" aria-label="工具调用明细"><ToolCallRow call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onResolveApproval={onResolveApproval} onOpenSubagent={onOpenSubagent} subagent={call.subagentId ? subagentById?.(call.subagentId) : undefined} /></div> : null;
                         })}
                       </ExecutionGroup>)}
@@ -296,7 +320,25 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
                 </>;
               })()
               : <>
-                {calls.length > 0 && <ToolCallBlocks calls={calls} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} subagentById={subagentById} />}
+                {calls.length > 0 && (() => {
+                  // Historical runs have no persisted segmentation, but replay
+                  // must still fold the tool rows like the live layout instead of
+                  // dumping every call as a flat list.
+                  const segments = detailReasoning?.[run.id] ?? [];
+                  const items: TimelineItem[] = [
+                    ...segments.map((segment) => ({
+                      kind: 'reasoning' as const,
+                      segment: { text: segment.text, startedAt: segment.startedAt, ...(segment.endedAt == null ? {} : { endedAt: segment.endedAt }) },
+                    })),
+                    ...calls.map((_, index) => ({ kind: 'tool' as const, index })),
+                  ];
+                  return <ExecutionGroup timeline={items} running={false}>
+                    {segments.map((segment, index) => <ReasoningNode key={`r${index}`} segment={{ text: segment.text, startedAt: segment.startedAt, ...(segment.endedAt == null ? {} : { endedAt: segment.endedAt }) }} display={reasoningDisplay} />)}
+                    {calls.map((call, index) => <div key={`t${index}`} className="tool-events" role="list" aria-label="工具调用明细">
+                      <ToolCallRow call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} subagent={call.subagentId ? subagentById?.(call.subagentId) : undefined} />
+                    </div>)}
+                  </ExecutionGroup>;
+                })()}
                 {inlineReasoning && reasoningDisplay !== 'hidden' &&
                   <CollapsibleBlock title="思考" icon={<BrainCircuit size={13} />} contentClass="reasoning-content"><ReasoningText text={inlineReasoning} streaming={false} /></CollapsibleBlock>}
               </>}
@@ -322,4 +364,6 @@ export default function ChatStream({ historyRef, onScroll, runs, loadingSession,
       </div>
     </div>
   </div>;
-}
+});
+
+export default ChatStream;

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{atomic::{AtomicU64, Ordering}, Arc},
 };
@@ -10,20 +10,29 @@ use std::sync::Mutex as StdMutex;
 
 use crate::{
     adapters::{
+        credentials::CredentialStore,
         db::Database,
         llm::{provider_for, ChatConfig, LlmProvider, ProviderResolver},
     },
     domain::{
+        command_policy,
         policy::{self, ToolEffect, ToolGate},
         AppResult, ChatMessage, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft,
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
-        format_answers, parse_questions, validate_answers, ApprovalCandidate, ApprovalDecision, ApprovalRule,
-        ContextCompaction,
+        format_answers, parse_questions, validate_answers, ApprovalCandidate, ApprovalDecision, ApprovalRule, ReasoningSegment, RunPart,
+        canonical_json, ContextCompaction, MAX_RULE_PATTERN_CHARS,
         CommandScope, Question, QuestionAnswer, RunMessage, SubagentStatus,
         SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
     },
-    services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
+    services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter, WriteBaseline}},
 };
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
 
 pub const EVENT_NAME: &str = "kernel-event";
 pub type EventSink = Arc<dyn Fn(KernelEvent) + Send + Sync>;
@@ -65,6 +74,15 @@ static QUESTION_SEQ: AtomicU64 = AtomicU64::new(1);
 /// last turn.
 #[derive(Default)]
 struct MetricsAccumulator {
+    /// Identity of the reporting stream, kept so a tool-close snapshot can
+    /// re-emit the same cumulative row without a model turn in flight.
+    run_id: i64,
+    session_id: i64,
+    provider: String,
+    model: String,
+    /// Last prompt size the provider ever reported. Metrics arrive before usage
+    /// exists, so the projection must never regress to `None` once known.
+    last_known_input: Option<u64>,
     input: Option<u64>,
     output: Option<u64>,
     cache: Option<u64>,
@@ -72,8 +90,24 @@ struct MetricsAccumulator {
     reasoning: Option<u64>,
     attempts: u32,
     elapsed: u64,
+    /// Σ 首 token 延迟，只覆盖记录了首 delta 的完成请求（DSH ttftSteps 口径）。
     first: u64,
+    ttft_steps: u32,
+    /// Σ decode 窗口（首 delta → 流结束），只在「首 token 与 output usage
+    /// 同有」的请求上成对累计 —— DSH sessionStats decodeMs/decodeTokens。
+    decode_ms: u64,
+    decode_tokens: u64,
+    /// Σ 工具墙钟：emit_tool_scoped 的 Started→终态配对（DSH tool/call→result）。
+    tool_ms: u64,
+    /// 未完成工具调用的 Started 时刻队列；终态按 FIFO 配对（事件本就按序发出）。
+    tool_starts: VecDeque<i64>,
+    /// 最近一次完成请求的快照字段，供工具配对快照与持久化使用。
+    last_output: Option<u64>,
+    last_elapsed: u64,
+    last_first: Option<u64>,
     current: Option<RunMetrics>,
+    /// 自上次持久化后 tool_ms 有新增：finish 时补一次最终落库。
+    dirty: bool,
 }
 
 fn sum_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -92,6 +126,12 @@ struct RuntimeState {
     /// the source of truth the agent loop polls.
     cancelled_run: Option<i64>,
     sequence: u64,
+    /// Reasoning bursts of the active run; persisted on finish so replay can
+    /// still show "思考 X 秒" after a restart.
+    reasoning: Vec<ReasoningSegment>,
+    /// Ordered timeline parts of the active run (ZCode-style parts).
+    parts: Vec<RunPart>,
+    reasoning_run: Option<i64>,
     shutting_down: bool,
     storage_failed: bool,
 }
@@ -113,12 +153,15 @@ pub struct Kernel {
     metrics_acc: StdMutex<HashMap<i64, MetricsAccumulator>>,
     /// Session-scoped "always allow" rules; cleared when the app exits.
     approval_rules: StdMutex<HashMap<i64, Vec<ApprovalRule>>>,
+    /// Provider API keys at rest (DPAPI on Windows); the webview never persists them.
+    credentials: CredentialStore,
 }
 
 impl Kernel {
     pub async fn open(path: PathBuf, maestro_dir: PathBuf, sink: EventSink) -> AppResult<Arc<Self>> {
         let database = Arc::new(Database::open(path).await?);
         let last_run = database.list_runs().await?.into_iter().next();
+        let credentials = CredentialStore::open(&maestro_dir.join("credentials"))?;
         let kernel = Arc::new(Self {
             router: ToolRouter::new(maestro_dir, database.clone())?,
             database,
@@ -129,6 +172,9 @@ impl Kernel {
                 control: None,
                 cancelled_run: None,
                 sequence: 0,
+                reasoning: Vec::new(),
+                parts: Vec::new(),
+                reasoning_run: None,
                 shutting_down: false,
                 storage_failed: false,
             }),
@@ -139,6 +185,7 @@ impl Kernel {
             subagent_cancels: StdMutex::new(HashMap::new()),
             metrics_acc: StdMutex::new(HashMap::new()),
             approval_rules: StdMutex::new(HashMap::new()),
+            credentials,
         });
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
         Ok(kernel)
@@ -146,6 +193,10 @@ impl Kernel {
 
     pub fn extensions(&self) -> &ExtensionManager {
         self.router.extensions()
+    }
+
+    pub fn credentials(&self) -> &CredentialStore {
+        &self.credentials
     }
 
     /// Startup restore for MCP servers the user left enabled. Failures stay
@@ -313,6 +364,21 @@ impl Kernel {
     }
 
     pub async fn cancel(&self, run_id: i64) -> AppResult<()> {
+        // Cascade first: child subagents must stop even when the parent run is
+        // already gone (otherwise a stopped run leaves orphaned children).
+        let senders: Vec<_> = self.subagent_cancels.lock().unwrap().values().cloned().collect();
+        for sender in senders {
+            let _ = sender.send(true);
+        }
+        {
+            let mut map = self.subagents.lock().unwrap();
+            for view in map.values_mut() {
+                if view.status == SubagentStatus::Running {
+                    view.status = SubagentStatus::Cancelled;
+                    view.finished_at = Some(crate::domain::unix_now());
+                }
+            }
+        }
         // Cancellation must never queue behind the command gate: a long
         // mutating command would otherwise make "stop" feel dead.
         let mut state = self.state.lock().await;
@@ -405,6 +471,21 @@ impl Kernel {
     ) {
         let mut state = self.state.lock().await;
         if Self::active_run_locked(&state, run_id).is_ok() {
+            if phase == ToolPhase::Started {
+                if let Some(part) = state.parts.last_mut() {
+                    if part.ended_at.is_none() {
+                        part.ended_at = Some(now_ms());
+                    }
+                }
+                let index = state.parts.iter().filter(|part| part.kind == "tool").count();
+                state.parts.push(RunPart {
+                    kind: "tool".into(),
+                    text: String::new(),
+                    index: Some(index),
+                    started_at: now_ms(),
+                    ended_at: None,
+                });
+            }
             self.emit_locked(
                 &mut state,
                 EventData::ToolCall {
@@ -429,6 +510,40 @@ impl Kernel {
         if let Some(id) = subagent_id {
             self.subagent_tool(run_id, id, tool, phase, detail).await;
             return;
+        }
+        // DSH tool/call→tool/result 口径：父级工具按 Started→终态（Finished/
+        // Failed/Blocked）FIFO 配对累计墙钟；ask_user 是用户等待而非工具执行，
+        // spawn_subagent 走 emit_spawn 独立路径，均不计入 tool_ms。
+        if tool != "ask_user" {
+            let snapshot = {
+                let mut map = self.metrics_acc.lock().unwrap();
+                // 工具可能早于首个 metrics 报告到达（首个请求 <200ms 完成即派
+                // 工具），此时 acc 尚无身份：照样记录配对，只在已有身份的 acc
+                // 上 emit 快照，避免发出 run_id=0 的空 Metrics。
+                let acc = map.entry(run_id).or_default();
+                let now = now_ms();
+                let mut snapshot = None;
+                match phase {
+                    ToolPhase::Started => acc.tool_starts.push_back(now),
+                    ToolPhase::Finished | ToolPhase::Failed | ToolPhase::Blocked => {
+                        if let Some(started) = acc.tool_starts.pop_front() {
+                            acc.tool_ms += now.saturating_sub(started) as u64;
+                            acc.dirty = true;
+                            if acc.run_id != 0 {
+                                snapshot = Some(Self::metrics_view(acc));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                snapshot
+            };
+            if let Some(metrics) = snapshot {
+                let mut state = self.state.lock().await;
+                if Self::active_run_locked(&state, run_id).is_ok() {
+                    self.emit_locked(&mut state, EventData::Metrics { metrics });
+                }
+            }
         }
         let mut state = self.state.lock().await;
         if Self::active_run_locked(&state, run_id).is_ok() {
@@ -455,12 +570,18 @@ impl Kernel {
 
     /// Stop one child without touching its siblings or the parent run.
     pub async fn cancel_subagent(&self, run_id: i64, subagent_id: &str) -> AppResult<()> {
-        {
-            let state = self.state.lock().await;
-            Self::active_run_locked(&state, run_id)?;
-        }
+        // The stop button must work even after the parent run finished: the
+        // child keeps its own cancel handle and status.
+        let _ = run_id;
         if let Some(sender) = self.subagent_cancels.lock().unwrap().get(subagent_id) {
             let _ = sender.send(true);
+        }
+        let mut map = self.subagents.lock().unwrap();
+        if let Some(view) = map.get_mut(subagent_id) {
+            if view.status == SubagentStatus::Running {
+                view.status = SubagentStatus::Cancelled;
+                view.finished_at = Some(crate::domain::unix_now());
+            }
         }
         Ok(())
     }
@@ -554,6 +675,12 @@ impl Kernel {
         content: String,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        first_token_ms: Option<u64>,
+        elapsed_ms: u64,
+        decode_ms: u64,
+        decode_tokens: u64,
+        last_input_tokens: Option<u64>,
     ) -> AppResult<()> {
         let mut view = self
             .subagents
@@ -562,6 +689,9 @@ impl Kernel {
             .get(subagent_id)
             .cloned()
             .ok_or("Subagent trace not found")?;
+        if matches!(view.status, SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Cancelled) {
+            return Ok(());
+        }
         let finished_at = crate::domain::unix_now();
         view.status = status;
         view.summary = summary.clone();
@@ -570,6 +700,12 @@ impl Kernel {
         view.tool_count = view.tools.len();
         view.input_tokens = input_tokens.or(view.input_tokens);
         view.output_tokens = output_tokens.or(view.output_tokens);
+        view.reasoning_tokens = reasoning_tokens.or(view.reasoning_tokens);
+        view.first_token_ms = first_token_ms.or(view.first_token_ms);
+        view.elapsed_ms = elapsed_ms;
+        view.decode_ms = decode_ms;
+        view.decode_tokens = decode_tokens;
+        view.last_input_tokens = last_input_tokens.or(view.last_input_tokens);
         view.finished_at = Some(finished_at);
         self.database
             .finish_subagent_trace(
@@ -581,6 +717,12 @@ impl Kernel {
                 view.tools.clone(),
                 view.input_tokens,
                 view.output_tokens,
+                view.reasoning_tokens,
+                view.first_token_ms,
+                view.elapsed_ms,
+                view.decode_ms,
+                view.decode_tokens,
+                view.last_input_tokens,
                 finished_at,
             )
             .await?;
@@ -602,6 +744,12 @@ impl Kernel {
                     tool_count: view.tool_count,
                     input_tokens: view.input_tokens,
                     output_tokens: view.output_tokens,
+                    reasoning_tokens: view.reasoning_tokens,
+                    first_token_ms: view.first_token_ms,
+                    elapsed_ms: view.elapsed_ms,
+                    decode_ms: view.decode_ms,
+                    decode_tokens: view.decode_tokens,
+                    last_input_tokens: view.last_input_tokens,
                     finished_at,
                 },
             );
@@ -675,8 +823,7 @@ impl Kernel {
             .list_compactions(session_id)
             .await?
             .into_iter()
-            .filter(|item| item.status == "completed")
-            .last())
+            .rfind(|item| item.status == "completed"))
     }
 
     pub async fn list_subagent_traces(&self, session_id: i64) -> AppResult<Vec<SubagentView>> {
@@ -744,7 +891,7 @@ impl Kernel {
             self.emit_tool(run_id, tool, ToolPhase::Blocked, &reason).await;
             return Err(reason);
         }
-        let text = self.router.execute(run.session_id, tool, "{}").await?.text;
+        let text = self.router.execute(run.session_id, tool, "{}", None).await?.text;
         self.database
             .record_tool(run_id, tool.into(), "read-only".into(), true)
             .await?;
@@ -802,7 +949,7 @@ impl Kernel {
             let mut rules = self.approval_rules.lock().unwrap();
             let entry = rules.entry(pending.session_id).or_default();
             for candidate in &pending.candidates {
-                let rule = ApprovalRule::from_candidate(candidate, command_scope);
+                let Some(rule) = ApprovalRule::from_candidate(candidate, command_scope) else { continue };
                 if !entry.contains(&rule) {
                     entry.push(rule);
                 }
@@ -907,20 +1054,40 @@ impl Kernel {
         Ok(())
     }
 
+    fn command_arg(arguments_json: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(arguments_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .map(str::to_string)
+            })
+    }
+
     fn approval_candidate(tool: &str, arguments_json: &str) -> ApprovalCandidate {
         let value: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
         let command = (tool == "run_command")
             .then(|| value.get("command").and_then(|item| item.as_str()).map(str::to_string))
             .flatten();
-        let target = if let Some(command) = &command {
-            command.clone()
+        let (target, scopable) = if let Some(command) = &command {
+            (command.clone(), true)
         } else if tool.starts_with("mcp__") {
-            String::new()
+            // MCP calls have no single "target" argument: the whole canonical
+            // argument set is the identity, so a different argument set never
+            // reuses an earlier approval.
+            let canonical = canonical_json(&value);
+            let bounded = canonical.chars().count() <= MAX_RULE_PATTERN_CHARS;
+            (if bounded { canonical } else { String::new() }, bounded)
         } else {
-            ToolRouter::call_target(tool, arguments_json)
+            let path = value.get("path").and_then(|item| item.as_str()).map(str::to_string);
+            (
+                path.unwrap_or_else(|| ToolRouter::call_target(tool, arguments_json)),
+                true,
+            )
         };
-        ApprovalCandidate { tool: tool.into(), target, command }
+        ApprovalCandidate { tool: tool.into(), target, command, scopable }
     }
 
     fn is_auto_approved(&self, session_id: i64, candidate: &ApprovalCandidate) -> bool {
@@ -929,6 +1096,49 @@ impl Kernel {
             .unwrap()
             .get(&session_id)
             .is_some_and(|rules| rules.iter().any(|rule| rule.matches(candidate)))
+    }
+
+    /// Session-scoped rules currently in force, for display and revocation.
+    /// Addressed by run id so the UI never has to trust a session it inferred.
+    pub async fn list_approval_rules(&self, run_id: i64) -> AppResult<Vec<ApprovalRule>> {
+        let session_id = self.session_for_run(run_id).await?;
+        Ok(self
+            .approval_rules
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn revoke_approval_rule(&self, run_id: i64, rule: &ApprovalRule) -> AppResult<bool> {
+        let session_id = self.session_for_run(run_id).await?;
+        let mut rules = self.approval_rules.lock().unwrap();
+        let Some(entry) = rules.get_mut(&session_id) else { return Ok(false) };
+        let before = entry.len();
+        entry.retain(|item| item != rule);
+        Ok(entry.len() != before)
+    }
+
+    async fn session_for_run(&self, run_id: i64) -> AppResult<i64> {
+        if let Some(session_id) = self
+            .state
+            .lock()
+            .await
+            .active_run
+            .as_ref()
+            .filter(|run| run.id == run_id)
+            .map(|run| run.session_id)
+        {
+            return Ok(session_id);
+        }
+        self.database
+            .list_runs()
+            .await?
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .map(|run| run.session_id)
+            .ok_or_else(|| "运行记录不存在".to_string())
     }
 
     /// Execute one model-requested tool call: classify, apply the mode gate
@@ -1012,19 +1222,24 @@ impl Kernel {
         let mut gates = Vec::with_capacity(calls.len());
         let mut suspended = Vec::new();
         let mut auto_approved = Vec::new();
+        let mut read_only_allowlisted = Vec::with_capacity(calls.len());
         let mut candidates = Vec::new();
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             let target = ToolRouter::call_target(tool, arguments_json);
             self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
             let candidate = Self::approval_candidate(tool, arguments_json);
+            let command = Self::command_arg(arguments_json);
+            read_only_allowlisted.push(
+                tool == "run_command"
+                    && command.as_deref().is_some_and(command_policy::is_read_only_safe),
+            );
+            // A historical "always allow" rule only waives an approval that the
+            // current mode would otherwise demand. It can never lift a mode's
+            // absolute denial (Plan), so the gate is resolved first.
             let auto = self.is_auto_approved(run.session_id, &candidate);
             let gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
-                Ok(effect) if auto => {
-                    auto_approved.push(index);
-                    Gate::Allow(effect)
-                }
-                Ok(effect) => match policy::gate_with_args(mode, effect, serde_json::from_str::<serde_json::Value>(arguments_json).ok().and_then(|value| value.get("command").and_then(|command| command.as_str()).map(str::to_string)).as_deref()) {
+                Ok(effect) => match policy::gate_call(mode, effect, command.as_deref()) {
                     ToolGate::Deny => Gate::Denied(
                         self.block_tool_scoped(
                             run_id,
@@ -1034,6 +1249,10 @@ impl Kernel {
                         )
                         .await,
                     ),
+                    ToolGate::RequireApproval if auto => {
+                        auto_approved.push(index);
+                        Gate::Allow(effect)
+                    }
                     ToolGate::RequireApproval => {
                         suspended.push(index);
                         candidates.push(candidate);
@@ -1046,6 +1265,16 @@ impl Kernel {
         }
         // Phase 2: one shared suspension — every gated call reports
         // AwaitingApproval (with its own preview) before the single wait.
+        // Snapshot write targets before the card is shown, so an edit made
+        // while the user decides is detected instead of overwritten.
+        let mut baselines: Vec<(usize, WriteBaseline)> = Vec::new();
+        for &index in &suspended {
+            let baseline = self
+                .router
+                .write_baseline(&calls[index].0, &calls[index].1)
+                .await;
+            baselines.push((index, baseline));
+        }
         let (approved, feedback) = if suspended.is_empty() {
             (true, None)
         } else {
@@ -1092,7 +1321,7 @@ impl Kernel {
             && gates.iter().all(|gate| matches!(gate, Gate::Allow(ToolEffect::ReadOnly)))
         {
             let outcomes = futures_util::future::join_all(
-                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json)),
+                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json, None)),
             )
             .await;
             let mut results = Vec::with_capacity(calls.len());
@@ -1134,13 +1363,24 @@ impl Kernel {
                     results.push(self.block_tool_scoped(run_id, subagent_id, tool, reason).await);
                 }
                 Gate::Allow(effect) | Gate::Suspended(effect) => {
-                    let audit = if auto_approved.contains(&index) {
-                        "auto-approved"
-                    } else if suspended.contains(&index) {
-                        "user approved"
-                    } else {
-                        "extension"
-                    };
+                    // An approved write must still match what the user saw.
+                    if suspended.contains(&index) {
+                        if let Some((_, baseline)) = baselines.iter().find(|(call, _)| *call == index) {
+                            if let Err(conflict) = self
+                                .router
+                                .verify_write_baseline(tool, arguments_json, baseline)
+                                .await
+                            {
+                                results.push(self.block_tool_scoped(run_id, subagent_id, tool, conflict).await);
+                                continue;
+                            }
+                        }
+                    }
+                    let audit = Self::audit_label(
+                        auto_approved.contains(&index),
+                        suspended.contains(&index),
+                        read_only_allowlisted.get(index).copied().unwrap_or(false),
+                    );
                     let target = ToolRouter::call_target(tool, arguments_json);
                     results.push(
                         self.finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, audit, *effect)
@@ -1151,6 +1391,20 @@ impl Kernel {
         }
         results
     }
+
+/// Why a call ran without a prompt. A historical rule and an explicit user
+/// decision are stronger evidence than the read-only allowlist.
+fn audit_label(auto_approved: bool, suspended: bool, read_only_allowlisted: bool) -> &'static str {
+    if auto_approved {
+        "auto-approved"
+    } else if suspended {
+        "user approved"
+    } else if read_only_allowlisted {
+        "read-only allowlist"
+    } else {
+        "extension"
+    }
+}
 
 fn apply_trace_tool(view: &mut SubagentView, tool: &str, phase: ToolPhase, detail: &str) {
     let pending = view
@@ -1229,6 +1483,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
 
     /// Execute the routed call, audit the terminal result, emit
     /// Finished/Failed and refresh the workspace on any side effect.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_tool(
         &self,
         run_id: i64,
@@ -1240,11 +1495,23 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         audit: &str,
         effect: ToolEffect,
     ) -> AppResult<String> {
-        let outcome = self.router.execute(session_id, tool, arguments_json).await;
+        // A running command must stop when the user stops the run, instead of
+        // waiting out its timeout: hand the exec adapter the run's cancel signal.
+        let cancel = {
+            let state = self.state.lock().await;
+            state
+                .active_run
+                .as_ref()
+                .filter(|active| active.id == run_id)
+                .and_then(|_| state.control.as_ref())
+                .map(|control| control.cancel.subscribe())
+        };
+        let outcome = self.router.execute(session_id, tool, arguments_json, cancel).await;
         self.finish_tool_outcome(run_id, session_id, subagent_id, tool, target, audit, effect, outcome)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_tool_outcome(
         &self,
         run_id: i64,
@@ -1554,6 +1821,28 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         if Self::active_run_locked(&state, run_id).is_err() {
             return;
         }
+        if state.reasoning_run != Some(run_id) {
+            state.reasoning.clear();
+            state.reasoning_run = Some(run_id);
+        }
+        match state.reasoning.last_mut() {
+            Some(segment) if segment.ended_at.is_none() => segment.text.push_str(&token),
+            _ => state.reasoning.push(ReasoningSegment {
+                text: token.clone(),
+                started_at: now_ms(),
+                ended_at: None,
+            }),
+        }
+        match state.parts.last_mut() {
+            Some(part) if part.kind == "reasoning" && part.ended_at.is_none() => part.text.push_str(&token),
+            _ => state.parts.push(RunPart {
+                kind: "reasoning".into(),
+                text: token.clone(),
+                index: None,
+                started_at: now_ms(),
+                ended_at: None,
+            }),
+        }
         self.emit_locked(
             &mut state,
             EventData::Reasoning { run_id, token },
@@ -1571,6 +1860,26 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         {
             return;
         }
+        if let Some(segment) = state.reasoning.last_mut() {
+            if segment.ended_at.is_none() {
+                segment.ended_at = Some(now_ms());
+            }
+        }
+        if let Some(part) = state.parts.last_mut() {
+            if part.kind == "reasoning" && part.ended_at.is_none() {
+                part.ended_at = Some(now_ms());
+            }
+        }
+        match state.parts.last_mut() {
+            Some(part) if part.kind == "content" => part.text.push_str(&token),
+            _ => state.parts.push(RunPart {
+                kind: "content".into(),
+                text: token.clone(),
+                index: None,
+                started_at: now_ms(),
+                ended_at: None,
+            }),
+        }
         if let Some(run) = state.active_run.as_mut().filter(|run| run.id == run_id) {
             run.output.push_str(&token);
             let session_id = run.session_id;
@@ -1585,12 +1894,62 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         }
     }
 
+    /// 由累加器重建累计视图（DSH sessionStats 口径）：last_* 是最近一次
+    /// 完成请求的快照，成对的 decode/ttft 字段只计完成请求。
+    fn metrics_view(acc: &MetricsAccumulator) -> RunMetrics {
+        RunMetrics {
+            run_id: acc.run_id,
+            session_id: acc.session_id,
+            provider: acc.provider.clone(),
+            model: acc.model.clone(),
+            input_tokens: acc.input,
+            output_tokens: acc.output,
+            cache_hit_tokens: acc.cache,
+            cache_write_tokens: acc.cache_write,
+            reasoning_tokens: acc.reasoning,
+            attempts: acc.attempts,
+            last_input_tokens: acc.last_known_input,
+            last_output_tokens: acc.last_output,
+            last_elapsed_ms: acc.last_elapsed,
+            last_first_token_ms: acc.last_first,
+            elapsed_ms: acc.elapsed,
+            first_token_ms: Some(acc.first),
+            ttft_steps: acc.ttft_steps,
+            decode_ms: acc.decode_ms,
+            decode_tokens: acc.decode_tokens,
+            tool_ms: acc.tool_ms,
+            live_surface_tokens: None,
+        }
+    }
+
     /// Streaming metrics updates reach the UI as events; only the terminal
     /// report is durable in SQLite.
     pub(crate) async fn report_metrics(&self, metrics: RunMetrics, persist: bool) -> AppResult<()> {
+        self.report_metrics_inner(metrics, persist, true).await
+    }
+
+    /// 子智能体调用的 usage 折进父 run 累计桶，但它的 prompt 属于子会话
+    /// 自己的上下文窗口，不能覆盖父会话的 context pressure（ZCode
+    /// `shouldUseModelUsageForContext`：只有主会话请求的 inputTokens 才
+    /// 代表可见上下文）——否则子调用的小 prompt 会把上下文环打成 0%。
+    pub(crate) async fn report_subagent_metrics(&self, metrics: RunMetrics, persist: bool) -> AppResult<()> {
+        self.report_metrics_inner(metrics, persist, false).await
+    }
+
+    async fn report_metrics_inner(&self, metrics: RunMetrics, persist: bool, main_conversation: bool) -> AppResult<()> {
         let cumulative = {
             let mut map = self.metrics_acc.lock().unwrap();
             let acc = map.entry(metrics.run_id).or_default();
+            acc.run_id = metrics.run_id;
+            acc.session_id = metrics.session_id;
+            acc.provider = metrics.provider.clone();
+            acc.model = metrics.model.clone();
+            let last_known_input = if main_conversation {
+                metrics.input_tokens.or(acc.last_known_input)
+            } else {
+                acc.last_known_input
+            };
+            acc.last_known_input = last_known_input;
             if persist {
                 acc.input = sum_tokens(acc.input, metrics.input_tokens);
                 acc.output = sum_tokens(acc.output, metrics.output_tokens);
@@ -1599,28 +1958,35 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
                 acc.reasoning = sum_tokens(acc.reasoning, metrics.reasoning_tokens);
                 acc.attempts += 1;
                 acc.elapsed += metrics.elapsed_ms;
-                acc.first += metrics.first_token_ms.unwrap_or(0);
-                acc.current = None;
-                RunMetrics {
-                    run_id: metrics.run_id,
-                    session_id: metrics.session_id,
-                    provider: metrics.provider.clone(),
-                    model: metrics.model.clone(),
-                    input_tokens: acc.input,
-                    output_tokens: acc.output,
-                    cache_hit_tokens: acc.cache,
-                    cache_write_tokens: acc.cache_write,
-                    reasoning_tokens: acc.reasoning,
-                    attempts: acc.attempts,
-                    last_input_tokens: metrics.input_tokens,
-                    last_output_tokens: metrics.output_tokens,
-                    last_elapsed_ms: metrics.elapsed_ms,
-                    last_first_token_ms: metrics.first_token_ms,
-                    elapsed_ms: acc.elapsed,
-                    first_token_ms: Some(acc.first),
+                // DSH sessionStats fold：TTFT 只覆盖记录了首 delta 的请求；
+                // decode 窗口只在「首 token 与 output usage 同有」时成对累计，
+                // 与 outputTokens 一一对应，不做文本估算。
+                if let Some(first) = metrics.first_token_ms {
+                    acc.first += first;
+                    acc.ttft_steps += 1;
                 }
+                if let (Some(first), Some(output)) = (metrics.first_token_ms, metrics.output_tokens) {
+                    acc.decode_ms += metrics.elapsed_ms.saturating_sub(first);
+                    acc.decode_tokens += output;
+                }
+                acc.last_output = metrics.output_tokens;
+                acc.last_elapsed = metrics.elapsed_ms;
+                acc.last_first = metrics.first_token_ms;
+                acc.current = None;
+                acc.dirty = false;
+                let mut view = Self::metrics_view(acc);
+                view.last_output_tokens = metrics.output_tokens;
+                view.last_elapsed_ms = metrics.elapsed_ms;
+                view.last_first_token_ms = metrics.first_token_ms;
+                view
             } else {
                 acc.current = Some(metrics.clone());
+                // Live view: 已完成请求的累计值 + 当前请求的成对贡献；
+                // 未上报 usage 的在途请求不进 decode 对，数字不回退漂移。
+                let (pair_ms, pair_tokens) = match (metrics.first_token_ms, metrics.output_tokens) {
+                    (Some(first), Some(output)) => (metrics.elapsed_ms.saturating_sub(first), output),
+                    _ => (0, 0),
+                };
                 RunMetrics {
                     run_id: metrics.run_id,
                     session_id: metrics.session_id,
@@ -1632,12 +1998,17 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
                     cache_write_tokens: sum_tokens(acc.cache_write, metrics.cache_write_tokens),
                     reasoning_tokens: sum_tokens(acc.reasoning, metrics.reasoning_tokens),
                     attempts: acc.attempts + 1,
-                    last_input_tokens: metrics.input_tokens,
+                    last_input_tokens: last_known_input,
                     last_output_tokens: metrics.output_tokens,
                     last_elapsed_ms: metrics.elapsed_ms,
                     last_first_token_ms: metrics.first_token_ms,
                     elapsed_ms: acc.elapsed + metrics.elapsed_ms,
                     first_token_ms: Some(acc.first + metrics.first_token_ms.unwrap_or(0)),
+                    ttft_steps: acc.ttft_steps + u32::from(metrics.first_token_ms.is_some()),
+                    decode_ms: acc.decode_ms + pair_ms,
+                    decode_tokens: acc.decode_tokens + pair_tokens,
+                    tool_ms: acc.tool_ms,
+                    live_surface_tokens: metrics.live_surface_tokens,
                 }
             }
         };
@@ -1651,8 +2022,49 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         Ok(())
     }
 
+    /// DSH tokenUsage：usage 样本在请求失败时仍然保留 —— 流异常终止（无
+    /// Done）但 provider 已上报 usage 时，只折叠 usage 桶进累计；失败 step
+    /// 不产生 assistant/message/step/end，故 attempts/ttft/decode/llmMs
+    /// 一概不动。置 dirty 由 finish() 统一落库，emit 立即刷新 UI。
+    pub(crate) async fn report_usage_sample(&self, metrics: RunMetrics) -> AppResult<()> {
+        self.report_usage_sample_inner(metrics, true).await
+    }
+
+    /// 同 `report_subagent_metrics`：失败子调用的 usage 样本保留但不得
+    /// 覆盖父会话的 context pressure。
+    pub(crate) async fn report_subagent_usage_sample(&self, metrics: RunMetrics) -> AppResult<()> {
+        self.report_usage_sample_inner(metrics, false).await
+    }
+
+    async fn report_usage_sample_inner(&self, metrics: RunMetrics, main_conversation: bool) -> AppResult<()> {
+        let cumulative = {
+            let mut map = self.metrics_acc.lock().unwrap();
+            let acc = map.entry(metrics.run_id).or_default();
+            acc.run_id = metrics.run_id;
+            acc.session_id = metrics.session_id;
+            acc.provider = metrics.provider.clone();
+            acc.model = metrics.model.clone();
+            acc.input = sum_tokens(acc.input, metrics.input_tokens);
+            acc.output = sum_tokens(acc.output, metrics.output_tokens);
+            acc.cache = sum_tokens(acc.cache, metrics.cache_hit_tokens);
+            acc.cache_write = sum_tokens(acc.cache_write, metrics.cache_write_tokens);
+            acc.reasoning = sum_tokens(acc.reasoning, metrics.reasoning_tokens);
+            if main_conversation {
+                acc.last_known_input = metrics.input_tokens.or(acc.last_known_input);
+            }
+            acc.current = None;
+            acc.dirty = true;
+            Self::metrics_view(acc)
+        };
+        self.emit_locked(
+            &mut *self.state.lock().await,
+            EventData::Metrics { metrics: cumulative },
+        );
+        Ok(())
+    }
+
     pub(crate) async fn finish(&self, run_id: i64, status: RunStatus, error: Option<String>) {
-        let mut run = {
+        let (mut run, segments, parts) = {
             let mut state = self.state.lock().await;
             let Some(run) = state.active_run.as_ref().filter(|run| run.id == run_id) else {
                 return;
@@ -1673,8 +2085,23 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
                 status
             };
             run.error = error;
-            run
+            if let Some(segment) = state.reasoning.last_mut() {
+                if segment.ended_at.is_none() {
+                    segment.ended_at = Some(now_ms());
+                }
+            }
+            if let Some(part) = state.parts.last_mut() {
+                if part.ended_at.is_none() {
+                    part.ended_at = Some(now_ms());
+                }
+            }
+            let segments = std::mem::take(&mut state.reasoning);
+            let parts = std::mem::take(&mut state.parts);
+            state.reasoning_run = None;
+            (run, segments, parts)
         };
+        let _ = self.database.save_run_reasoning(run_id, &segments).await;
+        let _ = self.database.save_run_parts(run_id, &parts).await;
         let mut persistence_error = None;
         for attempt in 0..3 {
             match self.database.finish_run(run.clone()).await {
@@ -1717,7 +2144,22 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         }
         state.control = None;
         state.cancelled_run = None;
-        self.metrics_acc.lock().unwrap().remove(&run_id);
+        // 工具计时到达于最后一次模型上报之后：终局前把累计值补落库。
+        let dirty_metrics = {
+            let mut map = self.metrics_acc.lock().unwrap();
+            let snapshot = map
+                .get_mut(&run_id)
+                .filter(|acc| acc.dirty && acc.run_id != 0)
+                .map(|acc| {
+                    acc.dirty = false;
+                    Self::metrics_view(acc)
+                });
+            map.remove(&run_id);
+            snapshot
+        };
+        if let Some(metrics) = dirty_metrics {
+            let _ = self.database.save_metrics(metrics).await;
+        }
         self.emit_locked(&mut state, EventData::Status { run });
         self.emit_locked(&mut state, EventData::SessionsChanged);
     }
@@ -1926,6 +2368,26 @@ mod tests {
             .create_run("boundary".into(), mode)
             .await
             .unwrap();
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        activate_seeded_run(kernel, id, session_id, mode).await
+    }
+
+    /// Seed a run in an existing session so cross-mode rules can be exercised.
+    async fn seed_run_in_session(kernel: &Arc<Kernel>, session_id: i64, mode: Mode) -> i64 {
+        let id = kernel
+            .database
+            .create_run_in_session(session_id, "boundary".into(), mode)
+            .await
+            .unwrap();
+        activate_seeded_run(kernel, id, session_id, mode).await.0
+    }
+
+    async fn activate_seeded_run(
+        kernel: &Arc<Kernel>,
+        id: i64,
+        session_id: i64,
+        mode: Mode,
+    ) -> (i64, watch::Receiver<bool>) {
         let (cancel, receiver) = watch::channel(false);
         let (done_tx, done) = watch::channel(false);
         tokio::spawn({
@@ -1937,7 +2399,6 @@ mod tests {
                 let _ = done_tx.send(true);
             }
         });
-        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
         let mut state = kernel.state.lock().await;
         state.active_run = Some(RunView {
             id,
@@ -2241,6 +2702,483 @@ mod tests {
         kernel.shutdown().await.unwrap();
     }
 
+    fn subagent_fixture(id: &str, status: SubagentStatus) -> SubagentView {
+        SubagentView {
+            id: id.into(),
+            run_id: 1,
+            session_id: 1,
+            agent: "explore".into(),
+            description: "调研".into(),
+            prompt: "读文件".into(),
+            model: None,
+            status,
+            summary: String::new(),
+            error: None,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_count: 0,
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            first_token_ms: None,
+            elapsed_ms: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            last_input_tokens: None,
+            started_at: 1,
+            finished_at: None,
+            tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_cascades_to_every_registered_subagent() {
+        let (kernel, _events) = test_kernel().await;
+        let (tx1, mut rx1) = tokio::sync::watch::channel(false);
+        let (tx2, mut rx2) = tokio::sync::watch::channel(false);
+        kernel.register_subagent_cancel("sa-1".into(), tx1);
+        kernel.register_subagent_cancel("sa-2".into(), tx2);
+        kernel.cancel(1).await.unwrap();
+        assert!(*rx1.borrow_and_update(), "sa-1 must be cancelled with the parent");
+        assert!(*rx2.borrow_and_update(), "sa-2 must be cancelled with the parent");
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_running_subagent_traces_cancelled() {
+        let (kernel, _events) = test_kernel().await;
+        kernel.subagents.lock().unwrap().insert("sa-1".into(), subagent_fixture("sa-1", SubagentStatus::Running));
+        kernel.subagents.lock().unwrap().insert("sa-2".into(), subagent_fixture("sa-2", SubagentStatus::Completed));
+        kernel.cancel(1).await.unwrap();
+        let map = kernel.subagents.lock().unwrap();
+        assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
+        assert_eq!(map["sa-2"].status, SubagentStatus::Completed, "finished children must not be touched");
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_subagent_works_after_the_parent_run_finished() {
+        let (kernel, _events) = test_kernel().await;
+        kernel.subagents.lock().unwrap().insert("sa-1".into(), subagent_fixture("sa-1", SubagentStatus::Running));
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        kernel.register_subagent_cancel("sa-1".into(), tx);
+        // No active run: the stop button must still work.
+        kernel.cancel_subagent(1, "sa-1").await.unwrap();
+        assert!(*rx.borrow_and_update());
+        assert_eq!(kernel.subagents.lock().unwrap()["sa-1"].status, SubagentStatus::Cancelled);
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_subagent_is_idempotent() {
+        let (kernel, _events) = test_kernel().await;
+        kernel.subagents.lock().unwrap().insert("sa-1".into(), subagent_fixture("sa-1", SubagentStatus::Cancelled));
+        kernel.cancel_subagent(1, "sa-1").await.unwrap();
+        kernel.cancel_subagent(1, "sa-1").await.unwrap();
+        let map = kernel.subagents.lock().unwrap();
+        assert_eq!(map["sa-1"].status, SubagentStatus::Cancelled);
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_keep_the_last_known_prompt_size() {
+        let (kernel, events) = test_kernel().await;
+        let base = RunMetrics {
+            run_id: 5,
+            session_id: 1,
+            provider: "openai".into(),
+            model: "test-model".into(),
+            input_tokens: Some(136_047),
+            output_tokens: Some(1),
+            cache_hit_tokens: None,
+            elapsed_ms: 1,
+            first_token_ms: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            attempts: 1,
+            last_input_tokens: Some(136_047),
+            last_output_tokens: None,
+            last_elapsed_ms: 0,
+            last_first_token_ms: None,
+            ttft_steps: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            tool_ms: 0,
+            live_surface_tokens: None,
+        };
+        kernel.report_metrics(base.clone(), false).await.unwrap();
+        // A later tick without usage must not erase what was already known.
+        let mut later = base;
+        later.input_tokens = None;
+        later.last_input_tokens = None;
+        kernel.report_metrics(later, false).await.unwrap();
+        let last = events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                EventData::Metrics { metrics } => Some(metrics.last_input_tokens),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last, Some(136_047));
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_fold_pairs_decode_windows_with_output_usage() {
+        let (kernel, events) = test_kernel().await;
+        let (run_id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let base = RunMetrics {
+            run_id,
+            session_id: 1,
+            provider: "openai".into(),
+            model: "m".into(),
+            input_tokens: Some(10),
+            output_tokens: Some(100),
+            cache_hit_tokens: None,
+            elapsed_ms: 1_000,
+            first_token_ms: Some(200),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            attempts: 1,
+            last_input_tokens: None,
+            last_output_tokens: None,
+            last_elapsed_ms: 0,
+            last_first_token_ms: None,
+            ttft_steps: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            tool_ms: 0,
+            live_surface_tokens: None,
+        };
+        // 完成请求 A：first+output 成对 → decode 800ms / 100 tokens，ttftSteps=1。
+        kernel.report_metrics(base.clone(), true).await.unwrap();
+        // 完成请求 B：有首 delta 但无 output usage → ttft 计入、decode 不计。
+        let mut no_usage = base.clone();
+        no_usage.output_tokens = None;
+        no_usage.elapsed_ms = 500;
+        no_usage.first_token_ms = Some(100);
+        kernel.report_metrics(no_usage, true).await.unwrap();
+        // 完成请求 C：有 output usage 但无首 delta → decode 仍不计。
+        let mut no_first = base.clone();
+        no_first.first_token_ms = None;
+        kernel.report_metrics(no_first, true).await.unwrap();
+        let metrics = events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                EventData::Metrics { metrics } => Some(metrics.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(metrics.ttft_steps, 2);
+        assert_eq!(metrics.first_token_ms, Some(300));
+        assert_eq!(metrics.decode_ms, 800);
+        assert_eq!(metrics.decode_tokens, 100);
+        // usage 汇总与 decode 对无关：三次 output 都在 output_tokens 里。
+        assert_eq!(metrics.output_tokens, Some(200));
+        kernel.finish(run_id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_sample_folds_tokens_without_touching_step_stats() {
+        let (kernel, events) = test_kernel().await;
+        let (run_id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        // 完成请求 A：建立 baseline（attempts=1, decode 800ms/100tok, ttft 200）。
+        let mut base = RunMetrics {
+            run_id,
+            session_id: 1,
+            provider: "openai".into(),
+            model: "m".into(),
+            input_tokens: Some(10),
+            output_tokens: Some(100),
+            cache_hit_tokens: Some(5),
+            elapsed_ms: 1_000,
+            first_token_ms: Some(200),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            attempts: 1,
+            last_input_tokens: None,
+            last_output_tokens: None,
+            last_elapsed_ms: 0,
+            last_first_token_ms: None,
+            ttft_steps: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            tool_ms: 0,
+            live_surface_tokens: None,
+        };
+        kernel.report_metrics(base.clone(), true).await.unwrap();
+        // 失败请求 B：流中途断流（无 Done），只带 usage 样本 —— DSH
+        // tokenUsage 口径：usage 进累计，attempts/ttft/decode/elapsed 不动。
+        base.input_tokens = Some(50);
+        base.output_tokens = Some(400);
+        base.cache_hit_tokens = None;
+        base.elapsed_ms = 9_000;
+        base.first_token_ms = Some(100);
+        kernel.report_usage_sample(base).await.unwrap();
+        let metrics = events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                EventData::Metrics { metrics } => Some(metrics.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(metrics.attempts, 1);
+        assert_eq!(metrics.elapsed_ms, 1_000);
+        assert_eq!(metrics.ttft_steps, 1);
+        assert_eq!(metrics.first_token_ms, Some(200));
+        assert_eq!(metrics.decode_ms, 800);
+        assert_eq!(metrics.decode_tokens, 100);
+        assert_eq!(metrics.input_tokens, Some(60));
+        assert_eq!(metrics.output_tokens, Some(500));
+        assert_eq!(metrics.cache_hit_tokens, Some(5));
+        kernel.finish(run_id, RunStatus::Failed, Some("断流".into())).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_reports_do_not_overwrite_parent_context_pressure() {
+        let (kernel, events) = test_kernel().await;
+        let (run_id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let base = RunMetrics {
+            run_id,
+            session_id: 1,
+            provider: "openai".into(),
+            model: "m".into(),
+            input_tokens: Some(136_047),
+            output_tokens: Some(100),
+            cache_hit_tokens: None,
+            elapsed_ms: 1_000,
+            first_token_ms: Some(200),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            attempts: 1,
+            last_input_tokens: None,
+            last_output_tokens: None,
+            last_elapsed_ms: 0,
+            last_first_token_ms: None,
+            ttft_steps: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            tool_ms: 0,
+            live_surface_tokens: None,
+        };
+        kernel.report_metrics(base.clone(), true).await.unwrap();
+        // 子智能体调用（小 prompt）：usage 桶照累计、attempts 照计，但
+        // last_input_tokens 属于父会话 context pressure，不得被覆盖。
+        let mut child = base.clone();
+        child.input_tokens = Some(2_000);
+        child.output_tokens = Some(50);
+        kernel.report_subagent_metrics(child.clone(), false).await.unwrap();
+        kernel.report_subagent_metrics(child.clone(), true).await.unwrap();
+        let mut child_sample = child;
+        child_sample.input_tokens = Some(2_500);
+        kernel.report_subagent_usage_sample(child_sample).await.unwrap();
+        let last = || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|event| match &event.data {
+                    EventData::Metrics { metrics } => Some(metrics.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let metrics = last();
+        assert_eq!(metrics.last_input_tokens, Some(136_047));
+        assert_eq!(metrics.input_tokens, Some(136_047 + 2_000 + 2_500));
+        assert_eq!(metrics.attempts, 2);
+        // 父会话下一次请求的 usage 到达后正常刷新。
+        let mut parent = base;
+        parent.input_tokens = Some(140_000);
+        kernel.report_metrics(parent, false).await.unwrap();
+        assert_eq!(last().last_input_tokens, Some(140_000));
+        kernel.finish(run_id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn audit_labels_prefer_the_strongest_reason() {
+        assert_eq!(Kernel::audit_label(true, false, false), "auto-approved");
+        assert_eq!(Kernel::audit_label(false, true, true), "user approved");
+        assert_eq!(Kernel::audit_label(false, false, true), "read-only allowlist");
+        assert_eq!(Kernel::audit_label(false, false, false), "extension");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn code_mode_runs_allowlisted_read_commands_without_approval() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let output = kernel
+            .execute_model_tool(id, "run_command", r#"{"command":"where cmd"}"#)
+            .await
+            .unwrap();
+        assert!(output.contains("exit code 0"), "{output}");
+        assert!(output.to_lowercase().contains("cmd.exe"), "{output}");
+        {
+            let events = events.lock().unwrap();
+            assert!(
+                !events.iter().any(|event| matches!(
+                    &event.data,
+                    EventData::ToolCall { phase: ToolPhase::AwaitingApproval, .. }
+                )),
+                "an allowlisted read command must not ask for approval"
+            );
+        }
+        kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn code_mode_suspends_commands_outside_the_read_only_allowlist() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "run_command", r#"{"command":"npm install"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::Deny, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(call.await.unwrap().is_err());
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_rules_are_listed_and_revocable() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"a.txt","content":"one"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowAlways, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(call.await.unwrap().is_ok());
+
+        let rules = kernel.list_approval_rules(id).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "write_file");
+        assert_eq!(rules[0].pattern, "a.txt");
+        assert!(!rules[0].prefix);
+        let candidate = Kernel::approval_candidate("write_file", r#"{"path":"a.txt","content":"two"}"#);
+        assert!(kernel.is_auto_approved(session_id, &candidate));
+
+        assert!(kernel.revoke_approval_rule(id, &rules[0]).await.unwrap());
+        assert!(kernel.list_approval_rules(id).await.unwrap().is_empty());
+        assert!(!kernel.is_auto_approved(session_id, &candidate));
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn mcp_candidates_are_identified_by_their_full_argument_set() {
+        let first = Kernel::approval_candidate("mcp__fs__write", r#"{"path":"a.txt","content":"one"}"#);
+        let same = Kernel::approval_candidate("mcp__fs__write", r#"{"content":"one","path":"a.txt"}"#);
+        let other = Kernel::approval_candidate("mcp__fs__write", r#"{"path":"a.txt","content":"two"}"#);
+        assert!(!first.target.is_empty());
+        assert!(first.scopable);
+        assert_eq!(first.target, same.target);
+        assert_ne!(first.target, other.target);
+    }
+
+    #[tokio::test]
+    async fn an_external_edit_during_approval_cancels_the_write() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        std::fs::write(workspace.path().join("a.txt"), "original").unwrap();
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "write_file", r#"{"path":"a.txt","content":"from-model"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        // The user edits the file while the approval card is open.
+        std::fs::write(workspace.path().join("a.txt"), "edited-outside").unwrap();
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        let error = call.await.unwrap().unwrap_err();
+        assert!(error.contains("外部修改"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "edited-outside"
+        );
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revert_refuses_a_file_edited_after_the_preview() {
+        let (kernel, _events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        std::fs::write(workspace.path().join("a.txt"), "after-model").unwrap();
+        let change = crate::domain::RunFileChange {
+            path: "a.txt".into(),
+            added: 1,
+            removed: 1,
+            before: "before-model".into(),
+            after: "after-model".into(),
+            created_at: 1,
+        };
+        // Simulate an edit between the revert preview and the write itself by
+        // checking the write path directly (the preview would have said safe).
+        assert_eq!(kernel.router.preview_revert_changes(std::slice::from_ref(&change)).await.unwrap().safe_files.len(), 1);
+        std::fs::write(workspace.path().join("a.txt"), "edited-outside").unwrap();
+        let result = kernel.router.revert_changes(&[change]).await.unwrap();
+        assert!(result.reverted.is_empty());
+        assert_eq!(result.conflicts, vec!["a.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "edited-outside"
+        );
+        kernel.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn rejected_approval_blocks_the_write() {
         let (kernel, events) = test_kernel().await;
@@ -2301,6 +3239,117 @@ mod tests {
         .unwrap();
         assert!(second.contains("a.txt"));
         kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_allow_always_cannot_bypass_plan_writes() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (confirm_run, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        let worker = kernel.clone();
+        let first = tokio::spawn(async move {
+            worker
+                .execute_model_tool(confirm_run, "write_file", r#"{"path":"a.txt","content":"one"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(confirm_run, ApprovalDecision::AllowAlways, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(first.await.unwrap().is_ok());
+        kernel.finish(confirm_run, RunStatus::Completed, None).await;
+
+        let plan_run = seed_run_in_session(&kernel, session_id, Mode::Plan).await;
+        let denied = kernel
+            .execute_model_tool(plan_run, "write_file", r#"{"path":"a.txt","content":"two"}"#)
+            .await
+            .unwrap_err();
+        assert!(denied.contains("Plan Mode blocked"), "{denied}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "one"
+        );
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            &event.data,
+            EventData::ToolCall { tool, phase: ToolPhase::Blocked, .. } if tool == "write_file"
+        )));
+        kernel.finish(plan_run, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_allow_always_cannot_bypass_plan_commands() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (confirm_run, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        let worker = kernel.clone();
+        let first = tokio::spawn(async move {
+            worker
+                .execute_model_tool(confirm_run, "run_command", r#"{"command":"echo approved-once"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(confirm_run, ApprovalDecision::AllowAlways, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(first.await.unwrap().unwrap().contains("approved-once"));
+        kernel.finish(confirm_run, RunStatus::Completed, None).await;
+
+        let plan_run = seed_run_in_session(&kernel, session_id, Mode::Plan).await;
+        let denied = kernel
+            .execute_model_tool(plan_run, "run_command", r#"{"command":"echo approved-once"}"#)
+            .await
+            .unwrap_err();
+        assert!(denied.contains("Plan Mode blocked"), "{denied}");
+        kernel.finish(plan_run, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_allow_always_still_waives_approval_in_an_allowing_mode() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (confirm_run, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        let worker = kernel.clone();
+        let first = tokio::spawn(async move {
+            worker
+                .execute_model_tool(confirm_run, "write_file", r#"{"path":"b.txt","content":"one"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(confirm_run, ApprovalDecision::AllowAlways, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(first.await.unwrap().is_ok());
+        kernel.finish(confirm_run, RunStatus::Completed, None).await;
+
+        // Confirm again in the same session: the rule still removes the prompt.
+        let second_run = seed_run_in_session(&kernel, session_id, Mode::Confirm).await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            kernel.execute_model_tool(second_run, "write_file", r#"{"path":"b.txt","content":"two"}"#),
+        )
+        .await
+        .expect("a session rule must still waive approval outside Plan")
+        .unwrap();
+        assert!(second.contains("b.txt"));
+        kernel.finish(second_run, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
 

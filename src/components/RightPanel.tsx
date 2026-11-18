@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
@@ -13,11 +13,11 @@ import { mockExplorerFiles, type ExplorerFile } from './workbenchMock';
 import type { ExplorerViewState } from './ExplorerPanel';
 import { countChanges } from './MiniDiff';
 import LightweightDiffPreview from './LightweightDiffPreview';
-import MonacoCode from './MonacoCode';
+import CodeViewer from './CodeViewer';
 import TaskPlanPanel from './TaskPlanPanel';
 import SubagentTracePanel from './SubagentTracePanel';
 import type { UiPreferences } from '../uiPreferences';
-import { preloadMonaco } from '../editor/loader';
+import { preloadViewer } from '../viewer/loader';
 
 export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
@@ -71,7 +71,11 @@ function flatTree(files: ExplorerFile[], scope: string): ListNode[] {
   return roots;
 }
 
-function ListNodes({ nodes, depth, closed, onToggle, activePath, onPick }: {
+// memo + conditional mount: a collapsed folder used to keep every descendant
+// mounted via `hidden`, so each streaming token re-render reconciled thousands
+// of tree nodes (a Python-distribution-sized subtree) and starved the main
+// thread. ZCode/VSCode explorers only mount expanded subtrees — same here.
+const ListNodes = memo(function ListNodesImpl({ nodes, depth, closed, onToggle, activePath, onPick }: {
   nodes: ListNode[]; depth: number; closed: Set<string>; onToggle: (id: string) => void;
   activePath: string | null; onPick: (path: string, file?: ExplorerFile) => void;
 }) {
@@ -84,11 +88,11 @@ function ListNodes({ nodes, depth, closed, onToggle, activePath, onPick }: {
           style={{ paddingLeft: 10 + depth * 13 }} onClick={() => onToggle(node.id)}>
           {closed.has(node.id) ? <Folder size={13} /> : <FolderOpen size={13} />}{node.name}<ChevronDown size={11} className={closed.has(node.id) ? 'folder-chevron closed' : 'folder-chevron'} />
         </button>
-        <div hidden={closed.has(node.id)}>
+        {!closed.has(node.id) && <div>
           {node.children.length ? <ListNodes nodes={node.children} depth={depth + 1} closed={closed} onToggle={onToggle} activePath={activePath} onPick={onPick} /> : <p className="explorer-empty-folder" style={{ paddingLeft: 24 + depth * 13 }}>空文件夹</p>}
-        </div>
+        </div>}
       </div>)}</>;
-}
+});
 
 const STATUS_LABEL: Record<ReviewFile['status'], string> = { pending: '待批准', applied: '已应用', proposal: '提议' };
 
@@ -112,9 +116,9 @@ function ChangesList({ files, activePath, onPick }: { files: ReviewFile[]; activ
 
 /// Unified workspace panel: fixed left list (Explorer tree OR Changes list,
 /// toggled by a compact segmented header) + a right preview column that shows
-/// MonacoCode for workspace files, MonacoDiff for changed files, and a slim
+/// CodeViewer for workspace files, LightweightDiffPreview for changed files, and a slim
 /// approval bar while a call is suspended.
-export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily, subagents, activeSubagentId, onActiveSubagent, onCancelSubagent, reasoningDisplay, light, onOpenWorkspaceFile }: {
+const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily, subagents, activeSubagentId, onActiveSubagent, onCancelSubagent, reasoningDisplay, light, onOpenWorkspaceFile }: {
   listTab: ListTab; onListTabChange: (tab: ListTab) => void;
   openTabs: ListTab[]; onAddTab: (tab: ListTab) => void; onCloseTab: (tab: ListTab) => void;
   activeFile: ActiveFile | null; onActiveFile: (file: ActiveFile | null) => void;
@@ -141,11 +145,13 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   }, [tick]);
 
   const closed = useMemo(() => new Set(explorerView.closedFolders), [explorerView.closedFolders]);
-  const toggleFolder = (id: string) => {
+  // Stable callbacks: memo(ListNodes) only skips the streaming re-render when
+  // these identities stay constant between token events.
+  const toggleFolder = useCallback((id: string) => {
     const next = new Set(closed);
     next.has(id) ? next.delete(id) : next.add(id);
     onExplorerViewChange({ ...explorerView, closedFolders: [...next] });
-  };
+  }, [closed, explorerView, onExplorerViewChange]);
 
   // Preview-mode explorer entries: mock files overlaid with plan proposals.
   const previewFiles = useMemo(() => {
@@ -170,10 +176,10 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
   const previewPath = change?.path ?? workspacePath ?? '';
 
 
-  const pickWorkspace = (picked: string, file?: ExplorerFile) => {
+  const pickWorkspace = useCallback((picked: string, file?: ExplorerFile) => {
     onActiveFile({ kind: 'workspace', path: picked });
     if (!preview) void workspace.selectFile(picked);
-  };
+  }, [onActiveFile, preview, workspace]);
 
   const TAB_META: Record<ListTab, { label: string; icon: ReactNode }> = {
     explorer: { label: '文件', icon: <Folder size={12} /> },
@@ -201,7 +207,7 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
     return () => document.removeEventListener('pointerdown', onPointerDown, true);
   }, [addMenuOpen]);
 
-  return <aside aria-label="右侧工作区" className="right-pane" onMouseEnter={preloadMonaco} onFocusCapture={preloadMonaco}>
+  return <aside aria-label="右侧工作区" className="right-pane" onMouseEnter={preloadViewer} onFocusCapture={preloadViewer}>
         <div className="right-tabs-toolbar">
           <div className="right-tabs-shell">
             <div className="right-tabs" role="tablist" aria-label="右侧面板视图">
@@ -290,12 +296,27 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
             })()
             : (() => {
               if (change) return <LightweightDiffPreview key={`${change.path}:${change.before}:${change.after}`} path={change.path} before={change.before} after={change.after} fontSize={fontSize} />;
-              if (previewFile) return <MonacoCode file={previewFile} fontSize={fontSize} fontFamily={fontFamily} />;
-              if (liveFile) return <MonacoCode file={liveFile} fontSize={fontSize} fontFamily={fontFamily} />;
+              if (previewFile) return <CodeViewer file={previewFile} fontSize={fontSize} fontFamily={fontFamily} />;
+              if (liveFile) return <CodeViewer file={liveFile} fontSize={fontSize} fontFamily={fontFamily} />;
               if (!preview && workspacePath) {
-                if (workspace.fileLoading) return <div className="editor-empty" role="status">正在读取文件内容…</div>;
-                if (workspace.fileError) return <div className="editor-empty" role="alert">{workspace.fileError}</div>;
-                return <div className="editor-empty">选择一个本地 UTF-8 文件以只读预览。</div>;
+                if (workspace.fileLoading) {
+                  // Keep the previous file on screen while the next one loads.
+                  // This is our own choice: ZCode shows a `loadingInitial`
+                  // placeholder instead (PreviewPane.tsx), so do not cite it as
+                  // parity — it simply removes the full-pane flash here.
+                  const previous = workspace.file;
+                  if (previous) return <>
+                    <div className="editor-loading-bar" role="status" aria-label="正在读取文件内容" />
+                    <CodeViewer file={previous} fontSize={fontSize} fontFamily={fontFamily} />
+                  </>;
+                  return <div className="editor-empty" role="status">正在读取文件内容…</div>;
+                }
+                if (workspace.fileError) return <div className="editor-empty" role="alert">{workspace.fileError}
+                  <button type="button" className="button-ghost" onClick={() => void workspace.selectFile(workspacePath)}>重试</button></div>;
+                // Selected but nothing arrived and nothing is loading: never a
+                // silent blank pane — say which file failed and offer a retry.
+                return <div className="editor-empty" role="status">未能加载 {workspacePath}
+                  <button type="button" className="button-ghost" onClick={() => void workspace.selectFile(workspacePath)}>重试</button></div>;
               }
               return <div className="editor-empty"><Braces size={34} strokeWidth={1} /><h3>你的下一次变更，从这里开始</h3><p>选择左侧文件以查看内容或差异。</p></div>;
             })()}
@@ -303,4 +324,6 @@ export default function RightPanel({ listTab, onListTabChange, openTabs, onAddTa
       </div>
     </div>
   </aside>;
-}
+});
+
+export default RightPanel;

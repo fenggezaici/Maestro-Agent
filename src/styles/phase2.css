@@ -372,6 +372,16 @@
 .approval-scope-menu { position: absolute; right: 0; bottom: calc(100% + 4px); z-index: 6; display: grid; min-width: 112px; padding: 4px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-popover); box-shadow: var(--shadow-overlay); }
 .approval-scope-menu button { padding: 6px 8px; border: 0; border-radius: 5px; background: transparent; color: var(--color-foreground-subtle); text-align: left; font-size: var(--text-ui-sm); }
 .approval-scope-menu button:hover { background: var(--color-hover); color: var(--color-foreground); }
+.approval-scope-menu { min-width: 230px; }
+.approval-scope-menu button { display: grid; gap: 2px; }
+.approval-scope-menu code { color: var(--color-foreground-subtlest); font-family: var(--code-font); font-size: var(--text-ui-xs); white-space: pre-wrap; word-break: break-all; }
+.approval-rules-list { display: grid; gap: 8px; max-height: 320px; overflow: auto; }
+.approval-rule-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--color-border); border-radius: 8px; }
+.approval-rule-row > div { display: grid; gap: 2px; min-width: 0; }
+.approval-rule-row strong { color: var(--color-foreground); font-weight: 500; font-size: var(--text-ui-sm); }
+.approval-rule-row code { color: var(--color-foreground-subtle); font-family: var(--code-font); font-size: var(--text-ui-xs); word-break: break-all; }
+.approval-rule-row em { color: var(--color-foreground-subtlest); font-style: normal; font-size: var(--text-ui-xs); }
+.credential-migration { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .tool-approval-feedback { display: grid; gap: 6px; margin-top: 8px; }
 .tool-approval-feedback textarea { min-height: 54px; padding: 7px 9px; border: 1px solid var(--color-border); border-radius: 7px; background: var(--color-input); color: var(--color-foreground); font-size: var(--text-ui-caption); resize: vertical; }
 .tool-approval-feedback-actions { display: flex; justify-content: flex-end; gap: 6px; }
@@ -382,3 +392,6 @@
 .context-compaction-row pre { max-height: 180px; overflow: auto; margin: 6px 0 0; padding: 8px; border-radius: 6px; background: var(--color-panel-alt); white-space: pre-wrap; font-size: var(--text-ui-xs); }
 .context-compaction-status { color: var(--color-primary); }
 .context-compaction-row.failed .context-compaction-status { color: var(--color-danger, #ef4444); }
+
+/* A streaming turn has no usage yet: keep the last value visible. */
+.context-ring.is-stale { opacity: 0.55; }

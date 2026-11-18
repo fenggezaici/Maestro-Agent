@@ -11,6 +11,16 @@ export interface RunMetrics {
   cacheWriteTokens?: number | null; reasoningTokens?: number | null;
   attempts?: number; lastInputTokens?: number | null; lastOutputTokens?: number | null; lastElapsedMs?: number;
   lastFirstTokenMs?: number | null;
+  /** DSH sessionStats 口径：记录了首 delta 的完成请求数（TTFT 平均的分母）。 */
+  ttftSteps?: number;
+  /** Σ decode 窗口（首 delta → 流结束），只计「首 token 与 output usage 同有」的请求。 */
+  decodeMs?: number;
+  /** 与 decodeMs 成对的 output tokens；tok/s = ΣdecodeTokens / ΣdecodeMs。 */
+  decodeTokens?: number;
+  /** Σ 工具墙钟（Started → 终态配对），不含 ask_user 等待与 spawn_subagent。 */
+  toolMs?: number;
+  /** 在途请求的 surface 文本估算 tokens（DSH surfaceTokens 口径，仅 live 快照携带，永不持久化）。 */
+  liveSurfaceTokens?: number | null;
 }
 export type RunStatus = 'running' | 'completed' | 'cancelled' | 'failed';
 
@@ -94,6 +104,14 @@ export interface SubagentView {
   toolCount: number;
   inputTokens?: number | null;
   outputTokens?: number | null;
+  reasoningTokens?: number | null;
+  firstTokenMs?: number | null;
+  elapsedMs?: number | null;
+  /** Σ 每次 LLM 调用的 decode 窗口（首 delta → 末 delta），仅计入上报 output usage 的调用。 */
+  decodeMs?: number;
+  /** 与 decodeMs 成对的 output tokens；tok/s = decodeTokens / decodeMs。 */
+  decodeTokens?: number;
+  lastInputTokens?: number | null;
   startedAt: number;
   finishedAt?: number | null;
   tools: ToolCallView[];
@@ -106,14 +124,17 @@ export type PlanStepStatus = 'pending' | 'in_progress' | 'completed';
 export interface PlanStep { id: string; description: string; status: PlanStepStatus }
 
 /// Payload carried in an `awaiting_approval` tool_call detail: the kernel's
-/// bounded preview of what would run. `write` diffs render in the Monaco
+/// bounded preview of what would run. `write` diffs render in the code
 /// panel; `command` renders as a terminal card; `args` is the generic fallback.
 export type ApprovalPreview =
   | { kind: 'write'; path: string; exists: boolean; old: string; new: string }
   | { kind: 'command'; command: string }
   | { kind: 'args'; arguments: string };
-export interface ContextCompaction {
-  operationId: string; sessionId: number; throughRunId: number; summary: string;
+/// Session-scoped "always allow" rule derived from an approval decision.
+/// `prefix` rules exist only for `run_command`; both are shown so they can be
+/// reviewed and revoked instead of silently widening.
+export interface ApprovalRuleView { tool: string; pattern: string; prefix: boolean }
+export interface ContextCompaction {  operationId: string; sessionId: number; throughRunId: number; summary: string;
   trigger: 'auto' | 'manual'; status: 'running' | 'completed' | 'failed' | 'interrupted';
   preTokens: number; postTokens?: number | null; createdAt: number;
 }
@@ -121,7 +142,11 @@ export interface RunMessage {
   runId: number; sessionId: number; seq: number; role: string; content: string;
   toolCalls?: unknown; toolCallId?: string | null; name?: string | null;
 }
-export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[] }
+/// Persisted reasoning bursts per run id (replay after a restart).
+export interface PersistedReasoning { text: string; startedAt: number; endedAt?: number | null }
+/// Ordered timeline part persisted per run (ZCode-style message parts).
+export interface PersistedPart { kind: 'reasoning' | 'tool' | 'content'; text?: string; index?: number; startedAt: number; endedAt?: number | null }
+export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[]; reasoning?: Record<number, PersistedReasoning[]>; parts?: Record<number, PersistedPart[]> }
 
 /// Single `kernel-event` channel contract. Streamed text arrives already
 /// classified as `content` (answer) or `reasoning` (thinking); tool execution
@@ -142,7 +167,7 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'subagent_started'; runId: number; subagent: SubagentView }
   | { type: 'subagent_tool'; runId: number; subagentId: string; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }
   | { type: 'subagent_token'; runId: number; subagentId: string; kind: 'content' | 'reasoning'; token: string }
-  | { type: 'subagent_finished'; runId: number; subagentId: string; status: SubagentStatus; summary: string; error: string | null; toolCount: number; inputTokens: number | null; outputTokens: number | null; finishedAt: number }
+  | { type: 'subagent_finished'; runId: number; subagentId: string; status: SubagentStatus; summary: string; error: string | null; toolCount: number; inputTokens: number | null; outputTokens: number | null; reasoningTokens?: number | null; firstTokenMs?: number | null; elapsedMs?: number | null; decodeMs?: number; decodeTokens?: number; lastInputTokens?: number | null; finishedAt: number }
   | { type: 'user_question'; runId: number; requestId: string; questions: UserQuestion[] }
   | { type: 'context_compaction'; compaction: ContextCompaction }
   | { type: 'reasoning'; runId: number; token: string }

@@ -19,6 +19,19 @@ use crate::{
 const NO_WORKSPACE: &str =
     "未选择工作区：当前项目未设置目录，请在输入框下方项目菜单中点击「设置目录」";
 
+/// What a write target looked like when its approval card was shown.
+#[derive(Debug, Clone)]
+pub enum WriteBaseline {
+    /// Read tools and commands have nothing to compare.
+    NotApplicable,
+    /// The target did not exist at preview time.
+    Absent,
+    /// The target existed with this exact content.
+    Content(String),
+    /// The target could not be read, so the write cannot be verified.
+    Unverifiable,
+}
+
 /// What `execute` produces: bounded text for the model plus, for workspace
 /// writes, the before/after contents the UI diffs in the tool row.
 pub struct ToolOutcome {
@@ -128,15 +141,78 @@ impl ToolRouter {
         let preview = self.preview_revert_changes(changes).await?;
         let merged = Self::merge_changes(changes);
         let mut reverted = Vec::new();
+        let mut conflicts: Vec<String> = preview
+            .unsafe_files
+            .iter()
+            .map(|issue| issue.path.clone())
+            .chain(preview.ignored_files.iter().map(|issue| issue.path.clone()))
+            .collect();
         for path in &preview.safe_files {
             let Some(change) = merged.iter().find(|change| &change.path == path) else { continue };
+            // Re-check immediately before writing: the preview and this write are
+            // not atomic, so an edit in between must win over our snapshot.
+            if fs::read_file(&root, path).ok().as_deref() != Some(change.after.as_str()) {
+                conflicts.push(path.clone());
+                continue;
+            }
             if change.before.is_empty() { fs::remove_file(&root, path)?; }
             else { fs::write_file(&root, path, &change.before)?; }
             reverted.push(path.clone());
         }
-        let conflicts = preview.unsafe_files.into_iter().map(|issue| issue.path)
-            .chain(preview.ignored_files.into_iter().map(|issue| issue.path)).collect();
         Ok(RevertResult { reverted, conflicts })
+    }
+
+    /// Snapshot of a write target taken when the approval card is shown. The
+    /// write is refused if the file changed in the meantime, so an external
+    /// edit is never silently overwritten by a stale preview.
+    pub async fn write_baseline(&self, tool: &str, arguments_json: &str) -> WriteBaseline {
+        if tool != "write_file" && tool != "apply_patch" {
+            return WriteBaseline::NotApplicable;
+        }
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments_json) else {
+            return WriteBaseline::Unverifiable;
+        };
+        let Some(rel) = arguments.get("path").and_then(|value| value.as_str()) else {
+            return WriteBaseline::Unverifiable;
+        };
+        let Some(root) = self.workspace_root().await else {
+            return WriteBaseline::Unverifiable;
+        };
+        match fs::scoped_path(&root, rel) {
+            Ok(path) if path.is_file() => match fs::read_file(&root, rel) {
+                Ok(content) => WriteBaseline::Content(content),
+                Err(_) => WriteBaseline::Unverifiable,
+            },
+            Ok(_) => WriteBaseline::Absent,
+            Err(_) => WriteBaseline::Absent,
+        }
+    }
+
+    pub async fn verify_write_baseline(
+        &self,
+        tool: &str,
+        arguments_json: &str,
+        baseline: &WriteBaseline,
+    ) -> AppResult<()> {
+        let expected = match baseline {
+            WriteBaseline::Absent => None,
+            WriteBaseline::Content(content) => Some(content.as_str()),
+            WriteBaseline::NotApplicable | WriteBaseline::Unverifiable => return Ok(()),
+        };
+        let arguments: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
+        let rel = arguments.get("path").and_then(|value| value.as_str()).unwrap_or("");
+        let root = self.workspace_root().await.ok_or_else(|| NO_WORKSPACE.to_string())?;
+        let current = match fs::scoped_path(&root, rel) {
+            Ok(path) if path.is_file() => fs::read_file(&root, rel).ok(),
+            _ => None,
+        };
+        if current.as_deref() == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "{tool} 已取消：{rel} 在批准期间被外部修改，请重新请求"
+        ))
     }
 
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
@@ -461,6 +537,7 @@ impl ToolRouter {
         session_id: i64,
         tool: &str,
         arguments_json: &str,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> AppResult<ToolOutcome> {
         let arguments: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
@@ -511,10 +588,36 @@ impl ToolRouter {
                     .workspace_root()
                     .await
                     .ok_or_else(|| NO_WORKSPACE.to_string())?;
-                (
-                    crate::adapters::exec::run_command(&root, arg("command", tool)?).await?,
-                    None,
-                )
+                let command = arg("command", tool)?;
+                let text = match crate::domain::command_policy::parse(command) {
+                    // Allowlisted: run the resolved binary directly, no shell.
+                    crate::domain::command_policy::CommandPolicy::ReadOnly { program, args } => {
+                        let Some(path) = crate::adapters::exec::resolve_in_path(&program, &root) else {
+                            return Err(format!(
+                                "只读白名单命令不可用：{program} 未在 PATH 中找到（未执行）"
+                            ));
+                        };
+                        crate::adapters::exec::run_program(
+                            &root,
+                            &path,
+                            &args,
+                            crate::adapters::exec::COMMAND_TIMEOUT,
+                            cancel,
+                        )
+                        .await?
+                    }
+                    // Everything else keeps the shell path and needs approval.
+                    crate::domain::command_policy::CommandPolicy::NeedsApproval => {
+                        crate::adapters::exec::run_command_with_cancel(
+                            &root,
+                            command,
+                            crate::adapters::exec::COMMAND_TIMEOUT,
+                            cancel,
+                        )
+                        .await?
+                    }
+                };
+                (text, None)
             }
             "list_dir" => {
                 let root = self

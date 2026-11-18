@@ -21,7 +21,7 @@ For real model testing use `pnpm.cmd tauri dev`, then **Settings → Models**. B
 - Sessions: single-line rows (status + title + relative time); full title, run count and `#id` live in the tooltip and aria-label. Lists group by local day (置顶 / 今天 / 昨天 / 7 天内 / 更早); pinning is a local UI preference.
 - Plan cards: pending plans render expanded; approved/rejected/invalidated plans collapse to a summary row and can be reopened manually. Decisions remain intent-only; nothing is applied.
 - Composer thinking strength: the model picker exposes a continuous effort slider for adjustable models; fixed-reasoning models show a static line. Settings → Models keeps the detailed select.
-- Appearance: font family/size update readonly Monaco previews. Dark/Light/System are real themes; 界面缩放 keeps the CSS zoom behavior (default 100%).
+- Appearance: font family/size update readonly code previews. Dark/Light/System are real themes; 界面缩放 keeps the CSS zoom behavior (default 100%).
 - Providers: OpenAI/Anthropic/Ollama selector demonstrates provider UI only. Actual Rust transmission remains OpenAI-compatible; native Anthropic/Ollama protocols are not enabled by this selector.
 - Shortcuts: search, click a binding, then press a modified key combination. Escape cancels capture. Conflicts and unsupported chords are rejected; Ctrl/Cmd+Enter remains reserved for Send. These bindings are application UI actions, not OS global shortcuts.
 - Right pane: closable **文件 / 变更 / 任务** tab strip with a trailing **+** menu; default opens 文件 + 变更, Tasks appears when a plan exists. Changes use the ZCode lightweight unified diff (14% row tint + 3px inset bar, 18% gutter tint), not Monaco Diff. In Tauri, Explorer reads the selected local directory and file text through Rust. Browser preview retains explicitly labeled samples.
@@ -45,7 +45,7 @@ New captures:
 - `artifacts/ui/maestro-explorer.png`
 - `artifacts/ui/maestro-extensions.png`
 
-Browser checks retain production CSP, local fonts/workers, resizable layouts, Activity routing and static preview safeguards. They also verify the fixed footer while sessions scroll, flat composer controls, Monaco previews, Settings menus, shortcuts and extension UI transitions. Filesystem reads are tested in Rust against real files, including this repository.
+Browser checks retain production CSP, local fonts/workers, resizable layouts, Activity routing and static preview safeguards. They also verify the fixed footer while sessions scroll, flat composer controls, code previews, Settings menus, shortcuts and extension UI transitions. Filesystem reads are tested in Rust against real files, including this repository.
 
 - Task tracker: `update_plan` steps stream into the right-panel Tasks tab; the conversation header shows a compact `任务 N/M` chip instead of an overlay card. Completed steps are gray + struck through.
 - Composer stats: two DeepSeek Harness-style pills below the composer (activity and usage); cache hit is provider-reported cache reads over billed input, never guessed.

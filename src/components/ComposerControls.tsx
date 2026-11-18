@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { readLlmSettings, saveLlmSettings } from '../settings';
+import { useEffect, useRef, useState } from 'react';
+import { hasProviderCredential, readLlmSettings, saveLlmSettings } from '../settings';
 import type { UiPreferences } from '../uiPreferences';
 import type { ProviderId, ThinkingLevel } from '../modelCapabilities';
 import { fetchModelsApi } from '../api/models';
@@ -25,7 +25,11 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
     setThinking(value?.reasoning ?? 'medium');
   }, [preview, preferences.previewModel, preferences.provider, settingsVersion]);
   const capability = resolveCapability(model, provider);
-  const context = capability.context;
+  // A models.dev catalog refresh can transiently drop the context window; keep
+  // the last known value so the ring never loses its denominator.
+  const lastContext = useRef<number | null>(null);
+  if (capability.context !== null) lastContext.current = capability.context;
+  const context = capability.context ?? lastContext.current;
   useEffect(() => { onCapability(model, provider, context); }, [model, provider, context, onCapability]);
 
   // Refresh the public models.dev catalog in the background (deferred so it
@@ -57,9 +61,9 @@ export default function ComposerControls({ preview, disabled, preferences, onPre
   useEffect(() => {
     if (preview || !fetchedStale(provider)) return;
     const settings = readLlmSettings();
-    if (!settings.baseUrl?.trim() || (provider !== 'ollama' && !settings.apiKey?.trim())) return;
+    if (!settings.baseUrl?.trim() || (provider !== 'ollama' && !hasProviderCredential(provider))) return;
     const timer = setTimeout(() => {
-      fetchModelsApi(provider, settings.baseUrl, settings.apiKey ?? '')
+      fetchModelsApi(provider, settings.baseUrl)
         .then((models) => {
           saveFetchedModels(provider, models);
           saveProviderModels(provider, mergeFetched(provider, models));

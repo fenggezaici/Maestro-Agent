@@ -2,7 +2,7 @@ import { createRef } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 
-import type { RunStatus, RunView, ToolCallView } from '../api/types';
+import type { PersistedPart, RunStatus, RunView, ToolCallView } from '../api/types';
 import type { TimelineItem } from '../lib/conversation';
 import ChatStream from './ChatStream';
 
@@ -139,4 +139,49 @@ it('collapses a reasoning burst when it finishes unless manually reopened', () =
   expect(view.container.querySelector('.reasoning-content')).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: /思考 · 3 秒/ }));
   expect(view.container.querySelector('.reasoning-content')).not.toBeNull();
+});
+
+it('stays memoized so a keystroke cannot re-render the whole history', () => {
+  // Workbench stabilizes every prop (useCallback/useMemo); without this wrapper
+  // the memo contract silently disappears and typing re-parses all messages.
+  expect((ChatStream as unknown as { $$typeof: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
+});
+
+it('folds historical tool calls into a collapsed execution group', () => {
+  const calls: ToolCallView[] = [
+    { runId: 1, tool: 'read_file', detail: 'a.ts', allowed: true },
+    { runId: 1, tool: 'write_file', detail: 'b.ts', allowed: true },
+  ];
+  const { container } = render(<ChatStream {...base} runs={[run('completed')]} detailTools={calls} />);
+  // No liveTimeline after a restart: replay must still fold, not dump every row.
+  expect(screen.getByRole('button', { name: /已执行 2 个工具/ })).toHaveAttribute('aria-expanded', 'false');
+  expect(container.querySelector('.execution-body')).toHaveAttribute('aria-hidden', 'true');
+});
+
+it('uses persisted reasoning so a replayed run keeps its thinking time', () => {
+  const calls: ToolCallView[] = [
+    { runId: 1, tool: 'read_file', detail: 'a.ts', allowed: true },
+    { runId: 1, tool: 'write_file', detail: 'b.ts', allowed: true },
+  ];
+  render(<ChatStream {...base} runs={[run('completed')]} detailTools={calls}
+    detailReasoning={{ 1: [{ text: '先分析', startedAt: 0, endedAt: 3000 }] }} />);
+  const summary = screen.getByRole('button', { name: /思考 3 秒 · 2 个工具/ });
+  expect(summary).toHaveAttribute('aria-expanded', 'false');
+});
+
+it('replays persisted parts in their original interleaved order', () => {
+  const calls: ToolCallView[] = [
+    { runId: 1, tool: 'read_file', detail: 'a.ts', allowed: true },
+    { runId: 1, tool: 'write_file', detail: 'b.ts', allowed: true },
+  ];
+  const parts: PersistedPart[] = [
+    { kind: 'reasoning', text: '先想', startedAt: 0, endedAt: 2000 },
+    { kind: 'tool', index: 0, startedAt: 2000 },
+    { kind: 'content', text: '中间说明', startedAt: 3000 },
+    { kind: 'tool', index: 1, startedAt: 4000 },
+  ];
+  render(<ChatStream {...base} runs={[run('completed')]} detailTools={calls} detailParts={{ 1: parts }} />);
+  // The content part splits the execution into two groups, exactly like a live run.
+  expect(screen.getAllByRole('button', { name: /个工具/ })).toHaveLength(2);
+  expect(screen.getByText('中间说明')).toBeInTheDocument();
 });

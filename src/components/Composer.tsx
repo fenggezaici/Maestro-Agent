@@ -1,6 +1,6 @@
 /// Dumb composer: prompt input, attachments, mode/project pickers and the
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
-import { useEffect, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type RefObject, type SetStateAction } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type Ref, type RefObject, type SetStateAction } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, Search, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
 import type { PendingApprovalView } from '../lib/conversation';
@@ -29,17 +29,19 @@ function formatStatusElapsed(ms: number) {
   return `${minutes} 分 ${(seconds - minutes * 60).toFixed(1)} 秒`;
 }
 
-export default function Composer({ atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, prompt, onPromptChange, promptBytes, focusRequest, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, steps = 0, slash }: {
+export interface ComposerHandle { setText: (text: string) => void; clear: () => void; focus: () => void }
+
+/// Survives unmount (Activity/Extensions navigation) without pushing the draft
+/// back into Workbench state, which would re-render the shell on every keystroke.
+let draftCache = '';
+
+function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, slash }: {
   atBottom: boolean;
   onScrollBottom: () => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>, value: string) => boolean | Promise<boolean>;
   attachments: LocalAttachment[];
   onAttachmentsChange: Dispatch<SetStateAction<LocalAttachment[]>>;
   blocked: boolean;
-  prompt: string;
-  onPromptChange: (value: string) => void;
-  promptBytes: number;
-  focusRequest?: number;
   preview: boolean;
   mode: Mode;
   onSetMode: (mode: Mode) => void;
@@ -62,7 +64,6 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
   context: number | null;
   modelLabel: string;
   status?: 'approval' | 'tool' | 'thinking' | 'working' | null;
-  steps?: number;
   slash?: {
     actions: SlashAction[];
     skills: SkillView[];
@@ -70,20 +71,27 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     onRefresh: () => void;
     onRunCommand: (name: string, args: string) => void;
   };
+  ref?: Ref<ComposerHandle>;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const promptInput = useRef<HTMLTextAreaElement>(null);
-  const attachmentUrls = useRef(new Set<string>());
-
-  // Editing a past user message refills the prompt; focus and park the caret
-  // at the end so the user can adjust and resend immediately.
-  useEffect(() => {
-    if (!focusRequest) return;
+  // The draft lives here, not in Workbench: typing must not re-render the page
+  // shell or the chat history (ZCode keeps it inside the editor for the same reason).
+  const [draft, setDraftState] = useState(() => draftCache);
+  const setDraft = (value: string) => { draftCache = value; setDraftState(value); };
+  const promptBytes = new TextEncoder().encode(draft.trim()).length;
+  const focusInput = () => {
     const element = promptInput.current;
     if (!element) return;
     element.focus();
     element.setSelectionRange(element.value.length, element.value.length);
-  }, [focusRequest]);
+  };
+  useImperativeHandle(ref, () => ({
+    setText: (text: string) => { setDraft(text); requestAnimationFrame(focusInput); },
+    clear: () => setDraft(''),
+    focus: focusInput,
+  }), []);
+  const attachmentUrls = useRef(new Set<string>());
 
   function removeAttachment(id: string) {
     const removed = attachments.find((item) => item.id === id);
@@ -130,7 +138,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
 
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
-  const slashState = slash ? slashQuery(prompt, slashDismissed) : null;
+  const slashState = slash ? slashQuery(draft, slashDismissed) : null;
   const slashGroups = slash && slashState ? buildSlashGroups(slash.actions, slash.skills, slash.commands, slashState.query) : [];
   const slashItems = slashGroups.flatMap((group) => group.items);
   useEffect(() => { setSlashIndex(0); }, [slashState?.query]);
@@ -142,25 +150,29 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
     const args = slashState?.args ?? '';
     if (item.kind === 'action') {
       item.action.run();
-      onPromptChange('');
+      setDraft('');
     } else if (item.kind === 'skill') {
-      onPromptChange(skillDirective(item.name, args));
+      setDraft(skillDirective(item.name, args));
     } else {
-      onPromptChange('');
+      setDraft('');
       slash?.onRunCommand(item.name, args);
     }
     setSlashDismissed(true);
     promptInput.current?.focus();
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={onSubmit} className="composer">
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={(event) => {
+      const accepted = onSubmit(event, draft);
+      if (typeof accepted === 'boolean') { if (accepted) setDraft(''); return; }
+      void accepted.then((ok) => { if (ok) setDraft(''); });
+    }} className="composer">
     {slashState && <SlashPanel groups={slashGroups} index={slashIndex} onHover={setSlashIndex} onSelect={selectSlash} />}
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
     <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
-    <textarea ref={promptInput} aria-label="发送消息" rows={3} value={prompt} onChange={(event) => {
+    <textarea ref={promptInput} aria-label="发送消息" rows={3} value={draft} onChange={(event) => {
       const value = event.target.value;
       setSlashDismissed(false);
-      onPromptChange(value);
+      setDraft(value);
       if (slash && value === '/') slash.onRefresh();
     }} placeholder="描述你的任务… 输入 / 打开命令；Enter 发送，Shift+Enter 换行"
       disabled={blocked} onKeyDown={(event) => {
@@ -185,7 +197,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
 
       <Choice label="由 Rust 强制执行" value={mode} disabled={!preview && (blocked || running)} onChange={(value) => onSetMode(value as Mode)} options={[
         { value: 'plan', label: <span className="choice-item-stack"><span className="choice-item-main"><ListChecks size={13} />计划</span><span className="choice-item-desc">只读分析，不修改文件</span></span> },
-        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件直接执行；危险命令需批准</span></span> },
+        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件直接执行；只读命令免审，其余需批准</span></span> },
         { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />确认</span><span className="choice-item-desc">每个工具/命令都需确认，批准后执行</span></span> },
         { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />自动</span><span className="choice-item-desc">已开放工具直接执行（含写入/命令）</span></span> },
       ]} />
@@ -217,5 +229,7 @@ export default function Composer({ atBottom, onScrollBottom, onSubmit, attachmen
       <span className={`input-count ${promptBytes > 8192 ? 'invalid' : ''}`}>{promptBytes > 0 ? `${promptBytes} / 8192` : 'Enter ↵'}</span>
       {running && !preview ? <IconButton label="停止生成" className="stop-button" onClick={onCancel}><Square size={13} /></IconButton> : <button type="submit" aria-label="发送" className="send-button" disabled={blocked || promptBytes === 0 || promptBytes > 8192}><ArrowUp size={19} strokeWidth={1.8} /></button>}
     </div>
-  </form><SessionStats runs={runs} metrics={metrics} context={context} steps={steps} /><div className="composer-caption"><span><ShieldCheck size={11} />{preview ? '预览不调用模型；媒体仅本地显示' : '图片/文本附件随消息发送（图片需视觉模型）；视频仅本地预览。'}</span><span>{modelLabel || 'Maestro Agent'}</span></div></div></div>;
+  </form><SessionStats runs={runs} metrics={metrics} context={context} /><div className="composer-caption"><span><ShieldCheck size={11} />{preview ? '预览不调用模型；媒体仅本地显示' : '图片/文本附件随消息发送（图片需视觉模型）；视频仅本地预览。'}</span><span>{modelLabel || 'Maestro Agent'}</span></div></div></div>;
 }
+
+export default Composer;

@@ -508,6 +508,42 @@ impl Database {
             let rows = statement.query_map([session_id], plan_row).map_err(db_error)?;
             let plans = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
             let metrics = read_metrics(connection, session_id)?;
+            let mut parts: std::collections::HashMap<i64, Vec<crate::domain::RunPart>> = std::collections::HashMap::new();
+            let mut parts_statement = connection.prepare(
+                "SELECT run_id, kind, text, tool_index, started_at, ended_at FROM run_parts
+                 WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1) ORDER BY run_id, seq"
+            ).map_err(db_error)?;
+            let parts_rows = parts_statement
+                .query_map([session_id], |row| {
+                    let run_id: i64 = row.get(0)?;
+                    Ok((run_id, crate::domain::RunPart {
+                        kind: row.get(1)?,
+                        text: row.get(2)?,
+                        index: row.get::<_, Option<i64>>(3)?.map(|value| value as usize),
+                        started_at: row.get(4)?,
+                        ended_at: row.get(5)?,
+                    }))
+                })
+                .map_err(db_error)?;
+            for row in parts_rows {
+                let (run_id, part) = row.map_err(db_error)?;
+                parts.entry(run_id).or_default().push(part);
+            }
+            let mut reasoning: std::collections::HashMap<i64, Vec<crate::domain::ReasoningSegment>> = std::collections::HashMap::new();
+            let mut reasoning_statement = connection.prepare(
+                "SELECT id, reasoning_json FROM runs WHERE session_id = ?1 AND reasoning_json != '[]'"
+            ).map_err(db_error)?;
+            let reasoning_rows = reasoning_statement
+                .query_map([session_id], |row| {
+                    let run_id: i64 = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    Ok((run_id, serde_json::from_str::<Vec<crate::domain::ReasoningSegment>>(&json).unwrap_or_default()))
+                })
+                .map_err(db_error)?;
+            for row in reasoning_rows {
+                let (run_id, segments) = row.map_err(db_error)?;
+                if !segments.is_empty() { reasoning.insert(run_id, segments); }
+            }
             let mut tool_statement = connection.prepare(
                 "SELECT run_id, action, detail FROM audit WHERE action IN ('tool_allowed','tool_blocked')
                  AND run_id IN (SELECT id FROM runs WHERE session_id = ?1) ORDER BY id"
@@ -553,7 +589,7 @@ impl Database {
                 let rows = statement.query_map([session_id], run_message_row).map_err(db_error)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
             };
-            Ok(SessionDetail { session, runs, plans, metrics, tools, compactions, run_messages })
+            Ok(SessionDetail { session, runs, plans, metrics, tools, compactions, run_messages, reasoning, parts })
         }).await
     }
 
@@ -564,8 +600,11 @@ impl Database {
                 .execute(
                     "INSERT INTO subagent_traces
                      (id, run_id, session_id, agent, description, prompt, model, status, summary,
-                      error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                      error, content, tool_count, input_tokens, output_tokens,
+                      reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens,
+                      last_input_tokens, started_at, finished_at, tools)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                             ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                     params![
                         trace.id,
                         trace.run_id,
@@ -581,6 +620,12 @@ impl Database {
                         trace.tool_count as i64,
                         trace.input_tokens.map(|value| value as i64),
                         trace.output_tokens.map(|value| value as i64),
+                        trace.reasoning_tokens.map(|value| value as i64),
+                        trace.first_token_ms.map(|value| value as i64),
+                        trace.elapsed_ms as i64,
+                        trace.decode_ms as i64,
+                        trace.decode_tokens as i64,
+                        trace.last_input_tokens.map(|value| value as i64),
                         trace.started_at,
                         trace.finished_at,
                         tools,
@@ -603,6 +648,12 @@ impl Database {
         tools: Vec<ToolCallView>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        first_token_ms: Option<u64>,
+        elapsed_ms: u64,
+        decode_ms: u64,
+        decode_tokens: u64,
+        last_input_tokens: Option<u64>,
         finished_at: i64,
     ) -> AppResult<()> {
         self.call(move |connection| {
@@ -611,7 +662,10 @@ impl Database {
             let changed = connection
                 .execute(
                     "UPDATE subagent_traces SET status = ?2, summary = ?3, error = ?4, content = ?5,
-                     tool_count = ?6, input_tokens = ?7, output_tokens = ?8, finished_at = ?9, tools = ?10
+                     tool_count = ?6, input_tokens = ?7, output_tokens = ?8,
+                     reasoning_tokens = ?11, first_token_ms = ?12, elapsed_ms = ?13, decode_ms = ?15,
+                     decode_tokens = ?16, last_input_tokens = ?14,
+                     finished_at = ?9, tools = ?10
                      WHERE id = ?1",
                     params![
                         id,
@@ -624,6 +678,12 @@ impl Database {
                         output_tokens.map(|value| value as i64),
                         finished_at,
                         tools,
+                        reasoning_tokens.map(|value| value as i64),
+                        first_token_ms.map(|value| value as i64),
+                        elapsed_ms as i64,
+                        last_input_tokens.map(|value| value as i64),
+                        decode_ms as i64,
+                        decode_tokens as i64,
                     ],
                 )
                 .map_err(db_error)?;
@@ -640,7 +700,10 @@ impl Database {
             let mut statement = connection
                 .prepare(
                     "SELECT id, run_id, session_id, agent, description, prompt, model, status, summary,
-                            error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools
+                            error, content, tool_count, input_tokens, output_tokens,
+                            reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens,
+                            last_input_tokens,
+                            started_at, finished_at, tools
                      FROM subagent_traces WHERE session_id = ?1 ORDER BY started_at, id",
                 )
                 .map_err(db_error)?;
@@ -717,7 +780,10 @@ impl Database {
             let mut statement = connection
                 .prepare(
                     "SELECT id, run_id, session_id, agent, description, prompt, model, status, summary,
-                            error, content, tool_count, input_tokens, output_tokens, started_at, finished_at, tools
+                            error, content, tool_count, input_tokens, output_tokens,
+                            reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens,
+                            last_input_tokens,
+                            started_at, finished_at, tools
                      FROM subagent_traces
                      WHERE session_id = ?1 AND summary != ''
                      ORDER BY started_at DESC, id DESC LIMIT ?2",
@@ -772,6 +838,54 @@ impl Database {
         }).await
     }
 
+    /// Persist one run's reasoning bursts (called once when the run finishes).
+    pub async fn save_run_reasoning(&self, run_id: i64, segments: &[crate::domain::ReasoningSegment]) -> AppResult<()> {
+        let json = serde_json::to_string(segments).map_err(|_| "reasoning serialize failed".to_string())?;
+        self.call(move |connection| {
+            connection
+                .execute("UPDATE runs SET reasoning_json = ?1 WHERE id = ?2", params![json, run_id])
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Persist one run's ordered timeline parts (called once when it finishes).
+    pub async fn save_run_parts(&self, run_id: i64, parts: &[crate::domain::RunPart]) -> AppResult<()> {
+        let rows: Vec<(i64, String, String, Option<i64>, i64, Option<i64>)> = parts
+            .iter()
+            .enumerate()
+            .map(|(seq, part)| {
+                (
+                    seq as i64,
+                    part.kind.clone(),
+                    part.text.chars().take(16_384).collect(),
+                    part.index.map(|value| value as i64),
+                    part.started_at,
+                    part.ended_at,
+                )
+            })
+            .collect();
+        self.call(move |connection| {
+            let transaction = connection.transaction().map_err(db_error)?;
+            transaction
+                .execute("DELETE FROM run_parts WHERE run_id = ?1", [run_id])
+                .map_err(db_error)?;
+            for (seq, kind, text, tool_index, started_at, ended_at) in rows {
+                transaction
+                    .execute(
+                        "INSERT INTO run_parts (run_id, seq, kind, text, tool_index, started_at, ended_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![run_id, seq, kind, text, tool_index, started_at, ended_at],
+                    )
+                    .map_err(db_error)?;
+            }
+            transaction.commit().map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn record_tool(
         &self,
         run_id: i64,
@@ -813,13 +927,18 @@ impl Database {
             let last_output = metrics.last_output_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
             let last_elapsed = i64::try_from(metrics.last_elapsed_ms).map_err(|_| "Invalid elapsed time")?;
             let last_first = metrics.last_first_token_ms.map(i64::try_from).transpose().map_err(|_| "Invalid first-token time")?;
-            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cache_hit_tokens=excluded.cache_hit_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens, attempts=excluded.attempts, last_input_tokens=excluded.last_input_tokens, last_output_tokens=excluded.last_output_tokens, last_elapsed_ms=excluded.last_elapsed_ms, last_first_token_ms=excluded.last_first_token_ms",
-                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, cache_hit, elapsed, first, cache_write, reasoning, attempts, last_input, last_output, last_elapsed, last_first]).map_err(db_error)?;
+            let ttft_steps = i64::from(metrics.ttft_steps);
+            let decode_ms = i64::try_from(metrics.decode_ms).map_err(|_| "Invalid decode time")?;
+            let decode_tokens = i64::try_from(metrics.decode_tokens).map_err(|_| "Provider token usage exceeds database range")?;
+            let tool_ms = i64::try_from(metrics.tool_ms).map_err(|_| "Invalid tool time")?;
+            connection.execute("INSERT INTO run_metrics (run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms, ttft_steps, decode_ms, decode_tokens, tool_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) ON CONFLICT(run_id) DO UPDATE SET input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cache_hit_tokens=excluded.cache_hit_tokens, elapsed_ms=excluded.elapsed_ms, first_token_ms=excluded.first_token_ms, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens, attempts=excluded.attempts, last_input_tokens=excluded.last_input_tokens, last_output_tokens=excluded.last_output_tokens, last_elapsed_ms=excluded.last_elapsed_ms, last_first_token_ms=excluded.last_first_token_ms, ttft_steps=excluded.ttft_steps, decode_ms=excluded.decode_ms, decode_tokens=excluded.decode_tokens, tool_ms=excluded.tool_ms",
+                params![metrics.run_id, metrics.session_id, metrics.provider, metrics.model, input, output, cache_hit, elapsed, first, cache_write, reasoning, attempts, last_input, last_output, last_elapsed, last_first, ttft_steps, decode_ms, decode_tokens, tool_ms]).map_err(db_error)?;
             Ok(())
         }).await
     }
 
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_file_change(&self, run_id: i64, session_id: i64, path: String, added: i64, removed: i64, before: String, after: String) -> AppResult<()> {
         self.call(move |connection| {
             connection.execute(
@@ -953,29 +1072,46 @@ fn read_metrics(connection: &Connection, session_id: i64) -> AppResult<Vec<RunMe
             })
             .transpose()
     }
-    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
+    let mut statement = connection.prepare("SELECT run_id, session_id, provider, model, input_tokens, output_tokens, cache_hit_tokens, elapsed_ms, first_token_ms, cache_write_tokens, reasoning_tokens, attempts, last_input_tokens, last_output_tokens, last_elapsed_ms, last_first_token_ms, ttft_steps, decode_ms, decode_tokens, tool_ms FROM run_metrics WHERE session_id=?1 ORDER BY run_id").map_err(db_error)?;
     let rows = statement
         .query_map([session_id], |row| {
+            let elapsed = number(row, 7)?.unwrap_or(0);
+            let first = number(row, 8)?;
+            let output = number(row, 5)?;
+            let stored_attempts = number(row, 11)?.unwrap_or(0) as u32;
+            let attempts = if stored_attempts == 0 && first.is_some() { 1 } else { stored_attempts };
+            let stored_ttft = number(row, 16)?.unwrap_or(0) as u32;
+            let stored_decode_ms = number(row, 17)?.unwrap_or(0);
+            let stored_decode_tokens = number(row, 18)?.unwrap_or(0);
+            // v15 写入器保证 first>0 ⇒ ttft_steps≥1；first>0 而 ttft_steps=0
+            // 只能是迁移前的旧行，对其按旧口径回退（不回填）。
+            let legacy = first.is_some() && stored_ttft == 0;
             Ok(RunMetrics {
                 run_id: row.get(0)?,
                 session_id: row.get(1)?,
                 provider: row.get(2)?,
                 model: row.get(3)?,
                 input_tokens: number(row, 4)?,
-                output_tokens: number(row, 5)?,
+                output_tokens: output,
                 cache_hit_tokens: number(row, 6)?,
-                elapsed_ms: number(row, 7)?.unwrap_or(0),
-                first_token_ms: number(row, 8)?,
+                elapsed_ms: elapsed,
+                first_token_ms: first,
                 cache_write_tokens: number(row, 9)?,
                 reasoning_tokens: number(row, 10)?,
-                attempts: {
-                    let stored = number(row, 11)?.unwrap_or(0) as u32;
-                    if stored == 0 && number(row, 8)?.is_some() { 1 } else { stored }
-                },
+                attempts,
                 last_input_tokens: number(row, 12)?.or(number(row, 4)?),
-                last_output_tokens: number(row, 13)?.or(number(row, 5)?),
-                last_elapsed_ms: number(row, 14)?.filter(|value| *value > 0).unwrap_or_else(|| number(row, 7).ok().flatten().unwrap_or(0)),
-                last_first_token_ms: number(row, 15)?.or(number(row, 8)?),
+                last_output_tokens: number(row, 13)?.or(output),
+                last_elapsed_ms: number(row, 14)?.filter(|value| *value > 0).unwrap_or(elapsed),
+                last_first_token_ms: number(row, 15)?.or(first),
+                ttft_steps: if legacy { attempts } else { stored_ttft },
+                decode_ms: if legacy && output.is_some() {
+                    elapsed.saturating_sub(first.unwrap_or(0))
+                } else {
+                    stored_decode_ms
+                },
+                decode_tokens: if legacy { output.unwrap_or(0) } else { stored_decode_tokens },
+                tool_ms: number(row, 19)?.unwrap_or(0),
+                live_surface_tokens: None,
             })
         })
         .map_err(db_error)?;
@@ -1035,7 +1171,7 @@ fn compaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextCompaction
 }
 
 fn subagent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentView> {
-    let tools_json: String = row.get(16)?;
+    let tools_json: String = row.get(22)?;
     let tools: Vec<ToolCallView> = serde_json::from_str(&tools_json).unwrap_or_default();
     Ok(SubagentView {
         id: row.get(0)?,
@@ -1052,8 +1188,14 @@ fn subagent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubagentView> {
         tool_count: row.get::<_, i64>(11)? as usize,
         input_tokens: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
         output_tokens: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
-        started_at: row.get(14)?,
-        finished_at: row.get(15)?,
+        reasoning_tokens: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+        first_token_ms: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        elapsed_ms: row.get::<_, i64>(16)?.max(0) as u64,
+        decode_ms: row.get::<_, Option<i64>>(17)?.unwrap_or(0).max(0) as u64,
+        decode_tokens: row.get::<_, Option<i64>>(18)?.unwrap_or(0).max(0) as u64,
+        last_input_tokens: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
+        started_at: row.get(20)?,
+        finished_at: row.get(21)?,
         reasoning: String::new(),
         tools,
     })
@@ -1143,9 +1285,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 12 {
+    if version > 15 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 12"
+            "Database schema {version} is newer than supported version 15"
         ));
     }
     connection
@@ -1375,6 +1517,49 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 13 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE runs ADD COLUMN reasoning_json TEXT NOT NULL DEFAULT '[]';
+                 CREATE TABLE run_parts (
+                    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL DEFAULT '',
+                    tool_index INTEGER,
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    ended_at INTEGER,
+                    PRIMARY KEY (run_id, seq)
+                 );
+                 CREATE INDEX run_parts_run ON run_parts(run_id, seq);
+                 PRAGMA user_version = 13;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 14 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE subagent_traces ADD COLUMN reasoning_tokens INTEGER;
+                 ALTER TABLE subagent_traces ADD COLUMN first_token_ms INTEGER;
+                 ALTER TABLE subagent_traces ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE subagent_traces ADD COLUMN last_input_tokens INTEGER;
+                 PRAGMA user_version = 14;",
+            )
+            .map_err(db_error)?;
+    }
+    if version < 15 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_metrics ADD COLUMN ttft_steps INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN decode_ms INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN decode_tokens INTEGER;
+                 ALTER TABLE run_metrics ADD COLUMN tool_ms INTEGER;
+                 ALTER TABLE subagent_traces ADD COLUMN decode_ms INTEGER;
+                 ALTER TABLE subagent_traces ADD COLUMN decode_tokens INTEGER;
+                 PRAGMA user_version = 15;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -1573,6 +1758,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrating_a_v13_database_adds_subagent_usage_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v13.sqlite3");
+        let database = Database::open(path.clone()).await.unwrap();
+        database
+            .call(|connection| {
+                connection
+                    .execute_batch(
+                        "ALTER TABLE subagent_traces DROP COLUMN reasoning_tokens;
+                         ALTER TABLE subagent_traces DROP COLUMN first_token_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN elapsed_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN last_input_tokens;
+                         ALTER TABLE subagent_traces DROP COLUMN decode_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN decode_tokens;
+                         ALTER TABLE run_metrics DROP COLUMN ttft_steps;
+                         ALTER TABLE run_metrics DROP COLUMN decode_ms;
+                         ALTER TABLE run_metrics DROP COLUMN decode_tokens;
+                         ALTER TABLE run_metrics DROP COLUMN tool_ms;
+                         PRAGMA user_version = 13;",
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        database.shutdown().await.unwrap();
+
+        let reopened = Database::open(path).await.unwrap();
+        let (columns, version) = reopened
+            .call(|connection| {
+                let mut statement = connection
+                    .prepare("PRAGMA table_info(subagent_traces)")
+                    .map_err(db_error)?;
+                let names = statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(db_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_error)?;
+                let version: i64 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(db_error)?;
+                Ok((names, version))
+            })
+            .await
+            .unwrap();
+        for column in ["reasoning_tokens", "first_token_ms", "elapsed_ms", "last_input_tokens"] {
+            assert!(columns.iter().any(|name| name == column), "missing {column}");
+        }
+        assert_eq!(version, 15);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrating_a_v12_database_adds_run_parts_and_reasoning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v12.sqlite3");
+        let database = Database::open(path.clone()).await.unwrap();
+        // Simulate a database that stopped at v12, before run_parts existed.
+        database
+            .call(|connection| {
+                connection
+                    .execute_batch(
+                        "DROP TABLE run_parts;
+                         ALTER TABLE runs DROP COLUMN reasoning_json;
+                         ALTER TABLE subagent_traces DROP COLUMN reasoning_tokens;
+                         ALTER TABLE subagent_traces DROP COLUMN first_token_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN elapsed_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN last_input_tokens;
+                         ALTER TABLE subagent_traces DROP COLUMN decode_ms;
+                         ALTER TABLE subagent_traces DROP COLUMN decode_tokens;
+                         ALTER TABLE run_metrics DROP COLUMN ttft_steps;
+                         ALTER TABLE run_metrics DROP COLUMN decode_ms;
+                         ALTER TABLE run_metrics DROP COLUMN decode_tokens;
+                         ALTER TABLE run_metrics DROP COLUMN tool_ms;
+                         PRAGMA user_version = 12;",
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+        database.shutdown().await.unwrap();
+
+        let reopened = Database::open(path).await.unwrap();
+        let (has_parts, version) = reopened
+            .call(|connection| {
+                let has_parts: i64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='run_parts'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)?;
+                let version: i64 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(db_error)?;
+                Ok((has_parts, version))
+            })
+            .await
+            .unwrap();
+        assert_eq!(has_parts, 1, "run_parts must be created when upgrading from v12");
+        assert_eq!(version, 15);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn newer_database_schema_is_rejected_without_downgrading_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("future.sqlite3");
@@ -1580,7 +1869,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 13)
+                    .pragma_update(None, "user_version", 16)
                     .map_err(db_error)
             })
             .await
@@ -1748,6 +2037,11 @@ mod tests {
                 last_output_tokens: Some(10),
                 last_elapsed_ms: 250,
                 last_first_token_ms: Some(20),
+                ttft_steps: 1,
+                decode_ms: 230,
+                decode_tokens: 10,
+                tool_ms: 0,
+                live_surface_tokens: None,
             })
             .await
             .unwrap();
@@ -1890,6 +2184,11 @@ mod tests {
                 last_output_tokens: Some(4),
                 last_elapsed_ms: 9,
                 last_first_token_ms: None,
+                ttft_steps: 0,
+                decode_ms: 0,
+                decode_tokens: 0,
+                tool_ms: 0,
+                live_surface_tokens: None,
             })
             .await
             .unwrap();
@@ -1992,6 +2291,12 @@ mod tests {
             tool_count: 0,
             input_tokens: None,
             output_tokens: None,
+            reasoning_tokens: None,
+            first_token_ms: None,
+            elapsed_ms: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            last_input_tokens: None,
             started_at: 1,
             finished_at: None,
             tools: Vec::new(),
@@ -2020,6 +2325,12 @@ mod tests {
                 tools,
                 Some(3),
                 Some(4),
+                Some(5),
+                Some(100),
+                1_000,
+                800,
+                4,
+                Some(3),
                 2,
             )
             .await
@@ -2065,6 +2376,12 @@ mod tests {
                 tool_count: 0,
                 input_tokens: None,
                 output_tokens: None,
+                reasoning_tokens: None,
+                first_token_ms: None,
+                elapsed_ms: 0,
+                decode_ms: 0,
+                decode_tokens: 0,
+                last_input_tokens: None,
                 started_at: 1,
                 finished_at: None,
                 tools: Vec::new(),

@@ -1,24 +1,38 @@
 //! Process execution adapter: the `run_command` tool body. Commands run
-//! through the platform shell inside the workspace root with a hard timeout
-//! and bounded output — the model never controls cwd, lifetime, or limits.
-use std::{path::Path, time::Duration};
+//! through the platform shell inside the workspace root with a hard timeout,
+//! a bounded output budget and a killable process tree — the model never
+//! controls cwd, lifetime, or limits.
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use tokio::process::Command;
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::watch,
+    task::JoinHandle,
+};
 
 use crate::domain::AppResult;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_COMMAND_CHARS: usize = 4096;
-const MAX_OUTPUT_CHARS: usize = 65536;
+/// Per-stream retention cap. The pipes keep being drained past this point so a
+/// chatty child can never block, but the retained bytes (and therefore memory)
+/// stay bounded regardless of how much the command prints.
+const MAX_STREAM_BYTES: usize = 65_536;
+const MAX_OUTPUT_CHARS: usize = 65_536;
+/// How long a killed tree gets to close its pipes before the drain tasks are
+/// abandoned. A grandchild that escaped the job can still hold them open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Execute `command` via the platform shell (`cmd /C` on Windows, `sh -c`
-/// elsewhere) with cwd pinned to the workspace root. On timeout the child is
-/// killed (`kill_on_drop`); a non-zero exit code still returns text — the
-/// reported `exit code N` is a mechanical fact the model cannot spin into a
-/// success claim. Grandchildren of the shell may outlive a kill (documented
-/// limitation; a full tree kill would need a platform job object).
+/// elsewhere) with cwd pinned to the workspace root. Used for commands that
+/// were not allowlisted, i.e. after the user approved them.
 pub async fn run_command(root: &Path, command: &str) -> AppResult<String> {
-    run_command_with_timeout(root, command, COMMAND_TIMEOUT).await
+    run_command_with_cancel(root, command, COMMAND_TIMEOUT, None).await
 }
 
 pub async fn run_command_with_timeout(
@@ -26,12 +40,24 @@ pub async fn run_command_with_timeout(
     command: &str,
     timeout: Duration,
 ) -> AppResult<String> {
+    run_command_with_cancel(root, command, timeout, None).await
+}
+
+/// Same as [`run_command`], but the caller may cancel the command mid-flight.
+/// On timeout or cancellation the whole process tree is terminated, the pipes
+/// are drained for at most [`DRAIN_GRACE`], then the drain tasks are abandoned.
+pub async fn run_command_with_cancel(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+    cancel: Option<watch::Receiver<bool>>,
+) -> AppResult<String> {
     let command = command.trim();
     if command.is_empty() || command.len() > MAX_COMMAND_CHARS {
         return Err("命令为空或超过 4096 字符限制".into());
     }
     let cwd = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
-    let mut process = if cfg!(windows) {
+    let process = if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.args(["/C", command]);
         process
@@ -40,61 +66,299 @@ pub async fn run_command_with_timeout(
         process.args(["-c", command]);
         process
     };
+    spawn_and_collect(process, &cwd, timeout, cancel, "无法启动 shell 进程").await
+}
+
+/// Run an already-allowlisted program directly — no shell, so no quoting,
+/// expansion or compound-command semantics apply. `program` must be an
+/// absolute path resolved through [`resolve_program`].
+pub async fn run_program(
+    root: &Path,
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+    cancel: Option<watch::Receiver<bool>>,
+) -> AppResult<String> {
+    let cwd = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+    let mut process = Command::new(program);
+    process.args(args);
+    // git would otherwise spawn a pager and refresh the index; both would make
+    // a "read-only" command write or block.
+    if program
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
+    {
+        process
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    spawn_and_collect(process, &cwd, timeout, cancel, "无法启动命令").await
+}
+
+/// Resolve a bare program name through `PATH`, never through the current
+/// directory and never to a file inside the workspace: a repository that drops
+/// a `git.exe` next to its sources must not be able to hijack the allowlist.
+pub fn resolve_program(name: &str, path: &OsStr, workspace_root: &Path) -> Option<PathBuf> {
+    let root = workspace_root.canonicalize().ok()?;
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            // An empty PATH entry means "current directory" on Windows.
+            continue;
+        }
+        for candidate_name in program_candidates(name) {
+            let candidate = dir.join(candidate_name);
+            if !candidate.is_file() {
+                continue;
+            }
+            let Ok(resolved) = candidate.canonicalize() else { continue };
+            if resolved.starts_with(&root) {
+                continue;
+            }
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// Convenience wrapper that reads the process `PATH`.
+pub fn resolve_in_path(name: &str, workspace_root: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    resolve_program(name, &path, workspace_root)
+}
+
+fn program_candidates(name: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![format!("{name}.exe"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+async fn spawn_and_collect(
+    mut process: Command,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: Option<watch::Receiver<bool>>,
+    spawn_error: &str,
+) -> AppResult<String> {
     let mut child = process
-        .current_dir(&cwd)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| "无法启动 shell 进程".to_string())?;
-    let mut stdout_pipe = child.stdout.take().ok_or("无法获取 stdout")?;
-    let mut stderr_pipe = child.stderr.take().ok_or("无法获取 stderr")?;
-    // Drain the pipes concurrently so a chatty child cannot deadlock on a
-    // full pipe buffer while we wait on it.
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf)
-            .await
-            .map(|_| buf)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf)
-            .await
-            .map(|_| buf)
-    });
-    let status = tokio::select! {
-        status = child.wait() => Some(status),
-        () = tokio::time::sleep(timeout) => None,
+        .map_err(|_| spawn_error.to_string())?;
+    let stdout_pipe = child.stdout.take().ok_or("无法获取 stdout")?;
+    let stderr_pipe = child.stderr.take().ok_or("无法获取 stderr")?;
+    let mut tree = ProcessTree::attach(&child);
+    // Drain concurrently so a chatty child cannot deadlock on a full pipe
+    // buffer, while retaining only the first MAX_STREAM_BYTES of each stream.
+    let stdout_task = tokio::spawn(drain_bounded(stdout_pipe));
+    let stderr_task = tokio::spawn(drain_bounded(stderr_pipe));
+
+    let mut cancel = cancel;
+    let end = tokio::select! {
+        status = child.wait() => End::Exited(status),
+        () = tokio::time::sleep(timeout) => End::TimedOut,
+        () = wait_for_cancel(cancel.as_mut()) => End::Cancelled,
     };
-    match status {
-        Some(Ok(status)) => {
+
+    match end {
+        End::Exited(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
-            let stdout = stdout_task.await.ok().and_then(|r| r.ok()).unwrap_or_default();
-            let stderr = stderr_task.await.ok().and_then(|r| r.ok()).unwrap_or_default();
-            let stdout = String::from_utf8_lossy(&stdout);
-            let stderr = String::from_utf8_lossy(&stderr);
+            let (stdout, stdout_dropped) = join_drain(stdout_task).await;
+            let (stderr, stderr_dropped) = join_drain(stderr_task).await;
             let mut text = format!("exit code {code}");
-            if !stdout.trim().is_empty() {
-                text.push_str(&format!(
-                    "\n--- stdout ---\n{}",
-                    stdout.chars().take(MAX_OUTPUT_CHARS).collect::<String>()
-                ));
-            }
-            if !stderr.trim().is_empty() {
-                text.push_str(&format!(
-                    "\n--- stderr ---\n{}",
-                    stderr.chars().take(MAX_OUTPUT_CHARS).collect::<String>()
-                ));
-            }
+            append_stream(&mut text, "stdout", &stdout, stdout_dropped);
+            append_stream(&mut text, "stderr", &stderr, stderr_dropped);
             Ok(text)
         }
-        Some(Err(_)) => Err("无法读取命令输出".into()),
-        None => {
-            let _ = child.start_kill();
+        End::Exited(Err(_)) => {
+            tree.terminate(&mut child);
             let _ = child.wait().await;
+            Err("无法读取命令输出".into())
+        }
+        End::TimedOut => {
+            tree.terminate(&mut child);
+            let _ = child.wait().await;
+            let _ = join_drain(stdout_task).await;
+            let _ = join_drain(stderr_task).await;
             Err(format!("命令执行超时（{}s），已终止", timeout.as_secs()))
+        }
+        End::Cancelled => {
+            tree.terminate(&mut child);
+            let _ = child.wait().await;
+            let _ = join_drain(stdout_task).await;
+            let _ = join_drain(stderr_task).await;
+            Err("命令已取消".into())
+        }
+    }
+}
+
+enum End {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+}
+
+async fn wait_for_cancel(cancel: Option<&mut watch::Receiver<bool>>) {
+    let Some(receiver) = cancel else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            // Sender gone without a cancel request: never resolve.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn drain_bounded<R>(mut pipe: R) -> (Vec<u8>, u64)
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut dropped = 0u64;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = MAX_STREAM_BYTES.saturating_sub(kept.len());
+                let take = read.min(room);
+                kept.extend_from_slice(&buf[..take]);
+                dropped += (read - take) as u64;
+            }
+        }
+    }
+    (kept, dropped)
+}
+
+async fn join_drain(mut task: JoinHandle<(Vec<u8>, u64)>) -> (Vec<u8>, u64) {
+    tokio::select! {
+        result = &mut task => result.unwrap_or((Vec::new(), 0)),
+        () = tokio::time::sleep(DRAIN_GRACE) => {
+            task.abort();
+            (Vec::new(), 0)
+        }
+    }
+}
+
+fn append_stream(text: &mut String, label: &str, bytes: &[u8], dropped: u64) {
+    let stream = String::from_utf8_lossy(bytes);
+    if stream.trim().is_empty() && dropped == 0 {
+        return;
+    }
+    text.push_str(&format!(
+        "\n--- {label} ---\n{}",
+        stream.chars().take(MAX_OUTPUT_CHARS).collect::<String>()
+    ));
+    if dropped > 0 {
+        text.push_str(&format!("\n…（输出已截断：省略 {dropped} 字节）"));
+    }
+}
+
+/// Windows job object bound to the spawned shell. Closing the last handle
+/// terminates the whole tree, which is what `kill_on_drop` alone cannot do for
+/// grandchildren. Attaching is best-effort: if any step fails we keep the
+/// single-process kill and report the limitation through the same behaviour.
+struct ProcessTree {
+    #[cfg(windows)]
+    job: Option<JobHandle>,
+}
+
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// The job handle is only ever used from the task that owns the child; handing
+// the raw pointer across threads is what tokio's spawn bound needs.
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+impl ProcessTree {
+    #[cfg(windows)]
+    fn attach(child: &tokio::process::Child) -> Self {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::{
+                JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    JobObjectExtendedLimitInformation,
+                },
+                Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+            },
+        };
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Self { job: None };
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let Some(pid) = child.id() else {
+                CloseHandle(job);
+                return Self { job: None };
+            };
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if configured == 0 || process.is_null() {
+                CloseHandle(job);
+                if !process.is_null() {
+                    CloseHandle(process);
+                }
+                return Self { job: None };
+            }
+            let assigned = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            if assigned == 0 {
+                CloseHandle(job);
+                return Self { job: None };
+            }
+            Self { job: Some(JobHandle(job)) }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn attach(_child: &tokio::process::Child) -> Self {
+        Self {}
+    }
+
+    fn terminate(&mut self, child: &mut tokio::process::Child) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            if let Some(job) = &self.job {
+                unsafe {
+                    TerminateJobObject(job.0, 1);
+                }
+                return;
+            }
+        }
+        let _ = child.start_kill();
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(job.0);
+            }
         }
     }
 }
@@ -102,6 +366,67 @@ pub async fn run_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn resolve_program_skips_the_workspace_and_empty_path_entries() {
+        let base = tempfile::tempdir().unwrap();
+        let bin = base.path().join("bin");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = if cfg!(windows) { "tool.exe" } else { "tool" };
+        std::fs::write(bin.join(tool), b"x").unwrap();
+        std::fs::write(workspace.join(tool), b"x").unwrap();
+
+        // A workspace-local binary must never win, even when it is first in PATH.
+        let path = std::env::join_paths([workspace.as_os_str(), bin.as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_program("tool", &path, &workspace).unwrap(),
+            bin.join(tool).canonicalize().unwrap()
+        );
+
+        let only_workspace = std::env::join_paths([workspace.as_os_str()]).unwrap();
+        assert!(resolve_program("tool", &only_workspace, &workspace).is_none());
+
+        // An empty PATH entry means "current directory" on Windows: skipped.
+        let with_empty = std::env::join_paths([OsStr::new(""), bin.as_os_str()]).unwrap();
+        assert!(resolve_program("tool", &with_empty, &workspace).is_some());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_program_runs_an_allowlisted_query_without_a_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let program = resolve_in_path("where", root.path()).expect("where.exe must exist");
+        let out = run_program(
+            root.path(),
+            &program,
+            &["cmd".to_string()],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("exit code 0"), "{out}");
+        assert!(out.to_lowercase().contains("cmd.exe"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_program_passes_metacharacters_literally() {
+        let root = tempfile::tempdir().unwrap();
+        let out = run_program(
+            root.path(),
+            Path::new("/bin/echo"),
+            &["a&b".to_string(), "c".to_string()],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("a&b c"), "{out}");
+    }
 
     #[tokio::test]
     async fn echo_runs_inside_the_workspace_and_reports_exit_code() {
@@ -144,5 +469,50 @@ mod tests {
         let result =
             run_command_with_timeout(root.path(), "sleep 10", Duration::from_millis(500)).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn drain_bounded_keeps_a_cap_and_counts_the_rest() {
+        let data = vec![b'x'; MAX_STREAM_BYTES + 5_000];
+        let (kept, dropped) = drain_bounded(&data[..]).await;
+        assert_eq!(kept.len(), MAX_STREAM_BYTES);
+        assert_eq!(dropped, 5_000);
+    }
+
+    #[tokio::test]
+    async fn output_beyond_the_cap_is_truncated_and_reported() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("big.txt"), "x".repeat(200_000)).unwrap();
+        let command = if cfg!(windows) { "type big.txt" } else { "cat big.txt" };
+        let out = run_command_with_timeout(root.path(), command, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(out.contains("输出已截断"), "{}", &out[..out.len().min(200)]);
+        assert!(out.len() <= MAX_OUTPUT_CHARS + 512, "retained {} chars", out.len());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_request_ends_the_command_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let (cancel, receiver) = watch::channel(false);
+        let task = tokio::spawn({
+            let root = root.path().to_path_buf();
+            async move {
+                run_command_with_cancel(
+                    &root,
+                    if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" },
+                    Duration::from_secs(60),
+                    Some(receiver),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancel must end the command, not wait for the 60s timeout")
+            .unwrap();
+        assert!(result.unwrap_err().contains("取消"));
     }
 }

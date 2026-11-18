@@ -7,7 +7,7 @@ import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunVi
 import CollapsibleBlock from './CollapsibleBlock';
 import MaestroLogo from './MaestroLogo';
 import TaskPlanPanel from './TaskPlanPanel';
-import { preloadMonaco } from '../editor/loader';
+import { preloadViewer } from '../viewer/loader';
 import PlanCard from './PlanCard';
 import ToolCallBlocks from './ToolCallBlocks';
 import type { ActiveFile, ListTab } from './RightPanel';
@@ -48,7 +48,7 @@ import { useAppearance } from '../useAppearance';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import SessionStats from './SessionStats';
 import ChatStream from './ChatStream';
-import Composer from './Composer';
+import Composer, { type ComposerHandle } from './Composer';
 import { resolveCapability } from '../modelCatalog';
 import type { ProviderId } from '../modelCapabilities';
 
@@ -160,8 +160,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const attachmentUrls = useRef(new Set<string>());
   const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => () => { for (const url of attachmentUrls.current) URL.revokeObjectURL(url); attachmentUrls.current.clear(); }, []);
-  const [prompt, setPrompt] = useState('');
-  const [promptFocus, setPromptFocus] = useState(0);
+  const composerRef = useRef<ComposerHandle>(null);
   const [navigation, setNavigation] = useState<UiView>(() => preferences.startupView);
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -211,8 +210,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [pinnedProjects, setPinnedProjects] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('maestro.ui.pinnedProjects') ?? '[]'); } catch { return []; } });
   useEffect(() => { try { localStorage.setItem('maestro.ui.pinnedProjects', JSON.stringify(pinnedProjects)); } catch { /* quota */ } }, [pinnedProjects]);
   const lastSession = useRef(c.selectedSessionId);
-  const promptBytes = new TextEncoder().encode(prompt.trim()).length;
-  const plans = c.detail?.plans ?? [];
+  const plans = useMemo(() => c.detail?.plans ?? [], [c.detail?.plans]);
   const planSteps = c.currentPlan ?? EMPTY_PLAN;
   const planCompleted = planSteps.filter((step) => step.status === 'completed').length;
   const lastChangedPath = c.lastChangedPath ?? null;
@@ -220,7 +218,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const planRunning = !stoppingActiveRun && (c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId));
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
   const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
-  const stepCount = useMemo(() => Math.max(c.detail?.tools?.length ?? 0, Object.values(c.liveTools ?? {}).reduce((total, calls) => total + calls.length, 0)), [c.detail?.tools, c.liveTools]);
+
   const panelReviewFiles = useMemo(() => reviewFileList.length ? reviewFileList : runChanges.map((change) => ({ path: change.path, before: change.before, after: change.after, status: 'applied' as const, tool: 'write_file' })), [reviewFileList, runChanges]);
   const status = agentStatus({ running: !stoppingActiveRun && (c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running')), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval) });
   // Surface suspended tool calls in the Review pane the moment they appear —
@@ -338,15 +336,22 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const dashboardData = useMemo(() => preview ? createMockDashboard(currentProject) : liveDashboard ?? createEmptyDashboard(), [preview, currentProject, liveDashboard]);
   const running = !stoppingActiveRun && c.state.activeRun?.status === 'running';
   const blocked = preview || !c.state.ready || c.pending;
-  const sessionSubagents = Object.values(c.subagents ?? {})
+  // Stable array identity: a fresh Object.values() per render would defeat
+  // memo(RightPanel) on every kernel event, not just on subagent updates.
+  const sessionSubagents = useMemo(() => Object.values(c.subagents ?? {}), [c.subagents])
     .filter((trace) => trace.sessionId === c.selectedSessionId)
     .sort((a, b) => a.startedAt - b.startedAt);
-  const subagentById = (id: string) => c.subagents?.[id];
-  const openSubagent = (id: string) => { setActiveSubagentId(id); addTab('subagents'); setReviewOpen(true); };
-  const cancelSubagent = (id: string) => {
+  const subagentById = useCallback((id: string) => c.subagents?.[id], [c.subagents]);
+  const openSubagent = useCallback((id: string) => {
+    setActiveSubagentId(id);
+    setOpenTabs((current) => current.includes('subagents') ? current : [...current, 'subagents']);
+    setListTab('subagents');
+    setReviewOpen(true);
+  }, []);
+  const cancelSubagent = useCallback((id: string) => {
     const trace = c.subagents?.[id];
     if (trace) void subagentsApi.cancel(trace.runId, id);
-  };
+  }, [c.subagents]);
   const slashSources = useSlashSources(!preview && c.state.ready, currentProject.id);
   const slashActions: SlashAction[] = [
     { id: 'plan', description: '切换到 Plan 模式（只读分析）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
@@ -360,25 +365,25 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     { id: 'extensions', description: '打开扩展（Skills / MCP）', run: () => setNavigation('extensions') },
     { id: 'activity', description: '打开活动面板', run: () => setNavigation('activity') },
     { id: 'settings', description: '打开设置', run: () => setSettingsOpen(true) },
-    { id: 'clear', description: '清空输入框', disabled: promptBytes === 0, run: () => setPrompt('') },
+    { id: 'clear', description: '清空输入框', run: () => composerRef.current?.clear() },
   ];
   const runSlashCommand = (name: string, args: string) => {
     if (preview) { setToastError('预览模式不支持自定义命令'); return; }
     void extensionsApi.readCommand(name)
-      .then((body) => setPrompt(expandCommand(body, args)))
+      .then((body) => composerRef.current?.setText(expandCommand(body, args)))
       .catch((reason) => setToastError(reason instanceof Error ? reason.message : String(reason)));
   };
 
-  const addTab = (tab: ListTab) => {
+  const addTab = useCallback((tab: ListTab) => {
     setOpenTabs((current) => current.includes(tab) ? current : [...current, tab]);
     setListTab(tab);
-  };
+  }, []);
   const openTasks = () => {
     tasksDismissed.current = false;
     addTab('tasks');
     setReviewOpen(true);
   };
-  const closeTab = (tab: ListTab) => {
+  const closeTab = useCallback((tab: ListTab) => {
     const index = openTabs.indexOf(tab);
     const next = openTabs.filter((item) => item !== tab);
     setOpenTabs(next);
@@ -387,7 +392,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       if (neighbor) setListTab(neighbor);
     }
     if (tab === 'tasks') tasksDismissed.current = true;
-  };
+  }, [openTabs, listTab]);
 
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
   useEffect(() => { autoFollowChanges.current = true; }, [c.state.activeRun?.id]);
@@ -395,7 +400,14 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     if (!reviewOpen || listTab !== 'changes' || !autoFollowChanges.current || !lastChangedPath) return;
     setActiveFile({ kind: 'change', path: lastChangedPath });
   }, [lastChangedPath, reviewOpen, listTab]);
-  useEffect(() => { const timer = window.setTimeout(preloadMonaco, 1200); return () => window.clearTimeout(timer); }, []);
+  useEffect(() => {
+    // Warm the viewer chunk as soon as the first frame settles so the first
+    // file click does not pay the import. requestIdleCallback keeps it off the
+    // startup critical path; the timer is the fallback for busy/headless envs.
+    const ric = (window as Partial<Window>).requestIdleCallback;
+    const id = ric ? ric(() => preloadViewer()) : window.setTimeout(preloadViewer, 400);
+    return () => { if (ric) window.cancelIdleCallback(id); else window.clearTimeout(id); };
+  }, []);
 
   const paletteCommands = useMemo<PaletteCommand[]>(() => {
     const themeIcon = preferences.theme === 'light' ? <Sun size={14} /> : preferences.theme === 'system' ? <Monitor size={14} /> : <Moon size={14} />;
@@ -442,14 +454,15 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     // eslint-disable-next-line react-hooks/exhaustive-deps -- returning to the chat should follow new output.
   }, [navigation]);
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>, value: string): Promise<boolean> {
     event.preventDefault();
-    if (blocked || running || promptBytes === 0 || promptBytes > 8192) {
+    const bytes = new TextEncoder().encode(value.trim()).length;
+    if (blocked || running || bytes === 0 || bytes > 8192) {
       if (running) setToastError('当前任务运行中，请先停止或等待完成');
-      return;
+      return false;
     }
     scroll.reset();
-    const submitted = prompt;
+    const submitted = value;
     const sentAttachments = attachments;
     const images = sentAttachments.map((item) => item.dataUrl).filter((url): url is string => Boolean(url));
     const texts = sentAttachments.filter((item) => item.text).map((item) => `
@@ -458,31 +471,59 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 ${item.text}\`\`\``).join('');
     if (images.length && !preview) {
       const vision = resolveCapability(capability.model, capability.provider).vision;
-      if (!vision) { setToastError('当前模型不支持视觉输入，请先移除图片附件'); return; }
+      if (!vision) { setToastError('当前模型不支持视觉输入，请先移除图片附件'); return false; }
     }
     if (c.stoppingRunId != null) {
-      if (images.length) { setToastError('等待上一轮停止后再发送图片'); return; }
+      if (images.length) { setToastError('等待上一轮停止后再发送图片'); return false; }
       c.queueStart?.(submitted + texts);
-      setPrompt(''); setAttachments([]);
+      setAttachments([]);
       setToastError('已排队，等待上一轮停止…');
-      return;
+      return true;
     }
-    setPrompt('');
     const runId = await c.start(submitted + texts, images.length ? images : undefined);
-    if (runId === undefined) setPrompt((current) => current || submitted);
-    else { setMessageAttachments((current) => ({ ...current, [runId]: sentAttachments })); setAttachments([]); }
+    // The composer clears only when the run was accepted; a failed start keeps
+    // the draft so the user can retry.
+    if (runId === undefined) return false;
+    setMessageAttachments((current) => ({ ...current, [runId]: sentAttachments }));
+    setAttachments([]);
+    return true;
   }
 
-function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); setReviewOpen(true); }
-  function selectReviewFile(path: string) { autoFollowChanges.current = false; setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }
-  function openWorkspaceFile(rawPath: string) {
+const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListTab('changes'); setReviewOpen(true); }, []);
+  const selectReviewFile = useCallback((path: string) => { autoFollowChanges.current = false; setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }, []);
+  const openWorkspaceFile = useCallback((rawPath: string) => {
     const path = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
     if (!path) return;
     setReviewOpen(true);
     setListTab('explorer');
     setActiveFile({ kind: 'workspace', path });
     if (!preview) void workspace.selectFile(path);
-  }
+  }, [preview, workspace]);
+
+  // Stable identities for the chat subtree: without these, memo(ChatStream)
+  // never matches and every keystroke re-renders the whole history.
+  const scrollApi = useRef(scroll);
+  scrollApi.current = scroll;
+  const compactions = useMemo(() => c.compactions ?? [], [c.compactions]);
+  const handleDecidePlan = useCallback((plan: Parameters<NonNullable<typeof c.decidePlan>>[0], decision: Parameters<NonNullable<typeof c.decidePlan>>[1]) => {
+    void c.decidePlan?.(plan, decision);
+  }, [c.decidePlan]);
+  const handleEditPrompt = useCallback((text: string) => { composerRef.current?.setText(text); }, []);
+  const handleJumpToTurn = useCallback((runId: number) => {
+    const root = history.current;
+    const turn = root?.querySelector<HTMLElement>(`[data-turn-id="${runId}"]`);
+    if (!root || !turn) return;
+    const top = root.scrollTop + turn.getBoundingClientRect().top - root.getBoundingClientRect().top - 12;
+    scrollApi.current.scrollToTop(top);
+  }, []);
+  const handleResolveApproval = useCallback((runId: number, decision: Parameters<NonNullable<typeof c.resolveApproval>>[1], commandScope?: Parameters<NonNullable<typeof c.resolveApproval>>[2], feedback?: string) => {
+    void c.resolveApproval?.(runId, decision, commandScope, feedback);
+  }, [c.resolveApproval]);
+  const footerNode = useMemo(() => runSummary && runSummary.files > 0 && !running ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
+    loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
+    onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
+    onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
+    onRevert={previewRevert} /> : null, [runSummary, runChanges, runChangesLoading, runChangesError, running, preview, workspace]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -492,7 +533,7 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
       if (!action) return;
       // The command palette is a global gesture (works from any input); other
       // shortcuts stay suspended while typing to avoid background navigation.
-      if (action !== 'search' && event.target instanceof Element && event.target.closest('input,textarea,[contenteditable="true"],.monaco-editor')) return;
+      if (action !== 'search' && event.target instanceof Element && event.target.closest('input,textarea,[contenteditable="true"],.viewer-container')) return;
       event.preventDefault();
       if (action === 'settings') setSettingsOpen(true);
       if (action === 'activity') setNavigation('activity');
@@ -562,34 +603,24 @@ function reviewPlan(id: number) { setSelectedPlanId(id); setListTab('changes'); 
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
-              detailTools={c.detail?.tools} liveTools={c.liveTools} liveTimeline={c.liveTimeline}
+              detailTools={c.detail?.tools} detailReasoning={c.detail?.reasoning} detailParts={c.detail?.parts} liveTools={c.liveTools} liveTimeline={c.liveTimeline}
               plans={plans} reasoningDisplay={preferences.reasoningDisplay} theme={theme} preview={preview}
               messageAttachments={messageAttachments} pending={c.pending}
-              onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={(plan, decision) => void c.decidePlan(plan, decision)}
+              onCopyError={setToastError} onReviewPlan={reviewPlan} onDecidePlan={handleDecidePlan}
               onSelectFile={selectReviewFile}
               onOpenFile={openWorkspaceFile}
               onOpenSubagent={openSubagent} subagentById={subagentById}
-              onEditPrompt={(text) => { setPrompt(text); setPromptFocus((value) => value + 1); }}
-              onJumpToTurn={(runId) => {
-                const root = history.current;
-                const turn = root?.querySelector<HTMLElement>(`[data-turn-id="${runId}"]`);
-                if (!root || !turn) return;
-                const top = root.scrollTop + turn.getBoundingClientRect().top - root.getBoundingClientRect().top - 12;
-                scroll.scrollToTop(top);
-              }}
-              onResolveApproval={preview || !c.resolveApproval ? undefined : (runId, decision, commandScope, feedback) => void c.resolveApproval!(runId, decision, commandScope, feedback)}
-              compactions={c.compactions ?? []}
-              footer={runSummary && runSummary.files > 0 && !running ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
-                loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
-                onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
-                onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
-                onRevert={previewRevert} /> : null}
+              onEditPrompt={handleEditPrompt}
+              onJumpToTurn={handleJumpToTurn}
+              onResolveApproval={preview || !c.resolveApproval ? undefined : handleResolveApproval}
+              compactions={compactions}
+              footer={footerNode}
               onScroll={scroll.onScroll} />
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
-              onSubmit={(event) => void submit(event)} attachments={attachments} onAttachmentsChange={setAttachments}
-              blocked={blocked} prompt={prompt} onPromptChange={setPrompt} promptBytes={promptBytes} focusRequest={promptFocus}
+              ref={composerRef} onSubmit={submit} attachments={attachments} onAttachmentsChange={setAttachments}
+              blocked={blocked}
               preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
-              status={status} steps={stepCount} currentProject={currentProject} projects={projects}
+              status={status} currentProject={currentProject} projects={projects}
               onSelectProject={(id) => c.selectProject?.(id)}
               onSetProjectPath={c.updateProjectPath ? (id, dir) => c.updateProjectPath!(id, dir) : undefined}
               onBrowse={preview ? undefined : pickDirectory}

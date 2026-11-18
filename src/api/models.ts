@@ -16,9 +16,16 @@ export interface CatalogModel {
   reasoningLevels: string[];
 }
 
-/// Ask the provider for its real model list (live Tauri only).
-export const fetchModelsApi = (provider: ProviderId | (string & {}), baseUrl: string, apiKey: string) =>
-  invoke<FetchedModel[]>('fetch_models', { provider: wireProvider(provider), baseUrl, apiKey });
+/// Ask the provider for its real model list (live Tauri only). `apiKey` is only
+/// the unsaved draft from the settings form; the backend resolves the stored
+/// credential when it is omitted.
+export const fetchModelsApi = (provider: ProviderId | (string & {}), baseUrl: string, apiKey?: string) =>
+  invoke<FetchedModel[]>('fetch_models', {
+    provider: wireProvider(provider),
+    baseUrl,
+    apiKey: apiKey?.trim() || null,
+    credential_provider: provider,
+  });
 
 /// Fetch the public models.dev catalog via the Rust `model_catalog` command.
 export const fetchCatalogApi = () => invoke<CatalogModel[]>('model_catalog');

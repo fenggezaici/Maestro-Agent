@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use crate::{
     adapters::{fs::workspace::WorkspaceService, llm::{ChatConfig, Provider}},
     commands::require_main,
-    domain::{AppResult, ApprovalDecision, ChatMessage, CommandScope, Mode, QuestionAnswer, RunView, Snapshot, SubagentView},
+    domain::{AppResult, ApprovalDecision, ApprovalRule, ChatMessage, CommandScope, Mode, QuestionAnswer, RunView, Snapshot, SubagentView},
     services::kernel::Kernel,
 };
 
@@ -37,11 +37,13 @@ pub async fn stream_chat(
     kernel: State<'_, Arc<Kernel>>,
     workspace: State<'_, WorkspaceService>,
     messages: Vec<ChatMessage>,
-    api_key: String,
     base_url: String,
     model: String,
     session_id: Option<i64>,
     provider: Option<Provider>,
+    // Profile id the key was stored under; custom endpoints share the OpenAI
+    // wire format but keep their own credential.
+    credential_provider: Option<String>,
     reasoning_effort: Option<String>,
     max_output: Option<u64>,
     context_window: Option<u64>,
@@ -49,11 +51,17 @@ pub async fn stream_chat(
     if window.label() != "main" || app.get_webview_window("main").is_none() {
         return Err("Only the main window may start a chat".into());
     }
+    let provider = provider.unwrap_or_default();
+    // The key is resolved from the OS-protected store, never from the request.
+    let api_key = kernel
+        .credentials()
+        .get(credential_provider.as_deref().unwrap_or_else(|| provider.name()))?
+        .unwrap_or_default();
     let config = ChatConfig {
         api_key,
         base_url,
         model,
-        provider: provider.unwrap_or_default(),
+        provider,
         reasoning: reasoning_effort,
         max_output,
         context_window,
@@ -102,7 +110,35 @@ pub async fn resolve_tool_approval(
 ) -> AppResult<()> {
     require_main(&window)?;
     kernel
-        .resolve_approval(run_id, decision, command_scope.unwrap_or(CommandScope::Prefix), feedback)
+        .resolve_approval(run_id, decision, command_scope.unwrap_or_default(), feedback)
+        .await
+}
+
+/// Session-scoped "always allow" rules currently in force. Rules are derived
+/// from exact command/argument identities by default; the UI shows them so a
+/// wide (prefix) rule can be reviewed and revoked.
+#[tauri::command]
+pub async fn list_approval_rules(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+) -> AppResult<Vec<ApprovalRule>> {
+    require_main(&window)?;
+    kernel.list_approval_rules(run_id).await
+}
+
+#[tauri::command]
+pub async fn revoke_approval_rule(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    run_id: i64,
+    tool: String,
+    pattern: String,
+    prefix: bool,
+) -> AppResult<bool> {
+    require_main(&window)?;
+    kernel
+        .revoke_approval_rule(run_id, &ApprovalRule { tool, pattern, prefix })
         .await
 }
 

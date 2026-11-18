@@ -1,7 +1,7 @@
 import { ChevronDown, FileCode2, Folder } from 'lucide-react';
 import { useMemo } from 'react';
 import { useT } from '../i18n';
-import MonacoCode from './MonacoCode';
+import CodeViewer from './CodeViewer';
 import type { ExplorerFile } from './workbenchMock';
 
 export interface ExplorerViewState { selected: string | null; closedFolders: string[] }
@@ -41,7 +41,7 @@ export default function ExplorerPanel({ files, scope, view, onViewChange, fontSi
   return <section aria-label="文件浏览器" className="explorer-pane">
     <div className="explorer-summary"><strong>{t.workspaceFiles}</strong><span className="mock-badge">{t.virtual}</span></div>
     <nav aria-label="虚拟文件树" className="explorer-tree">{nodes(tree)}</nav>
-    {selected ? <><div className="explorer-file-heading"><FileCode2 size={13} /><span>{selected.path}</span><small>{selected.source === 'mock' ? 'Mock' : 'Proposal'}</small></div><MonacoCode file={selected} fontSize={fontSize} fontFamily={fontFamily} /></>
+    {selected ? <><div className="explorer-file-heading"><FileCode2 size={13} /><span>{selected.path}</span><small>{selected.source === 'mock' ? 'Mock' : 'Proposal'}</small></div><CodeViewer file={selected} fontSize={fontSize} fontFamily={fontFamily} /></>
       : <div className="editor-empty">没有可预览的文件。</div>}
     <p className="review-safety-note">虚拟文件树与提议内容，不代表磁盘读取。不写入文件。</p>
   </section>;

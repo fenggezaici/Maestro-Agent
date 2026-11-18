@@ -23,6 +23,9 @@ const IGNORED: &[&str] = &[
     ".next",
     ".cache",
     ".pnpm",
+    "__pycache__",
+    ".venv",
+    "venv",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,7 +50,10 @@ struct Budget {
 
 pub struct WorkspaceService {
     root: Arc<RwLock<Option<PathBuf>>>,
+    /// Scan/select budget. A directory scan can take seconds on a large
+    /// workspace; file reads must not queue behind it, so they get their own.
     gate: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
 }
 
 impl Default for WorkspaceService {
@@ -55,6 +61,7 @@ impl Default for WorkspaceService {
         Self {
             root: Arc::new(RwLock::new(None)),
             gate: Arc::new(Semaphore::new(4)),
+            reads: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -67,9 +74,24 @@ impl WorkspaceService {
         &self,
         operation: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
-        let permit = self
-            .gate
-            .clone()
+        self.blocking_with(self.gate.clone(), operation).await
+    }
+
+    /// File reads use their own permit pool so a long scan cannot starve the
+    /// preview pane (which showed a permanent "正在读取文件内容…").
+    async fn blocking_read<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        self.blocking_with(self.reads.clone(), operation).await
+    }
+
+    async fn blocking_with<T: Send + 'static>(
+        &self,
+        semaphore: Arc<Semaphore>,
+        operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| "Workspace service is closed".to_string())?;
@@ -143,7 +165,7 @@ impl WorkspaceService {
 
     pub async fn text(&self, workspace: String, relative: String) -> Result<String, String> {
         let root = self.root();
-        self.blocking(move || {
+        self.blocking_read(move || {
             let approved = authorized(root.as_deref(), &workspace)?;
             read_text(&approved, &relative)
         })
@@ -333,6 +355,40 @@ fn read_text(root: &Path, relative: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(test)]
+    impl WorkspaceService {
+        /// Hold every scan permit so a read can be proven independent of them.
+        async fn exhaust_scan_gate(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+            let mut permits = Vec::new();
+            for _ in 0..4 {
+                permits.push(self.gate.clone().acquire_owned().await.unwrap());
+            }
+            permits
+        }
+    }
+
+    #[tokio::test]
+    async fn file_reads_do_not_queue_behind_directory_scans() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("a.txt"), "hello").unwrap();
+        let service = WorkspaceService::default();
+        let info = service
+            .select(temporary.path().to_str().unwrap().to_string())
+            .await
+            .unwrap();
+        let root = info.path.expect("selected root");
+        // All four scan permits held: a shared semaphore would block the read.
+        let permits = service.exhaust_scan_gate().await;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.text(root, "a.txt".into()),
+        )
+        .await;
+        assert!(read.is_ok(), "file read must not queue behind directory scans");
+        assert_eq!(read.unwrap().unwrap(), "hello");
+        drop(permits);
+    }
 
     #[test]
     fn scans_actual_files_empty_folders_and_prunes_ignored_directories() {

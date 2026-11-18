@@ -1,0 +1,126 @@
+# 暂未启用：远端 Actions 尚未配置。本地等价门禁见 scripts/ci.mjs（corepack pnpm verify）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install frontend dependencies
+        run: corepack pnpm install --frozen-lockfile
+
+      - name: Frontend tests (unit / integration / render guards)
+        run: corepack pnpm test
+
+      - name: Frontend build (typecheck + bundle)
+        run: corepack pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Rust lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
+
+      - name: Rust tests (unit + integration + IPC/ACL contracts)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
+
+  e2e-preview:
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install frontend dependencies
+        run: corepack pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: corepack pnpm exec playwright install chromium
+
+      - name: Build preview bundle
+        run: corepack pnpm build
+
+      - name: Preview E2E (no IPC)
+        run: node scripts/e2e-preview.mjs
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-preview-artifacts
+          path: artifacts/e2e
+          if-no-files-found: ignore
+
+  # tauri-driver 桌面 E2E 需要与 WebView2 匹配的 msedgedriver，且首版用例还在稳定中，
+  # 因此单独成 job 并允许失败；稳定后去掉 continue-on-error 即可作为发布门槛。
+  e2e-desktop:
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: corepack pnpm install --frozen-lockfile
+
+      # Debug builds load `build.devUrl`; the E2E script owns a Vite dev server.
+      - name: Build desktop app with the WebDriver bridge
+        run: cargo build --manifest-path src-tauri/Cargo.toml --features tauri/test
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Install matching msedgedriver
+        run: node scripts/e2e-driver-setup.mjs
+
+      - name: Desktop E2E (real IPC)
+        run: node scripts/e2e-desktop.mjs
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-desktop-artifacts
+          path: artifacts/e2e
+          if-no-files-found: ignore

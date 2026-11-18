@@ -67,6 +67,30 @@ pub struct RunView {
     pub created_at: i64,
 }
 
+/// One ordered piece of a run's timeline, mirroring ZCode's message parts:
+/// replaying them in `seq` order reproduces the live interleaving exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunPart {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub ended_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSegment {
+    pub text: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
 /// Unix seconds for a freshly created run (wall clock, UI relative time only).
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -134,6 +158,13 @@ pub struct SessionDetail {
     pub compactions: Vec<ContextCompaction>,
     #[serde(default)]
     pub run_messages: Vec<RunMessage>,
+    /// Persisted reasoning bursts per run id; the live timeline is memory-only.
+    #[serde(default)]
+    pub reasoning: std::collections::HashMap<i64, Vec<ReasoningSegment>>,
+    /// Ordered timeline parts per run (reasoning / tool / content), persisted so
+    /// replay keeps the exact interleaving instead of a heuristic ordering.
+    #[serde(default)]
+    pub parts: std::collections::HashMap<i64, Vec<RunPart>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

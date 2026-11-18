@@ -2,11 +2,9 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, expect, it, vi } from 'vitest';
 import PreviewApp from '../preview/PreviewApp';
 import MarkdownMessage from './MarkdownMessage';
-import type { ProposedDiff } from '../api/types';
 import type { ExplorerFile } from './workbenchMock';
 
-vi.mock('./MonacoDiff', () => ({ default: ({ diff }: { diff: ProposedDiff }) => <section aria-label={`Diff ${diff.path}`} /> }));
-vi.mock('./MonacoCode', () => ({ default: ({ file }: { file: ExplorerFile }) => <section aria-label={`文件预览 ${file.path}`} /> }));
+vi.mock('./CodeViewer', () => ({ default: ({ file }: { file: ExplorerFile }) => <section aria-label={`文件预览 ${file.path}`} /> }));
 const copy = vi.fn().mockResolvedValue(undefined);
 const revoke = vi.fn();
 beforeEach(() => {

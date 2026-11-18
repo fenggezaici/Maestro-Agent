@@ -61,9 +61,21 @@ const HISTORY_HINT: &str = "历史中被中断的轮次只包含部分输出；�
 
 const TASK_PLAN_HINT: &str = "在执行涉及多个文件或步骤的复杂任务前，必须先调用 update_plan 列出计划（每个步骤包含 id、description、status；初始为 pending，当前要做的步骤为 in_progress）。在后续执行中，每完成一步，必须重新调用 update_plan 提交完整步骤列表并更新各步状态；全部完成时所有步骤都应为 completed。简单的单步任务可以跳过。";
 
+/// How many bytes of prior turns may be replayed, derived from the model's
+/// context window instead of a fixed 128 KiB: a 1M-token model should not be
+/// handed the same history as a 128k one (that silently truncated the
+/// conversation and made the context ring drop between turns).
+pub fn replay_budget_bytes(context_window: Option<u64>) -> usize {
+    const DEFAULT_WINDOW_TOKENS: u64 = 128_000;
+    // ~4 bytes per token, 60% of the window reserved for replayed history.
+    let window = context_window.filter(|value| *value > 0).unwrap_or(DEFAULT_WINDOW_TOKENS);
+    let bytes = (window as f64 * 0.6 * 4.0) as u64;
+    bytes.clamp(65_536, 8 * 1024 * 1024) as usize
+}
+
 /// Conversation assembly: system policy for the run's mode plus prior
-/// completed turns of the same session within a byte budget.
-pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
+/// completed turns of the same session within a window-derived byte budget.
+pub fn conversation(detail: &SessionDetail, run: &RunView, context_window: Option<u64>) -> Vec<ChatMessage> {
     let policy = match run.mode {
         Mode::Plan => "你处于只读计划模式。仅可使用列表中提供的只读工具进行分析；写操作与命令执行不会出现在工具列表中，也不得声称已应用变更。",
         Mode::Code => "你处于 Code 模式。读操作和写文件/补丁直接执行；只有危险命令会挂起等待批准，安全命令直接执行——以工具结果为准，不得声称已应用未成功的修改。",
@@ -98,7 +110,7 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
                 && item.status != RunStatus::Running
         })
         .collect();
-    let mut budget = 131072usize;
+    let mut budget = replay_budget_bytes(context_window);
     let mut included = Vec::new();
     for item in prior.into_iter().rev().take(32) {
         let summary = tool_summary(detail, item.id);
@@ -109,10 +121,21 @@ pub fn conversation(detail: &SessionDetail, run: &RunView) -> Vec<ChatMessage> {
             .filter(|message| message.run_id == item.id)
             .cloned()
             .collect();
-        let message_bytes: usize = run_messages.iter().map(|message| message.content.len()).sum();
+        let mut message_bytes: usize = run_messages.iter().map(|message| message.content.len()).sum();
         let mut size = item.prompt.len() + output.len() + summary.len() + message_bytes;
         if size > budget {
             output = truncate_middle(&output, 4096);
+            size = item.prompt.len() + output.len() + summary.len() + message_bytes;
+        }
+        if size > budget {
+            // Compress tool bodies before dropping the run: clearing the whole
+            // list loses the conversation shape the model needs to continue.
+            for message in &mut run_messages {
+                if message.content.len() > 4096 {
+                    message.content = truncate_middle(&message.content, 4096);
+                }
+            }
+            message_bytes = run_messages.iter().map(|message| message.content.len()).sum();
             size = item.prompt.len() + output.len() + summary.len() + message_bytes;
         }
         if size > budget {
@@ -208,8 +231,9 @@ pub fn conversation_with_reports(
     detail: &SessionDetail,
     run: &RunView,
     reports: &str,
+    context_window: Option<u64>,
 ) -> Vec<ChatMessage> {
-    let mut messages = conversation(detail, run);
+    let mut messages = conversation(detail, run, context_window);
     if !reports.trim().is_empty() {
         messages.insert(1, ChatMessage::text("system", reports));
     }
@@ -278,12 +302,28 @@ async fn stream_turn(
                 last_first_token_ms: None,
                 elapsed_ms: 0,
                 first_token_ms: None,
+                ttft_steps: 0,
+                decode_ms: 0,
+                decode_tokens: 0,
+                tool_ms: 0,
+                live_surface_tokens: None,
             };
             // Drain relay: drop any buffered events the instant the run is
             // cancelled — this is what makes "stop" actually stop the stream.
             let mut reasoning_buf = String::new();
             let mut content_buf = String::new();
             let mut last_chunk = Instant::now();
+            let mut saw_done = false;
+            let mut last_delta_ms: Option<u64> = None;
+            // DSH surfaceTokens 口径：当前请求已流式 surface 文本的估算 tokens
+            // （content+reasoning，CJK=1/其他÷4）。provider 上报 output usage
+            // 后计数清零——估算只覆盖最近一个 usage 样本之后的文本。
+            let mut surface_cjk: u64 = 0;
+            let mut surface_other: u64 = 0;
+            let surface_est = |metrics: &mut RunMetrics, cjk: u64, other: u64| {
+                let est = cjk + other.div_ceil(4);
+                metrics.live_surface_tokens = (est > 0).then_some(est);
+            };
             loop {
                 let event = tokio::select! {
                     biased;
@@ -301,48 +341,105 @@ async fn stream_turn(
                 let Some(event) = event else {
                     flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                     flush_content(&kernel, run_id, &mut content_buf).await;
+                    // DSH：usage 样本在请求失败时仍然保留（tokenUsage），但失败
+                    // step 不进 sessionStats —— 无 Done 的终止只折叠 usage 桶，
+                    // 不贡献 attempts/ttft/decode/llmMs。
+                    if !saw_done {
+                        metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                        log_step_timing("aborted", &metrics, first_token_ms, last_delta_ms);
+                        if metrics.input_tokens.is_some()
+                            || metrics.output_tokens.is_some()
+                            || metrics.cache_hit_tokens.is_some()
+                            || metrics.cache_write_tokens.is_some()
+                            || metrics.reasoning_tokens.is_some()
+                        {
+                            let _ = kernel.report_usage_sample(metrics.clone()).await;
+                        }
+                    }
                     break;
                 };
+                // DSH 口径（dsh-llm isTokenDelta）：首个非空 text/reasoning/
+                // tool-call delta 即首 token，三种 delta 共用同一打点与 tick。
+                let is_delta = matches!(
+                    event,
+                    StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta
+                );
                 match event {
                     StreamEvent::Reasoning(token) => {
+                        count_surface(&token, &mut surface_cjk, &mut surface_other);
                         reasoning_buf.push_str(&token);
                         if reasoning_buf.len() >= STREAM_CHUNK_BYTES || last_chunk.elapsed() >= STREAM_CHUNK_INTERVAL {
                             flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                             last_chunk = Instant::now();
                         }
                     }
+                    StreamEvent::ToolCallDelta => {
+                        // A tool-call delta also ends the current thought burst.
+                        flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
+                    }
                     StreamEvent::Token(token) => {
+                        count_surface(&token, &mut surface_cjk, &mut surface_other);
                         // A content delta always ends the current thought burst.
                         flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
-                        if first_token_ms.is_none() {
-                            first_token_ms = Some(started.elapsed().as_millis() as u64);
-                            metrics.first_token_ms = first_token_ms;
-                        }
                         content_buf.push_str(&token);
                         if content_buf.len() >= STREAM_CHUNK_BYTES || last_chunk.elapsed() >= STREAM_CHUNK_INTERVAL {
                             flush_content(&kernel, run_id, &mut content_buf).await;
                             last_chunk = Instant::now();
                         }
-                        if reported.elapsed() >= METRICS_REPORT_INTERVAL {
-                            metrics.elapsed_ms = started.elapsed().as_millis() as u64;
-                            let _ = kernel.report_metrics(metrics.clone(), false).await;
-                            reported = Instant::now();
-                        }
                     }
                     StreamEvent::Usage { input, output, cache_hit, cache_write, reasoning } => {
                         flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                         flush_content(&kernel, run_id, &mut content_buf).await;
-                        metrics.input_tokens = input.or(metrics.input_tokens);
-                        metrics.output_tokens = output.or(metrics.output_tokens);
-                        metrics.cache_hit_tokens = cache_hit.or(metrics.cache_hit_tokens);
-                        metrics.cache_write_tokens = cache_write.or(metrics.cache_write_tokens);
-                        metrics.reasoning_tokens = reasoning.or(metrics.reasoning_tokens);
+                        // DSH tokenUsage addReplacing：同一请求的后续 usage
+                        // 样本替换前值（Anthropic message_start 带
+                        // output_tokens:1 种子，最终值在 message_delta）。
+                        if let Some(value) = input { metrics.input_tokens = Some(value); }
+                        if let Some(value) = output { metrics.output_tokens = Some(value); }
+                        if let Some(value) = cache_hit { metrics.cache_hit_tokens = Some(value); }
+                        if let Some(value) = cache_write { metrics.cache_write_tokens = Some(value); }
+                        if let Some(value) = reasoning { metrics.reasoning_tokens = Some(value); }
+                        // Provider 的 output usage 样本已覆盖此前流式文本——
+                        // 估算计数清零，只统计该样本之后的新文本。
+                        if output.is_some() {
+                            surface_cjk = 0;
+                            surface_other = 0;
+                        }
+                        // Surface usage the moment the provider reports it
+                        // (Anthropic sends input usage at message_start) instead
+                        // of waiting for the next delta tick or Done.
+                        surface_est(&mut metrics, surface_cjk, surface_other);
+                        let _ = kernel.report_metrics(metrics.clone(), false).await;
+                        reported = Instant::now();
                     }
                     StreamEvent::Done => {
                         flush_reasoning(&kernel, run_id, &mut reasoning_buf).await;
                         flush_content(&kernel, run_id, &mut content_buf).await;
                         metrics.elapsed_ms = started.elapsed().as_millis() as u64;
                         let _ = kernel.report_metrics(metrics.clone(), true).await;
+                        log_step_timing("done", &metrics, first_token_ms, last_delta_ms);
+                        saw_done = true;
+                    }
+                }
+                if is_delta {
+                    let now_ms = started.elapsed().as_millis() as u64;
+                    last_delta_ms = Some(now_ms);
+                    if first_token_ms.is_none() {
+                        first_token_ms = Some(now_ms);
+                        metrics.first_token_ms = first_token_ms;
+                        // Emit immediately so TTFT shows without waiting for the
+                        // 200ms tick.
+                        metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                        surface_est(&mut metrics, surface_cjk, surface_other);
+                        let _ = kernel.report_metrics(metrics.clone(), false).await;
+                        reported = Instant::now();
+                    }
+                    // Tick on every delta kind: a long reasoning burst must keep
+                    // the stats line live instead of freezing until content.
+                    if reported.elapsed() >= METRICS_REPORT_INTERVAL {
+                        metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                        surface_est(&mut metrics, surface_cjk, surface_other);
+                        let _ = kernel.report_metrics(metrics.clone(), false).await;
+                        reported = Instant::now();
                     }
                 }
             }
@@ -362,7 +459,232 @@ struct ChildOutcome {
     error: Option<String>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    first_token_ms: Option<u64>,
+    elapsed_ms: u64,
+    /// Σ 每次 LLM 调用的 decode 窗口（首 delta → 末 delta），仅计入上报
+    /// output usage 且流正常结束的调用 —— 与 DSH decodeTokens/decodeMs 同口径。
+    decode_ms: u64,
+    /// 与 decode_ms 成对的 output tokens。
+    decode_tokens: u64,
+    last_input_tokens: Option<u64>,
     tool_count: usize,
+}
+
+/// DSH surfaceTokens 同款文本密度估算：CJK（U+3400–U+9FFF，与前端
+/// `estimateTokens` 的 `[㐀-鿿]` 同区间）每字 1 token，其余每 4 字符
+/// 1 token。只用于 live 显示，永不进持久化。
+fn count_surface(text: &str, cjk: &mut u64, other: &mut u64) {
+    for ch in text.chars() {
+        if ('\u{3400}'..='\u{9fff}').contains(&ch) {
+            *cjk += 1;
+        } else {
+            *other += 1;
+        }
+    }
+}
+
+/// Per-request timing breakdown for diagnosing where the decode window goes:
+/// `active` = 首 delta → 末 delta（真实生成期），`tail` = 末 delta → 流终止
+/// （usage/[DONE] 帧等待）。与既有 `LLM retry` 日志同级，无敏感数据。
+fn log_step_timing(tag: &str, metrics: &RunMetrics, first_ms: Option<u64>, last_delta_ms: Option<u64>) {
+    let active = match (first_ms, last_delta_ms) {
+        (Some(first), Some(last)) => format!("{}ms", last.saturating_sub(first)),
+        _ => "—".to_string(),
+    };
+    let tail = last_delta_ms
+        .map(|last| format!("{}ms", metrics.elapsed_ms.saturating_sub(last)))
+        .unwrap_or_else(|| "—".to_string());
+    let ttft = first_ms
+        .map(|first| format!("{first}ms"))
+        .unwrap_or_else(|| "—".to_string());
+    eprintln!(
+        "LLM step timing {tag} run_id={} ttft={ttft} active={active} tail={tail} output={:?}",
+        metrics.run_id, metrics.output_tokens
+    );
+}
+
+fn add_tokens(total: Option<u64>, extra: Option<u64>) -> Option<u64> {
+    match (total, extra) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
+}
+
+/// One completed provider call's drained stream, kept separate so tool calls
+/// and retries can't contaminate the per-call decode window.
+#[derive(Default)]
+struct SubagentCall {
+    /// 子智能体启动 → 本调用首个有效 delta（content/reasoning/tool-call）。
+    first_delta_ms: Option<u64>,
+    /// 首 delta → 末 delta；仅当本调用上报了 output usage 才计入。
+    decode_ms: u64,
+    /// 与 decode_ms 成对的 output tokens（仅本调用有 decode 窗口时计入）。
+    decode_tokens: u64,
+    partial: String,
+    input: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+    last_input: Option<u64>,
+}
+
+/// 并发排空子智能体的流事件：与 stream 同时进行才能拿到真实的
+/// delta 到达时刻（事后 try_recv 排空会把整段流压成一个时刻）。
+/// 每次调用同时把 metrics 折进父 run 的累计（父 run_id）——子智能体的
+/// LLM 调用就是一次真实 model step，会话统计行应在子执行期间同样跳动。
+/// 子调用排空的父会话归属：metrics 折叠到该 run/session。
+struct SubagentDrainCtx {
+    run_id: i64,
+    session_id: i64,
+    provider: String,
+    model: String,
+    subagent_id: String,
+}
+
+async fn drain_subagent_stream(
+    kernel: Arc<Kernel>,
+    ctx: SubagentDrainCtx,
+    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
+    started: Instant,
+) -> SubagentCall {
+    let SubagentDrainCtx { run_id, session_id, provider, model, subagent_id } = ctx;
+    let mut call = SubagentCall::default();
+    let mut last_delta_ms = None;
+    // 父 metrics 口径按“本调用”计时（与 stream_turn relay 同构）。
+    let call_started = Instant::now();
+    let mut reported = Instant::now();
+    let mut call_first_ms: Option<u64> = None;
+    let mut call_last_ms: Option<u64> = None;
+    let mut saw_done = false;
+    let mut surface_cjk: u64 = 0;
+    let mut surface_other: u64 = 0;
+    let mut metrics = RunMetrics {
+        run_id,
+        session_id,
+        provider,
+        model,
+        input_tokens: None,
+        output_tokens: None,
+        cache_hit_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        attempts: 0,
+        last_input_tokens: None,
+        last_output_tokens: None,
+        last_elapsed_ms: 0,
+        last_first_token_ms: None,
+        elapsed_ms: 0,
+        first_token_ms: None,
+        ttft_steps: 0,
+        decode_ms: 0,
+        decode_tokens: 0,
+        tool_ms: 0,
+        live_surface_tokens: None,
+    };
+    let surface_est = |m: &mut RunMetrics, cjk: u64, other: u64| {
+        let est = cjk + other.div_ceil(4);
+        m.live_surface_tokens = (est > 0).then_some(est);
+    };
+    while let Some(event) = rx.recv().await {
+        // DSH isTokenDelta：text/reasoning/tool-call delta 都算有效增量。
+        let is_delta = matches!(
+            event,
+            StreamEvent::Token(_) | StreamEvent::Reasoning(_) | StreamEvent::ToolCallDelta
+        );
+        if is_delta {
+            let at = started.elapsed().as_millis() as u64;
+            if call.first_delta_ms.is_none() {
+                call.first_delta_ms = Some(at);
+            }
+            last_delta_ms = Some(at);
+            let call_at = call_started.elapsed().as_millis() as u64;
+            call_last_ms = Some(call_at);
+            if call_first_ms.is_none() {
+                call_first_ms = Some(call_at);
+                metrics.first_token_ms = call_first_ms;
+                metrics.elapsed_ms = call_at;
+                surface_est(&mut metrics, surface_cjk, surface_other);
+                let _ = kernel.report_subagent_metrics(metrics.clone(), false).await;
+                reported = Instant::now();
+            }
+        }
+        match event {
+            StreamEvent::Token(token) => {
+                count_surface(&token, &mut surface_cjk, &mut surface_other);
+                call.partial.push_str(&token);
+                kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Content, &token).await;
+            }
+            StreamEvent::Reasoning(token) => {
+                count_surface(&token, &mut surface_cjk, &mut surface_other);
+                kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Reasoning, &token).await;
+            }
+            StreamEvent::ToolCallDelta => {}
+            StreamEvent::Usage { input, output, cache_hit, cache_write, reasoning } => {
+                // DSH addReplacing：同调用的后续 usage 样本替换前值。
+                if let Some(value) = input {
+                    metrics.input_tokens = Some(value);
+                    call.input = Some(value);
+                    call.last_input = Some(value);
+                }
+                if let Some(value) = output {
+                    metrics.output_tokens = Some(value);
+                    call.output = Some(value);
+                    // output 样本已覆盖此前流式文本，估算计数清零。
+                    surface_cjk = 0;
+                    surface_other = 0;
+                }
+                if let Some(value) = cache_hit {
+                    metrics.cache_hit_tokens = Some(value);
+                }
+                if let Some(value) = cache_write {
+                    metrics.cache_write_tokens = Some(value);
+                }
+                if let Some(value) = reasoning {
+                    metrics.reasoning_tokens = Some(value);
+                    call.reasoning = Some(value);
+                }
+                metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
+                surface_est(&mut metrics, surface_cjk, surface_other);
+                let _ = kernel.report_subagent_metrics(metrics.clone(), false).await;
+                reported = Instant::now();
+            }
+            StreamEvent::Done => {
+                // 子调用自身口径：decode 窗口 = 首个有效 delta → 末个 delta；
+                // 只在与 output usage 成对时计入（DSH：无 usage 不进 decode）。
+                if call.first_delta_ms.is_some() && call.output.is_some() {
+                    if let (Some(first), Some(last)) = (call.first_delta_ms, last_delta_ms) {
+                        call.decode_ms = last.saturating_sub(first);
+                        call.decode_tokens = call.output.unwrap_or(0);
+                    }
+                }
+                // 父会话口径：子调用整对 persist —— 一次真实 model step。
+                metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
+                let _ = kernel.report_subagent_metrics(metrics.clone(), true).await;
+                log_step_timing("sub done", &metrics, call_first_ms, call_last_ms);
+                saw_done = true;
+            }
+        }
+        if is_delta && reported.elapsed() >= METRICS_REPORT_INTERVAL {
+            metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
+            surface_est(&mut metrics, surface_cjk, surface_other);
+            let _ = kernel.report_subagent_metrics(metrics.clone(), false).await;
+            reported = Instant::now();
+        }
+    }
+    // 无 Done 的终止（断流/超时/取消）：只保留已到达的 usage 样本。
+    if !saw_done {
+        metrics.elapsed_ms = call_started.elapsed().as_millis() as u64;
+        log_step_timing("sub aborted", &metrics, call_first_ms, call_last_ms);
+        if metrics.input_tokens.is_some()
+            || metrics.output_tokens.is_some()
+            || metrics.cache_hit_tokens.is_some()
+            || metrics.cache_write_tokens.is_some()
+            || metrics.reasoning_tokens.is_some()
+        {
+            let _ = kernel.report_subagent_usage_sample(metrics.clone()).await;
+        }
+    }
+    call
 }
 
 fn next_subagent_id(run_id: i64) -> String {
@@ -448,6 +770,12 @@ async fn run_subagent(
         tool_count: 0,
         input_tokens: None,
         output_tokens: None,
+        reasoning_tokens: None,
+        first_token_ms: None,
+        elapsed_ms: 0,
+        decode_ms: 0,
+        decode_tokens: 0,
+        last_input_tokens: None,
         started_at: crate::domain::unix_now(),
         finished_at: None,
         tools: Vec::new(),
@@ -461,53 +789,67 @@ async fn run_subagent(
         }
     });
 
-    let outcome = async {
+    let started = Instant::now();
+    let mut outcome = async {
         let timeout = subagent_timeout();
         let deadline = Instant::now() + timeout;
         let mut notes = String::new();
         let mut input_tokens = None;
         let mut output_tokens = None;
+        let mut reasoning_tokens = None;
+        let mut first_token_ms = None;
+        let mut elapsed_ms = 0u64;
+        let mut decode_ms = 0u64;
+        let mut decode_tokens = 0u64;
+        let mut last_input_tokens = None;
         let mut tool_count = 0usize;
         let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
         for _ in 0..definition.steps.unwrap_or(8) {
             if tool_count >= SUBAGENT_TOOL_BUDGET {
-                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{SUBAGENT_TOOL_BUDGET} 次），已返回部分结论")), input_tokens, output_tokens, tool_count };
+                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{SUBAGENT_TOOL_BUDGET} 次），已返回部分结论")), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             if *cancel.borrow() {
-                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, tool_count };
+                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
+                return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             let mut attempt = 0;
             let (outcome, text) = loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
+                    return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                 }
-                let (tx, mut rx) = mpsc::unbounded_channel();
+                let (tx, rx) = mpsc::unbounded_channel();
+                // 与 stream 并发排空：delta 时刻是真实到达时间，usage 逐次累加。
+                let consumer = tokio::spawn(drain_subagent_stream(
+                    kernel.clone(),
+                    SubagentDrainCtx {
+                        run_id,
+                        session_id,
+                        provider: child_config.provider.name().to_string(),
+                        model: child_config.model.clone(),
+                        subagent_id: subagent_id.clone(),
+                    },
+                    rx,
+                    started,
+                ));
                 let streamed = tokio::time::timeout(
                     remaining,
                     provider.clone().stream(&child_config, &messages, &tools, &mut cancel, tx),
                 ).await;
-                let mut partial = String::new();
-                while let Ok(event) = rx.try_recv() {
-                    match event {
-                        StreamEvent::Token(token) => {
-                            partial.push_str(&token);
-                            kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Content, &token).await;
-                        }
-                        StreamEvent::Reasoning(token) => {
-                            kernel.subagent_token(run_id, &subagent_id, SubagentTokenKind::Reasoning, &token).await;
-                        }
-                        StreamEvent::Usage { input, output, .. } => {
-                            input_tokens = input.or(input_tokens);
-                            output_tokens = output.or(output_tokens);
-                        }
-                        StreamEvent::Done => {}
-                    }
+                let drained = consumer.await.unwrap_or_default();
+                if first_token_ms.is_none() {
+                    first_token_ms = drained.first_delta_ms;
                 }
+                decode_ms += drained.decode_ms;
+                decode_tokens += drained.decode_tokens;
+                input_tokens = add_tokens(input_tokens, drained.input);
+                output_tokens = add_tokens(output_tokens, drained.output);
+                reasoning_tokens = add_tokens(reasoning_tokens, drained.reasoning);
+                last_input_tokens = drained.last_input.or(last_input_tokens);
+                let partial = drained.partial;
                 match streamed {
                     Ok(Ok(outcome)) => break (outcome, partial),
                     Ok(Err(error)) => {
@@ -523,18 +865,18 @@ async fn run_subagent(
                         if !partial.trim().is_empty() {
                             notes.push_str(&partial);
                         }
-                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(error), input_tokens, output_tokens, tool_count };
+                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                     }
                     Err(_) => {
                         if !partial.trim().is_empty() {
                             notes.push_str(&partial);
                         }
-                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, tool_count };
+                        return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                     }
                 }
             };
             if !outcome.done {
-                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, tool_count };
+                return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             if !text.trim().is_empty() {
                 notes.push_str(&text);
@@ -543,7 +885,7 @@ async fn run_subagent(
                 }
             }
             if outcome.tool_calls.is_empty() {
-                return ChildOutcome { status: SubagentStatus::Completed, content: text, error: None, input_tokens, output_tokens, tool_count };
+                return ChildOutcome { status: SubagentStatus::Completed, content: text, error: None, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             messages.push(ChatMessage {
                 role: "assistant".into(),
@@ -586,22 +928,31 @@ async fn run_subagent(
                 });
             }
         }
+        elapsed_ms = started.elapsed().as_millis() as u64;
         ChildOutcome {
             status: SubagentStatus::Completed,
             content: notes,
             error: Some("达到工具轮次上限，已返回部分结论".into()),
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            first_token_ms,
+            elapsed_ms,
+            decode_ms,
+            decode_tokens,
+            last_input_tokens,
             tool_count,
         }
     }.await;
 
     forward.abort();
     kernel.unregister_subagent_cancel(&subagent_id);
-    let ChildOutcome { status, content, error, input_tokens, output_tokens, tool_count } = outcome;
+    // elapsed_ms 覆盖所有提前返回路径：总墙钟（含工具执行），decode 口径另列。
+    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    let ChildOutcome { status, content, error, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count } = outcome;
     let header = format!("【子智能体 {}｜{}｜{} 次工具】", definition.name, status.label(), tool_count);
     let summary = if content.trim().is_empty() { header.clone() } else { format!("{header}\n{}", content.trim()) };
-    let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens).await;
+    let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens).await;
     if status == SubagentStatus::Cancelled {
         return Err("子智能体已取消".into());
     }
@@ -623,7 +974,7 @@ pub(crate) async fn run(
         }
         let detail = kernel.session_detail(run.session_id).await?;
         let reports = kernel.recent_subagent_reports(run.session_id).await.unwrap_or_default();
-        let mut messages = conversation_with_reports(&detail, &run, &reports);
+        let mut messages = conversation_with_reports(&detail, &run, &reports, config.context_window);
         let mut saved_upto = messages.len();
         let mut next_seq = 0i64;
         let tools = kernel.agent_tools(run.mode).await;
@@ -781,7 +1132,7 @@ pub(crate) async fn run(
         // summarize what it already gathered instead of failing the run.
         messages.push(ChatMessage::text(
             "user",
-            &format!("本轮工具调用达到上限（{max_rounds} 轮），任务可能未完成。请基于已收集的信息总结，并提示用户发送「继续」开始新一轮；本轮不要再调用工具。"),
+            format!("本轮工具调用达到上限（{max_rounds} 轮），任务可能未完成。请基于已收集的信息总结，并提示用户发送「继续」开始新一轮；本轮不要再调用工具。"),
         ));
         let mut final_cancel = cancel.clone();
         let final_turn = tokio::select! {
@@ -978,6 +1329,8 @@ mod tests {
             created_at: 2,
         };
         let detail = SessionDetail {
+            reasoning: Default::default(),
+            parts: Default::default(),
             session: crate::domain::SessionView {
                 id: 7,
                 title: "session".into(),
@@ -1029,7 +1382,7 @@ mod tests {
             tool_call_id: Some("call-1".into()),
             name: Some("read_file".into()),
         });
-        let messages = conversation(&detail, &current);
+        let messages = conversation(&detail, &current, None);
         assert!(messages.iter().any(|message| message.role == "tool" && message.content == "file body"));
         assert!(!messages.iter().any(|message| message.content.contains("上一轮实际执行过的工具")));
     }
@@ -1048,7 +1401,7 @@ mod tests {
             post_tokens: Some(20),
             created_at: 1,
         });
-        let messages = conversation(&detail, &current);
+        let messages = conversation(&detail, &current, None);
         assert!(messages.iter().any(|message| message.role == "system"
             && message.content.contains("早前完成了 A")));
         assert!(!messages.iter().any(|message| message.content.contains("上一轮任务")));
@@ -1057,7 +1410,7 @@ mod tests {
     #[test]
     fn interrupted_runs_are_replayed_with_partial_output_and_tool_summary() {
         let (detail, current) = fixture(RunStatus::Cancelled, "已经写了 a.ts");
-        let messages = conversation(&detail, &current);
+        let messages = conversation(&detail, &current, None);
         assert!(messages.iter().any(|message| message.role == "assistant"
             && message.content.contains("上一轮被用户中断")
             && message.content.contains("已经写了 a.ts")));
@@ -1069,7 +1422,7 @@ mod tests {
     #[test]
     fn completed_runs_without_text_still_replay_their_tool_actions() {
         let (detail, current) = fixture(RunStatus::Completed, "");
-        let messages = conversation(&detail, &current);
+        let messages = conversation(&detail, &current, None);
         assert!(messages.iter().any(|message| message.role == "assistant"
             && message.content.contains("没有最终文字输出")));
         assert!(messages.iter().any(|message| message.role == "system"
@@ -1079,8 +1432,19 @@ mod tests {
     #[test]
     fn running_prior_runs_are_not_replayed() {
         let (detail, current) = fixture(RunStatus::Running, "partial");
-        let messages = conversation(&detail, &current);
+        let messages = conversation(&detail, &current, None);
         assert!(!messages.iter().any(|message| message.content.contains("上一轮任务")));
+    }
+
+    #[test]
+    fn replay_budget_scales_with_the_context_window() {
+        let small = replay_budget_bytes(Some(128_000));
+        let large = replay_budget_bytes(Some(1_000_000));
+        assert!(large > small * 5, "{large} vs {small}");
+        assert_eq!(replay_budget_bytes(None), small);
+        assert_eq!(replay_budget_bytes(Some(0)), small);
+        assert_eq!(replay_budget_bytes(Some(u64::MAX)), 8 * 1024 * 1024);
+        assert!(small >= 65_536);
     }
 
     #[test]

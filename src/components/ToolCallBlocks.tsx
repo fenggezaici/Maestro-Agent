@@ -1,8 +1,9 @@
-import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
-import { useState } from 'react';
+import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, ShieldCheck, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import { memo, useState } from 'react';
 import type { ApprovalDecision, CommandScope, SubagentView, ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
 import MiniDiff, { countChanges } from './MiniDiff';
+import ApprovalRulesDialog from './ApprovalRulesDialog';
 import { parseUserQuestionPayload, questionAnswerText } from '../lib/userQuestion';
 
 /// `write_result` payload emitted in the Finished detail for write tools —
@@ -70,12 +71,26 @@ function targetOf(call: ToolCallView): string {
   return segments.length > 1 ? segments[segments.length - 1] : '';
 }
 
+/// What "始终允许" would actually store, so a wide rule is never implicit.
+function rulePattern(call: ToolCallView, scope: CommandScope): string {
+  const preview = parseApprovalPreview(call.detail);
+  if (preview?.kind === 'command') {
+    const command = preview.command.trim();
+    if (scope === 'prefix') return `${command.split(/\s+/)[0] || command} *`;
+    return command;
+  }
+  if (preview?.kind === 'write') return preview.path;
+  const args = preview?.kind === 'args' ? preview.arguments : call.detail;
+  return args.replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
 /// One collapsed tool-call row with icon + verb + target + status; expandable
 /// detail panel for results/output/failures. Exported so the reasoning timeline
 /// can interleave rows with thinking nodes in event order.
-export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
+export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
   const [expanded, setExpanded] = useState(false);
   const [scopeOpen, setScopeOpen] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
   const [denyOpen, setDenyOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
   const pending = Boolean(call.pending || call.awaitingApproval);
@@ -119,14 +134,22 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval,
           <button type="button" className="button-ghost" aria-label="批准工具调用" onClick={() => onResolveApproval(call.runId, 'allow_once')}>允许一次</button>
           <div className="approval-always">
             <button type="button" className="button-ghost" aria-label="始终允许工具调用"
-              onClick={() => call.tool === 'run_command' ? setScopeOpen((value) => !value) : onResolveApproval(call.runId, 'allow_always')}>始终允许</button>
+              onClick={() => call.tool === 'run_command' ? setScopeOpen((value) => !value) : onResolveApproval(call.runId, 'allow_always', 'exact')}>始终允许</button>
             {scopeOpen && call.tool === 'run_command' && <div className="approval-scope-menu" role="menu">
-              <button type="button" role="menuitem" onClick={() => onResolveApproval(call.runId, 'allow_always', 'prefix')}>命令前缀</button>
-              <button type="button" role="menuitem" onClick={() => onResolveApproval(call.runId, 'allow_always', 'exact')}>仅此命令</button>
+              <button type="button" role="menuitem" onClick={() => { setScopeOpen(false); onResolveApproval(call.runId, 'allow_always', 'exact'); }}>
+                <span>仅此命令（推荐）</span>
+                <code>{rulePattern(call, 'exact')}</code>
+              </button>
+              <button type="button" role="menuitem" onClick={() => { setScopeOpen(false); onResolveApproval(call.runId, 'allow_always', 'prefix'); }}>
+                <span>命令前缀（更宽）</span>
+                <code>{rulePattern(call, 'prefix')}</code>
+              </button>
             </div>}
           </div>
           <button type="button" className="button-ghost" aria-label="拒绝工具调用" onClick={() => setDenyOpen((value) => !value)}>拒绝</button>
+          <button type="button" className="button-ghost" aria-label="查看本会话授权规则" onClick={() => setRulesOpen(true)}><ShieldCheck size={12} />授权规则</button>
         </div>
+        <ApprovalRulesDialog runId={call.runId} open={rulesOpen} onOpenChange={setRulesOpen} />
         {denyOpen && <div className="tool-approval-feedback">
           <textarea aria-label="拒绝原因" value={feedback} placeholder="拒绝原因（可选），会回传给模型"
             onChange={(event) => setFeedback(event.target.value)} />
@@ -156,12 +179,14 @@ export function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval,
       ? <MiniDiff before={writeResult.before} after={writeResult.after} />
       : <pre className="tool-call-panel">{panel}</pre>)}
   </div>;
-}
+});
 
 /// ZCode-style collapsed tool-call group: one row per call.
-export default function ToolCallBlocks({ calls, onSelectFile, onOpenFile, onOpenSubagent, subagentById }: { calls: ToolCallView[]; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onOpenSubagent?: (id: string) => void; subagentById?: (id: string) => SubagentView | undefined }) {
+export const ToolCallBlocks = memo(function ToolCallBlocks({ calls, onSelectFile, onOpenFile, onOpenSubagent, subagentById }: { calls: ToolCallView[]; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onOpenSubagent?: (id: string) => void; subagentById?: (id: string) => SubagentView | undefined }) {
   if (!calls.length) return null;
   return <div className="tool-events" role="list" aria-label="工具调用明细">
     {calls.map((call, index) => <ToolCallRow key={index} call={call} onSelectFile={onSelectFile} onOpenFile={onOpenFile} onOpenSubagent={onOpenSubagent} subagent={call.subagentId ? subagentById?.(call.subagentId) : undefined} />)}
   </div>;
-}
+});
+
+export default ToolCallBlocks;

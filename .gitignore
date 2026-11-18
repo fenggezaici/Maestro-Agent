@@ -44,3 +44,8 @@ Thumbs.db
 
 # pnpm is the authoritative frontend package manager
 /package-lock.json
+
+# Downloaded e2e driver artifacts (fetched by scripts/e2e-driver-setup.mjs)
+/scripts/msedgedriver.exe
+/scripts/msedgedriver.zip
+/scripts/Driver_Notes/

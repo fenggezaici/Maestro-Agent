@@ -71,14 +71,34 @@ async fn provider_truncated_then_ok() -> (String, tokio::task::JoinHandle<()>) {
     let task = tokio::spawn(async move {
         let mut attempt = 0;
         loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.set_nodelay(true).unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = socket.read(&mut buffer).await.unwrap();
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let _ = socket.set_nodelay(true);
+            // Consume the whole request before replying: the chat body is far
+            // larger than one read, and answering while the client is still
+            // uploading makes reqwest report a send error instead of the
+            // truncation this test is about. An aborted connection (no bytes)
+            // is skipped rather than treated as the request.
+            let mut received = false;
+            loop {
+                let mut buffer = [0u8; 8192];
+                match tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buffer)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(_)) => received = true,
+                    Err(_) => break,
+                }
+            }
+            if !received {
+                continue;
+            }
             if attempt == 0 {
                 let _ = socket
                     .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        b"HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Transfer-Encoding: chunked
+Connection: close
+
+",
                     )
                     .await;
                 // Close without the terminating zero chunk: reqwest reports a
@@ -86,9 +106,18 @@ async fn provider_truncated_then_ok() -> (String, tokio::task::JoinHandle<()>) {
                 attempt += 1;
                 continue;
             }
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\ndata: [DONE]\n\n";
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}
+
+data: [DONE]
+
+";
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Content-Length: {}
+Connection: close
+
+",
                 body.len()
             );
             let _ = socket.write_all(header.as_bytes()).await;
@@ -113,7 +142,9 @@ fn config(base_url: String) -> ChatConfig {
 }
 
 async fn idle(kernel: &Kernel) {
-    tokio::time::timeout(Duration::from_secs(6), async {
+    // The gateway retry path backs off ~2s + ~4s (plus jitter) before the
+    // second attempt, so a 6s ceiling was flaky under parallel test load.
+    tokio::time::timeout(Duration::from_secs(15), async {
         while kernel.snapshot().await.active_run.is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -386,6 +417,8 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
         ..prior.clone()
     };
     let detail = SessionDetail {
+        reasoning: Default::default(),
+        parts: Default::default(),
         session: SessionView {
             id: 1,
             title: "session".into(),
@@ -401,7 +434,7 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
         run_messages: Vec::new(),
         tools: Vec::new(),
     };
-    let messages: Vec<ChatMessage> = conversation(&detail, &current);
+    let messages: Vec<ChatMessage> = conversation(&detail, &current, None);
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0].role, "system");
     assert_eq!(

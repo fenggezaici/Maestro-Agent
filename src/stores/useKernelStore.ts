@@ -15,7 +15,7 @@ import {
   appendContent, appendReasoning, appendTool, applyToolEventIndexed, chatMessages, closeReasoning,
   conversationRuns, errorMessage, initialSnapshot, kernelReducer, type KernelAction, type TimelineItem,
 } from '../lib/conversation';
-import { readLlmSettings, validateLlmSettings } from '../settings';
+import { hasProviderCredential, readLlmSettings, validateLlmSettings } from '../settings';
 
 export interface KernelStore {
   state: Snapshot;
@@ -152,7 +152,11 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       if (mounted && revision === detailRevision && selectedRef === id) {
         set((s) => ({
           detail: result,
-          metrics: { ...s.metrics, ...Object.fromEntries((result.metrics ?? []).map((v) => [v.runId, v])) },
+          // Live metrics events are emitted only after the DB write, so for a
+          // run seen live the in-memory entry is never older than the row —
+          // let it win over the persisted snapshot instead of regressing the
+          // stats line on every refresh.
+          metrics: { ...Object.fromEntries((result.metrics ?? []).map((v) => [v.runId, v])), ...s.metrics },
           subagents: { ...Object.fromEntries(traces.map((trace) => [trace.id, trace])), ...s.subagents },
           compactions: result.compactions ?? [],
         }));
@@ -280,6 +284,12 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
                 summary: event.summary,
                 error: event.error,
                 toolCount: event.toolCount,
+                reasoningTokens: event.reasoningTokens ?? trace.reasoningTokens,
+                firstTokenMs: event.firstTokenMs ?? trace.firstTokenMs,
+                elapsedMs: event.elapsedMs ?? trace.elapsedMs,
+                decodeMs: event.decodeMs ?? trace.decodeMs,
+                decodeTokens: event.decodeTokens ?? trace.decodeTokens,
+                lastInputTokens: event.lastInputTokens ?? trace.lastInputTokens,
                 inputTokens: event.inputTokens,
                 outputTokens: event.outputTokens,
                 finishedAt: event.finishedAt,
@@ -481,7 +491,11 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
 
     start: (prompt, images) => command(async () => {
       set({ lastChangedPath: null, queuedStart: null });
-      const settings = validateLlmSettings(readLlmSettings());
+      const settings = validateLlmSettings(readLlmSettings(), { requireKey: false });
+      const provider = settings.provider ?? 'openai';
+      if (provider !== 'ollama' && !hasProviderCredential(provider)) {
+        throw new Error('请先在 Settings 中保存该 Provider 的 API Key');
+      }
       let id = selectedRef;
       if (id === null) {
         const revision = selectionRevision;

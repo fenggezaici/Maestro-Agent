@@ -2,17 +2,13 @@ import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import type { ChatMessage, KernelEvent, PlanCard, ProposedDiff, RunView, SessionDetail, SessionView, Snapshot } from './api/types';
-import { LLM_SETTINGS_KEY } from './settings';
+import type { ChatMessage, KernelEvent, PlanCard, RunView, SessionDetail, SessionView, Snapshot } from './api/types';
+import { LLM_SETTINGS_KEY, setCredentialStatus } from './settings';
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(), stop: vi.fn() }));
-vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke, isTauri: () => false }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }));
-vi.mock('./components/MonacoDiff', () => ({
-  default: ({ diff, split }: { diff: ProposedDiff; split: boolean }) =>
-    <section aria-label={`Diff ${diff.path}`} data-split={split}><pre>{diff.before}</pre><pre>{diff.after}</pre></section>,
-}));
-vi.mock('./components/MonacoCode', () => ({ default: ({ file }: { file: { path: string; content: string } }) => <section aria-label={`文件预览 ${file.path}`}>{file.content}</section> }));
+vi.mock('./components/CodeViewer', () => ({ default: ({ file }: { file: { path: string; content: string } }) => <section aria-label={`文件预览 ${file.path}`}>{file.content}</section> }));
 
 let snapshot: Snapshot;
 let history: RunView[];
@@ -24,6 +20,8 @@ let channels: Map<string, (event: { payload: unknown }) => void>;
 beforeEach(() => {
   localStorage.clear();
   localStorage.setItem(LLM_SETTINGS_KEY, JSON.stringify({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'test-model' }));
+  // The live app resolves keys from the OS-protected store; the cache stands in for it here.
+  setCredentialStatus(['openai', 'deepseek', 'anthropic']);
   channels = new Map();
   snapshot = { ready: true, mode: 'plan', activeRun: null, lastRun: null, sequence: 1 };
   history = [];
@@ -126,7 +124,7 @@ describe('desktop IPC interface', () => {
     await ready();
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'a request' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], api_key: 'test-key', base_url: 'http://localhost:1234/v1', model: 'test-model' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], base_url: 'http://localhost:1234/v1', model: 'test-model' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     expect(screen.getByLabelText('发送消息')).not.toBeDisabled();
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'queued draft' } });
@@ -365,10 +363,13 @@ describe('desktop IPC interface', () => {
     fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://example.test/v1' } });
     fireEvent.click(screen.getByRole('button', { name: '设为当前模型 configured-model' }));
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
-    expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'new-test-key', model: 'configured-model' });
+    const saved = JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!);
+    expect(saved).toMatchObject({ model: 'configured-model', baseUrl: 'https://example.test/v1' });
+    expect(JSON.stringify(saved)).not.toContain('new-test-key');
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'configured request' } });
     fireEvent.keyDown(screen.getByLabelText('发送消息'), { key: 'Enter', ctrlKey: true });
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', expect.objectContaining({ api_key: 'new-test-key', base_url: 'https://example.test/v1', model: 'configured-model' })));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', expect.objectContaining({ base_url: 'https://example.test/v1', model: 'configured-model' })));
+    expect(mocks.invoke.mock.calls.find(([command]) => command === 'stream_chat')![1]).not.toHaveProperty('api_key');
     expect(screen.getByLabelText('发送消息')).toHaveValue('');
   });
 
@@ -438,6 +439,7 @@ describe('desktop IPC interface', () => {
 
   it('requires saved settings before requesting a model and restores input on validation failure', async () => {
     localStorage.removeItem(LLM_SETTINGS_KEY);
+    setCredentialStatus([]);
     render(<App />);
     await ready();
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'keep invalid request' } });
@@ -453,13 +455,13 @@ describe('desktop IPC interface', () => {
     await ready();
     fireEvent.click(screen.getByLabelText('选择模型'));
     fireEvent.click(screen.getByRole('button', { name: /gpt-5\.2/ }));
-    expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'gpt-5.2' });
+    expect(JSON.parse(localStorage.getItem(LLM_SETTINGS_KEY)!)).toMatchObject({ baseUrl: 'http://localhost:1234/v1', model: 'gpt-5.2' });
     fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' });
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'model selection request' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'stream_chat')).toBe(true));
     const payload = mocks.invoke.mock.calls.find(([command]) => command === 'stream_chat')![1];
-    expect(payload).toMatchObject({ model: 'gpt-5.2', api_key: 'test-key', reasoning_effort: 'high' });
+    expect(payload).toMatchObject({ model: 'gpt-5.2', reasoning_effort: 'high' });
     expect(payload).not.toHaveProperty('temperature');
     expect(payload).not.toHaveProperty('context_window');
   });
@@ -482,6 +484,21 @@ describe('desktop IPC interface', () => {
     fireEvent.click(screen.getByRole('tab', { name: '变更' }));
     fireEvent.click(screen.getByRole('tab', { name: '文件' }));
     expect(screen.getByLabelText('文件预览 src/unique.rs')).toHaveTextContent('actual source from Rust');
+  });
+
+  it('unmounts collapsed folder children instead of hiding them in the DOM', async () => {
+    // Regression: `hidden` used to keep every descendant mounted, so a huge
+    // workspace tree was reconciled on every streamed token — starving the
+    // main thread (file reads looked stuck, output crawled).
+    render(<App />);
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+    fireEvent.click(screen.getByRole('tab', { name: '文件' }));
+    const file = await screen.findByRole('button', { name: '文件 src/unique.rs' });
+    fireEvent.click(screen.getByRole('button', { name: '文件夹 src' }));
+    expect(file).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '文件夹 src' }));
+    expect(await screen.findByRole('button', { name: '文件 src/unique.rs' })).toBeInTheDocument();
   });
 
   it('keeps sent attachments as local bubble placeholders without uploading them', async () => {

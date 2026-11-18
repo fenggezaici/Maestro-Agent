@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64">
+  <rect width="24" height="24" rx="6" fill="#18181B"/>
+  <!-- 左半边 M -->
+  <path d="M5 16V8L12 14" fill="none" stroke="#E4E4E7" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter"/>
+  <!-- 右半边 M (独立开，变成紫色) -->
+  <path d="M19 16V8L12 14" fill="none" stroke="#8B5CF6" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter"/>
+</svg>

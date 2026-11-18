@@ -21,6 +21,7 @@ impl SubagentStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Self {
         match value {
             "completed" => Self::Completed,
@@ -68,6 +69,18 @@ pub struct SubagentView {
     pub tool_count: usize,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub first_token_ms: Option<u64>,
+    pub elapsed_ms: u64,
+    /// Σ 每次 LLM 调用的 decode 窗口（首个任意 delta → 末次 delta），仅计入
+    /// 上报了 output usage 的调用；与 DSH decode 口径一致。
+    #[serde(default)]
+    pub decode_ms: u64,
+    /// 与 decode_ms 成对的 output tokens —— 只有贡献了 decode 窗口的调用
+    /// 的 output usage 才计入；tok/s = decode_tokens / decode_ms。
+    #[serde(default)]
+    pub decode_tokens: u64,
+    pub last_input_tokens: Option<u64>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub tools: Vec<ToolCallView>,

@@ -2,7 +2,10 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
 import * as Switch from '@radix-ui/react-switch';
 import { Eye, EyeOff, KeyRound, Pencil, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
-import { clearLlmSettings, readLlmSettings, saveLlmSettings, type LlmSettings } from '../settings';
+import { clearLlmSettings, hasProviderCredential, legacyCredentials, readLlmSettings, saveLlmSettings, stripLegacyCredential, type LlmSettings } from '../settings';
+import { credentialsApi, isLiveDesktop, refreshCredentialStatus } from '../api/credentials';
+import { migrateLegacyCredentials } from '../api/credentials';
+import { errorText } from '../lib/errors';
 import { getProvider } from '../customProviders';
 import { contextLabel, providers, type ProviderId } from '../modelCapabilities';
 import { fetchModelsApi } from '../api/models';
@@ -15,6 +18,11 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
   useEffect(() => { setValues(load()); }, [provider, preview]);
   const [showKey, setShowKey] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [stored, setStored] = useState(() => hasProviderCredential(provider));
+  useEffect(() => { setStored(hasProviderCredential(provider)); }, [provider, preview]);
+  const [pendingLegacy, setPendingLegacy] = useState(() => legacyCredentials().length);
+  const [migrating, setMigrating] = useState(false);
+  useEffect(() => { setPendingLegacy(legacyCredentials().length); }, [provider, preview]);
   const [models, setModels] = useState<ProviderModel[]>(() => readProviderModels(provider));
   const [fetching, setFetching] = useState(false);
   const [editing, setEditing] = useState<ProviderModel | 'new' | null>(null);
@@ -31,15 +39,47 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
       const merged = mergeFetched(provider, list);
       persist(merged);
       if (!(values.model ?? '').trim() && merged.length > 0) setValues((current) => ({ ...current, model: merged[0].id }));
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法拉取模型列表'); }
+    } catch (reason) { setError(errorText(reason)); }
     finally { setFetching(false); }
   }
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function retryMigration() {
+    setMigrating(true);
+    setError(null);
+    try {
+      const notice = await migrateLegacyCredentials();
+      setPendingLegacy(legacyCredentials().length);
+      setStored(hasProviderCredential(provider));
+      if (notice) setError(notice);
+      else onChanged?.();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setMigrating(false);
+    }
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (preview) return;
     const model = (values.model ?? '').trim() || models[0]?.id || '';
-    try { saveLlmSettings({ ...values, model }); setError(null); onSaved(); void pull(); } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置'); }
+    try {
+      saveLlmSettings({ ...values, model });
+      const draft = (values.apiKey ?? '').trim();
+      if (isLiveDesktop() && draft) {
+        await credentialsApi.save(provider, draft);
+        // The explicit key supersedes any legacy copy, otherwise the next
+        // startup migration would overwrite what the user just typed.
+        stripLegacyCredential(provider);
+        await refreshCredentialStatus();
+        setValues((current) => ({ ...current, apiKey: '', model }));
+        setStored(true);
+        setPendingLegacy(legacyCredentials().length);
+      }
+      setError(null);
+      onSaved();
+      void pull();
+    } catch (reason) { setError(errorText(reason)); }
   }
 
   return <form className="llm-settings-form" onSubmit={submit}>
@@ -70,11 +110,32 @@ export default function LlmSettingsForm({ preview, onSaved, onChanged, provider 
     </div>
 
     <p className="settings-note">点击模型行设为当前模型；上下文窗口与思考类型在「编辑」中配置。</p>
-    <p className="settings-secret-warning">API Key 按要求保存在 localStorage，属于明文存储，并非安全凭据库。仅在信任的本机使用；发送时通过 IPC 交给 Rust，不写入会话数据库或日志。</p>
+    <p className="settings-secret-warning">{stored
+      ? 'API Key 已保存在系统凭据中（Windows DPAPI，仅当前用户可解密）。输入框留空表示沿用已保存的 Key。'
+      : 'API Key 将保存在系统凭据中（Windows DPAPI），不再写入 localStorage；请求时由 Rust 端读取，不进入会话数据库或日志。'}</p>
+    <p className="settings-note">非本地地址必须使用 HTTPS；本地 Ollama/代理可继续使用 http://localhost。</p>
+    {!preview && pendingLegacy > 0 && <div className="settings-note credential-migration" role="status">
+      <span>有 {pendingLegacy} 个旧 Key 仍以明文保存在 localStorage 中。</span>
+      <button type="button" className="button-ghost" disabled={migrating} onClick={() => void retryMigration()}>
+        {migrating ? '迁移中…' : '重试迁移'}
+      </button>
+    </div>}
     {preview && <p className="settings-note">前端预览不会读取或保存真实连接配置；请在 Tauri 客户端测试模型。</p>}
     {error && <p role="alert" className="settings-form-error">{error}</p>}
     <div className="settings-form-actions"><button type="button" className="button-ghost" disabled={preview} onClick={() => {
-      try { clearLlmSettings(); setValues(load()); setError(null); onChanged?.(); } catch (reason) { setError(reason instanceof Error ? reason.message : '无法清除设置'); }
+      void (async () => {
+        try {
+          clearLlmSettings();
+          if (isLiveDesktop()) {
+            await credentialsApi.clear(provider);
+            // Clearing is explicit: drop the legacy copy too, or the next
+            // migration would bring the removed key back.
+            stripLegacyCredential(provider);
+            await refreshCredentialStatus();
+          }
+          setValues(load()); setStored(false); setPendingLegacy(legacyCredentials().length); setError(null); onChanged?.();
+        } catch (reason) { setError(errorText(reason)); }
+      })();
     }}><Trash2 size={13} />清除配置</button><button type="submit" className="button-approve" disabled={preview}><Save size={13} />保存设置</button></div>
     <ModelEditDialog editing={editing} onClose={() => setEditing(null)} onSave={(row) => {
       if (!preview) clearRemoved(provider, row.id);

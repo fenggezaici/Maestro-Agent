@@ -51,7 +51,7 @@
 .provider-badge.configured { background: #8b5cf61c; color: #bfabe4; }
 .provider-panel-note { margin: 4px 0 0; color: #777; font-size: 9px; line-height: 1.8; }
 [data-theme="light"] { color: #303030; background: #fff; --color-canvas: #fff; --color-surface: #f4f4f5; --color-foreground: #303030; --color-muted: #666; }
-[data-theme="light"] body, [data-theme="light"] .workbench, [data-theme="light"] .conversation-pane, [data-theme="light"] .editor-loading, [data-theme="light"] .monaco-container { background: #fff; color: #363636; }
+[data-theme="light"] body, [data-theme="light"] .workbench, [data-theme="light"] .conversation-pane, [data-theme="light"] .editor-loading, [data-theme="light"] .viewer-container { background: #fff; color: #363636; }
 [data-theme="light"] .sessions-pane, [data-theme="light"] .sidebar-bottom, [data-theme="light"] .right-pane, [data-theme="light"] .review-pane, [data-theme="light"] .right-panel-body, [data-theme="light"] .settings-rail { background: #f4f4f5; }
 [data-theme="light"] .user-message, [data-theme="light"] .project-switcher, [data-theme="light"] .composer, [data-theme="light"] .metric-card, [data-theme="light"] .dashboard-card, [data-theme="light"] .extension-card, [data-theme="light"] .ide-settings-panel, [data-theme="light"] .message-code-block, [data-theme="light"] .attachment-preview { background: #f1f1f3; }
 [data-theme="light"] .approval-card { background: linear-gradient(135deg,#f1eef5,#f7f7f7); box-shadow: 0 5px 20px #00000006; }
@@ -425,8 +425,8 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 [data-theme="light"] .segmented-tabs { background: #00000008; }
 [data-theme="light"] .segmented-tabs button { color: #71717a; }
 [data-theme="light"] .segmented-tabs button[data-state="active"] { background: #0000000f; color: #252130; }
-.monaco-container { position: relative; flex: 1; min-height: 0; overflow: hidden; }
-.monaco-host { position: absolute; inset: 0; }
+.viewer-container { position: relative; flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.viewer-file { flex: 1; min-height: 0; width: 100%; height: 100%; overflow: auto; }
 .editor-loading { position: absolute; inset: 0; display: grid; place-items: center; background: #1b1b1b; color: #888; font-size: 11px; }
 .editor-empty { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 17px; padding: 25px; color: #646464; }
 .editor-empty h3 { color: #a3a3a3; font-size: 12px; font-weight: 500; }
@@ -817,8 +817,8 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .preview-toolbar { flex-shrink: 0; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px; border-bottom: 1px solid #ffffff08; }
 .preview-toolbar-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #71717a; font-family: Consolas, monospace; font-size: 10px; }
 .list-workspace { display: flex; align-items: center; gap: 6px; padding: 7px 12px 5px; }
-.list-workspace-name { font-size: 10px; font-weight: 600; letter-spacing: .8px; color: #71717a; text-transform: uppercase; }
-.list-workspace-meta { flex: 1; min-width: 0; font-size: 9px; letter-spacing: .5px; color: #52525b; text-transform: uppercase; }
+.list-workspace-name { flex: 1; min-width: 0; font-size: 11px; font-weight: 600; color: #a1a1aa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-workspace-meta { flex-shrink: 0; font-size: 10px; color: #52525b; white-space: nowrap; }
 [data-theme="light"] .right-list-pane { background: #efeff1; }
 [data-theme="light"] .list-workspace-name { color: #71717a; }
 [data-theme="light"] .list-workspace-meta { color: #a1a1aa; }
@@ -1060,6 +1060,8 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 
 /* Execution group: one quiet summary row, expandable body */
 .execution-group { margin: 6px 0 10px; }
+/* ZCode 式段落分隔线：执行段结束后的 1px 弱对比横线，双主题走 token */
+.timeline-divider { height: 1px; background: var(--color-border-subtle); margin: 0 0 10px; }
 .execution-summary { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border: 0; border-radius: 6px; background: transparent; color: #71717a; font-size: 11px; cursor: pointer; }
 .execution-summary:hover { background: #ffffff06; color: #a1a1aa; }
 .execution-summary svg:last-child { transition: transform 140ms ease; }
@@ -1123,7 +1125,9 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .review-panel { width: var(--review-width, 520px); flex: 0 0 auto; }
 .resize-handle { flex: 0 0 4px; background: #191919; cursor: col-resize; touch-action: none; }
 .resize-handle:hover { background: #638ac8b0; }
+.resize-handle:focus-visible { outline: 2px solid var(--color-primary); outline-offset: -2px; background: #638ac8b0; }
 .resize-handle.is-horizontal { width: 100%; height: 4px; flex: 0 0 4px; cursor: row-resize; }
+.stacked-divider { flex: 0 0 1px; width: 100%; background: var(--color-border); }
 .stacked-rows { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .chat-panel { flex: 1; min-height: 0; }
 .review-panel.is-stacked { width: 100%; height: 42%; }
@@ -1149,6 +1153,7 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 /* Light theme: semantic surfaces (ZCode-style tokens approximated) */
 [data-theme="light"] .resize-handle { background: #e4e4e7; }
 [data-theme="light"] .resize-handle:hover { background: #a1a1aa; }
+[data-theme="light"] .stacked-divider { background: #e4e4e7; }
 [data-theme="light"] .preference-row .choice-trigger { background: #f4f4f5; color: #3f3f46; border: 1px solid #d4d4d8; }
 [data-theme="light"] .settings-content { background: #fff; }
 [data-theme="light"] .preference-row p { color: #71717a; }
@@ -1223,3 +1228,7 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 [data-theme="light"] .task-plan-progress { background: #00000014; }
 @keyframes task-plan-spin { to { transform: rotate(360deg); } }
 @media (max-width: 760px) { .task-plan-panel.is-card { align-self: stretch; width: auto; margin: 8px 12px 0; } }
+
+/* Thin progress bar shown while the next file loads (previous content stays). */
+.editor-loading-bar { height: 2px; width: 100%; background: linear-gradient(90deg, transparent, var(--color-primary), transparent); background-size: 40% 100%; background-repeat: no-repeat; animation: editor-loading-slide 1s linear infinite; }
+@keyframes editor-loading-slide { from { background-position: -40% 0; } to { background-position: 140% 0; } }

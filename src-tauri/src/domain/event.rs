@@ -138,6 +138,18 @@ pub enum EventData {
         input_tokens: Option<u64>,
         #[serde(rename = "outputTokens")]
         output_tokens: Option<u64>,
+        #[serde(rename = "reasoningTokens")]
+        reasoning_tokens: Option<u64>,
+        #[serde(rename = "firstTokenMs")]
+        first_token_ms: Option<u64>,
+        #[serde(rename = "elapsedMs")]
+        elapsed_ms: u64,
+        #[serde(rename = "decodeMs")]
+        decode_ms: u64,
+        #[serde(rename = "decodeTokens")]
+        decode_tokens: u64,
+        #[serde(rename = "lastInputTokens")]
+        last_input_tokens: Option<u64>,
         #[serde(rename = "finishedAt")]
         finished_at: i64,
     },
@@ -231,6 +243,12 @@ mod tests {
             tool_count: 0,
             input_tokens: None,
             output_tokens: None,
+            reasoning_tokens: None,
+            first_token_ms: None,
+            elapsed_ms: 0,
+            decode_ms: 0,
+            decode_tokens: 0,
+            last_input_tokens: None,
             started_at: 1,
             finished_at: None,
             tools: Vec::new(),
@@ -281,6 +299,12 @@ mod tests {
                 tool_count: 2,
                 input_tokens: Some(1),
                 output_tokens: Some(2),
+                reasoning_tokens: Some(0),
+                first_token_ms: Some(100),
+                elapsed_ms: 1_000,
+                decode_ms: 900,
+                decode_tokens: 2,
+                last_input_tokens: Some(1),
                 finished_at: 3,
             },
         };

@@ -2,6 +2,7 @@
 //! filesystem, MCP child processes, LLM HTTP transports).
 pub mod agents;
 pub mod commands;
+pub mod credentials;
 pub mod db;
 pub mod exec;
 pub mod fs;

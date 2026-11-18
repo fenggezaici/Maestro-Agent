@@ -30,17 +30,17 @@ Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作�
 
 | 功能 | 当前状态 |
 | --- | --- |
-| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
+| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发（投递前在 32ms 窗口内合并相邻同 key 的 token 事件，防止逐 token eval 打满 webview 主线程）；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
 | 执行时间线 | reasoning、tool_call 与正文都进入同一条时间线；连续思考/工具折叠为「已工作 X 秒」执行阶段，正文按真实事件位置穿插，不再固定堆在底部 |
-| 工具事件行 | 工具/思考行右侧 Chevron 展开详情；执行中亮色 + Loader，完成后整行与图标灰化、hover 恢复；点击文件名打开右侧 Explorer 并加载 Monaco |
+| 工具事件行 | 工具/思考行右侧 Chevron 展开详情；执行中亮色 + Loader，完成后整行与图标灰化、hover 恢复；点击文件名打开右侧 Explorer 并加载代码预览 |
 | 停止生成 | 前端乐观终结当前 run、立即隐藏“工作中”胶囊与停止按钮，并继续丢弃迟到 token；停止期间新输入进入 `queuedStart`，旧 run terminal 后自动启动；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁 |
 | 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
 | 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
-| 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Monaco 只读预览；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁 |
-| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，仅危险命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许（会话级规则，命令可选前缀或精确）/ 拒绝并反馈，拒绝原因回传给模型 |
+| 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Shiki 代码预览（`@pierre/diffs`）；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁且在飞合并去重；折叠子树按需渲染（不驻留 DOM），忽略 `__pycache__`/`venv`/`.venv` |
+| Review / 审批 | 提议 Diff 与单次计划决定；计划批准仅记录意图；Code 模式写文件直接执行，只读白名单命令免审、其余命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许（会话级规则，默认精确匹配完整命令或参数，可选前缀并在卡片上显示实际规则）/ 拒绝并反馈，拒绝原因回传给模型；Plan 下历史授权不能越过模式禁止 |
 | IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
 | 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
-| Composer 统计 | Harness 风格六枚 chip：Context / Input / Output / Hit rate / tok-s / TTFT；Context 取最新一次 prompt，Input 为计费累计（cache read+write+uncached），tok/s=Σoutput/Σdecode，TTFT 为平均首 token；点击展开详情；缺失字段显示 —，不用文本估算 |
+| Composer 统计 | 对齐 DSH StatsLine：`N 轮 M 步 · X tok/s · Y tok · 缓存命中 Z% · W%`；步=已完成 LLM 请求数（attempts，即 DSH step/end 计数），tok/s=输出速度 TPS=ΣdecodeTokens/ΣdecodeMs（decode 窗口=首个 content/reasoning/tool-call delta → 流结束，仅计入首 delta 与 output usage 同有的请求，reasoning 不重复计、工具时间不计入），Y=计费输入+输出（流式中为估算增量标 est.），Z=cacheRead/计费输入整数百分比，W=上下文占用；provider 多在请求结束上报 usage，会话 TPS/token 按请求边界跳变、Usage 一到达即刷新；流式期间 liveSurfaceTokens（在途请求 surface 文本估算，含 reasoning，usage 样本到达即清零）驱动 token 增量与 `≈tok/s` 本轮速度（估），永不持久化，与 DSH surfaceTokens 一致；无 Done 的失败请求仅 usage 进累计、不进 TPS/TTFT/步数（DSH tokenUsage 与 sessionStats 分离语义）；同请求多次 usage 后值替换前值；取消不计；子智能体的 LLM 调用作为真实 step 折进父会话统计（执行期间行持续跳动），但 W% 仅由主会话请求的最新 inputTokens 驱动、子调用不得覆盖（ZCode `shouldUseModelUsageForContext` 口径），百分比经 Intl percent 保留一位小数（0.2% 不显示为 0%）；点击展开详情（模型用时/工具调用用时/首 token 平均/输出速度/本轮速度（估）/最近请求 TPS + token 明细）；缺失字段显示 —，持久化速度绝不用文本估算 |
 | 结构化提问 | 只读工具 `ask_user`：1-4 题、每题 2-4 选项、单选/多选 + 自定义输入；Kernel 挂起该轮并发出 `user_question`，UI 模态提交/跳过后把结构化答案作为 tool result 返回；停止生成会取消等待 |
 | 弹窗适配层 | `src/components/ui/dialog.tsx` 统一 Portal/Overlay/固定居中/z-index 与 default/form/panel/palette 变体；8 个弹窗全部迁移，业务类只保留内容排版 |
 | 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
@@ -116,7 +116,7 @@ pnpm.cmd tauri dev
 - 会话数据库包含用户消息与模型回复，请视为私人数据。位置为 Tauri `app_data_dir()/maestro.sqlite3`。
 - 所有 SQLite 操作由 `maestro-sqlite` 专用 OS 线程独占，通过有界 `mpsc` 与异步调用者通信；不会在异步线程直接执行阻塞 SQL。
 - Rust 持有模式与运行授权；Plan Mode 拒绝副作用工具和未知名称，但允许应用内部会话/审计落库。
-- Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules` and `target`, and enforce path, link, scan-budget and file-size limits. The selected root is cloned before scanning, so long scans never hold the state lock; the Explorer caches the last tree and refreshes on debounced `workspace_changed`.
+- Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules`, `target`, `__pycache__`, `venv` and `.venv`, and enforce path, link, scan-budget and file-size limits. The selected root is cloned before scanning, so long scans never hold the state lock; concurrent refreshes coalesce into at most one active scan plus one pending rerun, and same-path file reads share an in-flight request. The Explorer caches the last tree and refreshes on debounced `workspace_changed`.
 - System prompt tells the model that paths outside the selected workspace cannot be read: it must ask the user to copy/move the file into the workspace instead of probing the sandbox.
 - 文件浏览不会自动把内容发送给模型。只读检查不是完整 OS 沙箱；并发恶意文件系统下的残余 TOCTOU 风险见[工作区文档](docs/workspace-filesystem.md)。
 - 扩展数据存放于 `~/.maestro/`（`skills/`、`commands/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，20s 握手/30s 调用超时，应用退出时统一回收；Windows 下 `.cmd`/`.bat` 启动器经 `cmd /C` 解析，启用状态写入 `disabled` 并在下次启动时后台恢复；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
@@ -177,6 +177,20 @@ pnpm.cmd tauri build
 
 NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，缺失时下载 bootstrapper，不捆绑完整 Chromium。打包工具缓存位于 `target/.tauri/`。安装包大小和内存占用请以当前版本实测为准；低内存目标尚未完成验收。
 
+## 本地 CI
+
+远端 GitHub Actions 暂未启用（`.github/workflows/ci.yml` 仅作参考）。日常校验使用本地一键门禁：
+
+| 命令 | 内容 | 典型耗时 |
+| --- | --- | --- |
+| `corepack pnpm verify:fast` | 前端测试 + 构建 | ~35s |
+| `corepack pnpm verify` | 前端测试/构建 + `cargo clippy -D warnings` + `cargo test --workspace` + preview E2E | ~2 分钟 |
+| `corepack pnpm verify:desktop` | 上述全部 + 真实 IPC 桌面 E2E | 约多 1 分钟 |
+
+- `scripts/ci.mjs` 会用 `vswhere` 找到 VS 并 `call vcvars64.bat`，因此在 Git Bash / PowerShell 里都能直接跑 `cargo`，不需要手工开 DevShell。
+- 可选 pre-push 钩子：`node scripts/install-git-hooks.mjs`（推送前跑 `verify:fast`，`git push --no-verify` 可临时跳过）。
+- CI 不需要任何 secrets：E2E 使用本地假 provider，Rust/前端测试使用 stub，不接触真实凭据。
+
 ## 文档与后续方向
 
 - [真实模型配置、重启与流式协议](docs/llm-streaming.md)
@@ -185,13 +199,35 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - [UI 设计、Activity 与截图](docs/ui-redesign.md)
 - [初始阶段验证记录（历史）](docs/verification.md)
 
+## Code 模式只读命令白名单
+
+`run_command` 在 Code 模式下默认挂起审批。只有同时满足以下三层的命令才免审执行，且**不经过 shell**（解析成 argv 后直接 spawn 已解析的绝对路径）：
+
+1. 程序名命中白名单，且是裸名字（`C:\...\git.exe`、`./git` 一律不认）。
+2. 子命令命中该程序允许的只读子命令。
+3. 每一个 `-` 参数都在该子命令的显式参数表内。
+
+| 程序 | 允许的只读子命令 / 参数 |
+| --- | --- |
+| `git` | `status` `diff` `log` `show` `rev-parse` `ls-files` `blame` `describe` `shortlog` `branch`（仅列表）`config`（仅 `--get`/`--get-all`/`--list`）及各自的显式 flag 表 |
+| `rg` | `-n` `-i` `-l` `-c` `-S` `-w` `-F` `--files` `--hidden` `--no-heading` 与 `-g/-t/-e/-A/-B/-C/-m/--max-depth`（带值） |
+| `where` | 仅位置参数（`/R`、`-x` 等开关需审批） |
+
+安全边界：
+
+- 命令中任何 shell 元字符（`&`、`|`、`;`、`<`、`>`、`^`、`%`、`$`、反引号、`(`、`)`、`{`、`}`、`[`、`]`、`*`、`?`、`~`、`!`、`#`）或换行都会被拒 → 管道、重定向、命令替换、`%PATH%`、通配符全部转为审批。
+- `git` 的第一个参数必须是子命令，`git -c core.pager=calc diff` 这类全局选项需要审批；`git diff --output=…`、`git log --format=…` 同样需要审批。
+- 白名单命令只在 `PATH` 中解析，跳过空条目（Windows 上等价当前目录）与落在工作区内的同名文件，防止仓库内放一个 `git.exe` 劫持。
+- `git` 额外注入 `GIT_PAGER=cat`、`GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0`，避免分页阻塞与索引刷新写入。
+- 命中白名单的调用在审计里记为 `read-only allowlist`，与 `auto-approved` / `user approved` / `extension` 区分。
+
 ## Roadmap
 
 已完成：
 
 - 真实模型聊天、工具循环、Skills/MCP、只读 Explorer、写入/命令审批
 - `ask_user` 结构化提问（1-4 题、选项 + 自定义输入）、`update_plan` 任务追踪、Tasks Tab、任务胶囊
-- Code 模式写自动、危险命令审批
+- Code 模式写自动、只读白名单命令免审、其余命令审批
 - 只读子智能体（内置 explore/general + 自定义 agent 全局/项目双源）、只读工具并发
 - 斜杠命令（内置动作 + 技能 + `.maestro/commands` 自定义命令）
 - 子智能体 trace 持久化、右侧下钻、跨轮报告、超时/用量/单独停止
@@ -202,7 +238,7 @@ NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，
 - Activity 项目级真实聚合（历史行数不回填）
 - 右侧 rAF 分栏、停止后输入队列、侧栏对齐
 - 统一 Dialog 适配层（8 个弹窗，Portal/Overlay/固定居中/变体）
-- DeepSeek Harness 六 chip 统计（Context/Input/Output/Hit/tok-s/TTFT）与 run_metrics v10 持久化
+- DeepSeek Harness StatsLine 统计（轮/步·tok/s·tok·缓存命中·上下文）与 run_metrics v15 持久化（成对 decode/ttft_steps/tool_ms，旧行近似回退不回填）
 - 工具审批 allow-once / allow-always / deny feedback（会话级规则、命令前缀/精确命令）
 - 中断/失败轮次上下文回放（部分输出 + 工具动作摘要），同一会话继续追问不丢工作记忆
 - ZCode 风格 context_compaction：80% 自动触发、`/compact` 手动触发、持久摘要与 pre/post token 分隔行

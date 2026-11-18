@@ -8,6 +8,7 @@ pub mod agent;
 pub mod approval;
 pub mod compaction;
 pub mod change;
+pub mod command_policy;
 pub mod metrics;
 pub mod plan;
 pub mod policy;
@@ -30,12 +31,15 @@ pub use plan::{
     validate_plan_steps, PlanCard, PlanDecision, PlanDraft, PlanStatus, PlanStep, PlanStepStatus,
     ProposedDiff,
 };
-pub use policy::{authorize, classify, gate, ToolEffect, ToolGate};
+pub use policy::{authorize, classify, gate, gate_call, ToolEffect, ToolGate};
 pub use session::{
-    unix_now, Mode, ProjectView, RunMessage, RunStatus, RunView, SessionDetail, SessionView,
-    Snapshot, ToolCallView,
+    unix_now, Mode, ProjectView, ReasoningSegment, RunMessage, RunPart, RunStatus, RunView, SessionDetail,
+    SessionView, Snapshot, ToolCallView,
 };
-pub use approval::{ApprovalCandidate, ApprovalDecision, ApprovalRule, CommandScope};
+pub use approval::{
+    canonical_json, ApprovalCandidate, ApprovalDecision, ApprovalRule, CommandScope,
+    MAX_RULE_PATTERN_CHARS,
+};
 pub use compaction::ContextCompaction;
 pub use subagent::{SubagentStatus, SubagentTokenKind, SubagentView};
 pub use user_question::{format_answers, parse_questions, validate_answers, Question, QuestionAnswer, QuestionOption};

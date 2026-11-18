@@ -11,7 +11,7 @@ pnpm.cmd tauri dev
 
 Open the right-side **Explorer** tab. Debug builds default to the repository containing `src-tauri`, so this checkout reads `E:\Maestro-Agent` without a hardcoded production path.
 Use the path field and **Open workspace** button to choose another absolute local project directory. Refresh reloads the selected tree.
-Click a file to fetch its current UTF-8 contents for readonly Monaco preview. Empty directories remain visible.
+Click a file to fetch its current UTF-8 contents for readonly code preview (ZCode-style `@pierre/diffs` + Shiki worker highlighting). Empty directories remain visible.
 Settings is fixed at the sidebar bottom; model, Plan/Execute, context choice and Tokens are inline in the composer.
 
 `pnpm.cmd dev:ui` is still an explicit browser Mock preview and cannot access Rust/local files. Packaged release builds require selecting a workspace rather than guessing a working directory.

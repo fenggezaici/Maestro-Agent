@@ -7,6 +7,24 @@ import { ToolCallRow } from './ToolCallBlocks';
 import SubagentReasoning from './SubagentReasoning';
 import { useStickyScroll } from '../hooks/useStickyScroll';
 
+/// Provider-reported decode speed only: no estimates when timing is missing.
+/// DSH 口径：Σ outputTokens / Σ decode 窗口（首 delta → 末 delta），不含
+/// 工具执行时间；缺 decodeMs 的旧行回退 elapsed - firstToken 近似。
+function subagentSpeed(trace: SubagentView): string | null {
+  // 优先成对的 decodeTokens/decodeMs；旧行没有 decodeTokens 时回退 outputTokens。
+  const output = (trace.decodeTokens != null && trace.decodeTokens > 0)
+    ? trace.decodeTokens
+    : trace.outputTokens ?? null;
+  if (output == null || output <= 0) return null;
+  const decodeMs = trace.decodeMs != null && trace.decodeMs > 0
+    ? trace.decodeMs
+    : trace.elapsedMs != null && trace.firstTokenMs != null
+      ? trace.elapsedMs - trace.firstTokenMs
+      : 0;
+  if (decodeMs <= 0) return null;
+  return (output / (decodeMs / 1000)).toFixed(1);
+}
+
 const STATUS_LABEL: Record<SubagentView['status'], string> = {
   running: '执行中',
   completed: '已完成',
@@ -40,6 +58,9 @@ export default function SubagentTracePanel({ trace, light, reasoningDisplay, onO
         {trace.model && <span>{trace.model}</span>}
         {trace.inputTokens != null && <span>in {trace.inputTokens}</span>}
         {trace.outputTokens != null && <span>out {trace.outputTokens}</span>}
+        {trace.reasoningTokens != null && <span>think {trace.reasoningTokens}</span>}
+        {subagentSpeed(trace) && <span>{subagentSpeed(trace)} tok/s</span>}
+        {trace.firstTokenMs != null && <span>TTFT {(trace.firstTokenMs / 1000).toFixed(1)}s</span>}
         {trace.status === 'running' && onCancel && <button type="button" className="button-ghost" onClick={() => onCancel(trace.id)}><Square size={11} />停止</button>}
       </div>
     </header>
