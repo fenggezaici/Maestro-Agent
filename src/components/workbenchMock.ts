@@ -33,7 +33,27 @@ export function changeMockExtension(items: MockExtension[], id: string, action: 
 // Preview-mode controller: functional local state, zero backend calls.
 import { useState } from 'react';
 import type { ExtensionsController } from '../hooks/useExtensions';
-import type { McpServerView, RecommendedItem, SkillView } from '../api/extensions';
+import type { McpServerView, PluginView, RecommendedItem, SkillView } from '../api/extensions';
+
+/// 架构沙盘 Preview 物料区：不触 IPC 的固定 fixture（含运行中 MCP 工具）。
+export function sandboxFixtureExtensions(): { skills: SkillView[]; servers: McpServerView[]; plugins: PluginView[] } {
+  return {
+    skills: [
+      { name: 'ui-guidelines', description: 'UI 组件与设计规范', source: 'global', path: '~/.maestro/skills/ui-guidelines/SKILL.md' },
+      { name: 'plan-review', description: '计划审查流程', source: 'project', path: '<workspace>/.maestro/skills/plan-review/SKILL.md' },
+    ],
+    servers: [
+      { name: 'postgres', command: 'npx', args: ['-y', 'server-pg'], env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
+        { name: 'query', description: 'Run a read-only SQL query', inputSchema: {}, readOnly: true },
+        { name: 'describe_schema', description: 'Inspect table schema', inputSchema: {}, readOnly: true },
+      ] },
+      { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
+    ],
+    plugins: [
+      { name: 'acceptance-checklist', description: '验收清单（项目级清单示例）', kind: 'skill', target: 'plan-review', tool: null, condition: 'required', params: {}, source: 'project', path: '<workspace>/.maestro/plugins/acceptance-checklist.json', error: null },
+    ],
+  };
+}
 
 const previewRecommended: RecommendedItem[] = [
   { id: 'superpowers', kind: 'skill', name: 'Superpowers', description: '社区热门技能合集：TDD、系统化调试、分支工作流。', sourceUrl: 'https://github.com/obra/superpowers', installPayload: 'https://github.com/obra/superpowers' },
@@ -46,13 +66,16 @@ export function usePreviewExtensions(): ExtensionsController {
     { name: 'pdf-tools', description: '项目级技能示例', source: 'project', path: '<workspace>/.maestro/skills/pdf-tools/SKILL.md' },
   ]);
   const [servers, setServers] = useState<McpServerView[]>([
-    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 8, error: null },
-    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_preview' }, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null },
+    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
+      { name: 'read_file', description: 'Read a file', inputSchema: {}, readOnly: true },
+      { name: 'list_dir', description: 'List directory', inputSchema: {}, readOnly: true },
+    ] },
+    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_preview' }, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
   ]);
   const [pending, setPending] = useState<string | null>(null);
   const noop = async () => null;
   return {
-    skills, servers,
+    skills, servers, plugins: [],
     recommendedSkills: previewRecommended.filter((i) => i.kind === 'skill'),
     recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
     mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
@@ -63,12 +86,12 @@ export function usePreviewExtensions(): ExtensionsController {
     createSkill: async (name, description, scope = 'global') => { setSkills((items) => [...items, { name, description, source: scope, path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
     deleteSkill: async (skill) => { setSkills((items) => items.filter((item) => !(item.name === skill.name && item.source === skill.source))); return null; },
     importSkill: noop, importSkillGithub: noop,
-    addMcpServer: async (name, command, args, env = {}, trust = false) => { setServers((items) => [...items, { name, command, args, env, disabled: false, autoStart: false, trust, running: false, toolCount: 0, error: null }]); return null; },
+    addMcpServer: async (name, command, args, env = {}, trust = false) => { setServers((items) => [...items, { name, command, args, env, disabled: false, autoStart: false, trust, running: false, toolCount: 0, error: null, tools: [] }]); return null; },
     setMcpTrust: async (server, trust) => { setServers((items) => items.map((item) => item.name === server.name ? { ...item, trust } : item)); },
     importMcpJson: noop,
     toggleMcpServer: async (server, enable) => {
       setPending(`mcp-${server.name}`);
-      setServers((items) => items.map((item) => item.name === server.name ? { ...item, running: enable, toolCount: enable ? 8 : 0 } : item));
+      setServers((items) => items.map((item) => item.name === server.name ? { ...item, running: enable, toolCount: enable ? item.tools.length : 0 } : item));
       setPending(null);
     },
     removeMcpServer: async (name) => { setServers((items) => items.filter((item) => item.name !== name)); return null; },

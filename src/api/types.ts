@@ -152,10 +152,28 @@ export interface SessionDetail { session: SessionView; runs: RunView[]; plans: P
 /// stay inert until the user grants trust.
 export interface WorkspaceTrustStatus { path: string; assets: string[] }
 
+/// 架构沙盘执行轨迹中的单步：画布按 nodeId 高亮节点状态。
+export interface ArchitectureTraceStep {
+  nodeId: string;
+  status: 'matched' | 'passed' | 'failed' | 'optional' | 'blocked' | 'pending' | 'reminded';
+}
+
+/// 最近一次命中 Trigger 的工具调用求值轨迹（`architecture_trace` 事件的载荷形状）。
+export interface ArchitectureTrace {
+  runId: number;
+  sessionId: number;
+  tool: string;
+  target: string;
+  blocked: boolean;
+  message: string | null;
+  steps: ArchitectureTraceStep[];
+}
+
 /// Single `kernel-event` channel contract. Streamed text arrives already
 /// classified as `content` (answer) or `reasoning` (thinking); tool execution
 /// is reported as structured `tool_call` lifecycle events.
 export type KernelEvent = { sequence: number } & (
+  | { type: 'architecture_trace'; runId: number; sessionId: number; tool: string; target: string; blocked: boolean; message?: string | null; steps: ArchitectureTraceStep[] }
   | { type: 'ready' }
   | { type: 'metrics'; metrics: RunMetrics }
   | { type: 'backend_error'; message: string }

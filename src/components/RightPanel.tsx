@@ -99,7 +99,13 @@ const STATUS_LABEL: Record<ReviewFile['status'], string> = { pending: '待批准
 function ChangesList({ files, activePath, onPick }: { files: ReviewFile[]; activePath: string | null; onPick: (path: string) => void }) {
   if (!files.length) return <p className="review-files-empty">暂无变更</p>;
   return <>{files.map((item) => {
-    const { added, removed } = countChanges(item.before, item.after);
+    // Net cumulative counts win (merged multi-write rows); per-write counts
+    // are still authoritative for single-write rows; text diff is last resort.
+    const { added, removed } = item.netAdded != null && item.netRemoved != null
+      ? { added: item.netAdded, removed: item.netRemoved }
+      : (item.added != null && item.removed != null
+        ? { added: item.added, removed: item.removed }
+        : countChanges(item.before, item.after));
     const slash = item.path.lastIndexOf('/');
     const basename = slash >= 0 ? item.path.slice(slash + 1) : item.path;
     const dir = slash >= 0 ? item.path.slice(0, slash + 1) : '';

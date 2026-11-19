@@ -111,5 +111,69 @@ pub struct McpServerView {
     pub trust: bool,
     pub running: bool,
     pub tool_count: usize,
+    /// 运行中 Server 的 `tools/list` 结果；未运行或失败时为空。
+    #[serde(default)]
+    pub tools: Vec<McpToolView>,
+    pub error: Option<String>,
+}
+
+// ---- 声明式插件清单（无独立插件运行时） -----------------------------------------
+//
+// `~/.maestro/plugins/<name>.json` 与 `<workspace>/.maestro/plugins/<name>.json`
+// 声明一个「插件 = 对 Skill 或 MCP 的封装引用」；架构沙盘把插件节点解析为
+// 其声明的 Skill/MCP 依赖再强制调用。清单本身不可执行，绝不伪造运行时代码。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginCondition {
+    Required,
+    Optional,
+}
+
+impl Default for PluginCondition {
+    fn default() -> Self {
+        Self::Required
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// `skill` | `mcp` —— 插件声明的底层依赖类型。
+    pub kind: PluginKind,
+    /// skill 名或 MCP server 名。
+    pub target: String,
+    /// 仅 `kind: mcp` 时可用：限定具体工具。
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub condition: PluginCondition,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginKind {
+    Skill,
+    Mcp,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginView {
+    pub name: String,
+    pub description: String,
+    /// 清单解析失败时为 `null`，前端以红色徽标呈现。
+    pub kind: Option<PluginKind>,
+    pub target: Option<String>,
+    pub tool: Option<String>,
+    pub condition: PluginCondition,
+    pub params: BTreeMap<String, String>,
+    pub source: SkillSource,
+    pub path: String,
     pub error: Option<String>,
 }

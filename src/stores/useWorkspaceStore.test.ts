@@ -63,4 +63,23 @@ describe('useWorkspaceStore concurrency guards', () => {
     await flushTicks();
     expect(treeMock).toHaveBeenCalledTimes(2);
   });
+
+  it('loads the fallback root instead of failing the first click after a reload', async () => {
+    // Fresh store state simulates a vite dev reload: module root is empty.
+    // mockResolvedValue also clears any pending implementation left over from
+    // the coalescing test (clearAllMocks does not reset implementations).
+    treeMock.mockResolvedValue([]);
+    textMock.mockResolvedValue('reloaded content');
+    await useWorkspaceStore.getState().selectFile('src/main.ts', 'E:/project');
+    const state = useWorkspaceStore.getState();
+    expect(state.fileError).toBeNull();
+    expect(state.file?.path).toBe('src/main.ts');
+    expect(textMock).toHaveBeenCalledWith('E:/project', 'src/main.ts');
+  });
+
+  it('still reports the empty-workspace error when no fallback root is given', async () => {
+    await useWorkspaceStore.getState().selectFile('src/main.ts');
+    expect(useWorkspaceStore.getState().fileError).toContain('工作区尚未加载');
+    expect(textMock).not.toHaveBeenCalled();
+  });
 });

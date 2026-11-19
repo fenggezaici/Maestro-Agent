@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
-import { afterEach, vi } from 'vitest';
+import { afterEach, beforeEach, vi } from 'vitest';
 
 class TestPointerEvent extends MouseEvent {
   pointerType: string;
@@ -24,4 +24,7 @@ HTMLElement.prototype.hasPointerCapture = vi.fn(() => false);
 HTMLElement.prototype.setPointerCapture = vi.fn();
 HTMLElement.prototype.releasePointerCapture = vi.fn();
 
+// View state persists to sessionStorage (reload survival); without a reset it
+// leaks across tests in the same jsdom environment and restores stale panels.
+beforeEach(() => { sessionStorage.clear(); });
 afterEach(cleanup);

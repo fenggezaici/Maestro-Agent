@@ -2,7 +2,9 @@
 //! delegates to a service/adapter, and wraps errors. No business logic here.
 pub mod activity;
 pub mod agents;
+pub mod architecture;
 pub mod credentials;
+pub mod debug;
 pub mod extensions;
 pub mod kernel;
 pub mod models;

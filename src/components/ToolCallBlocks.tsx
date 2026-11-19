@@ -1,4 +1,5 @@
 import { Bot, ChevronDown, ChevronRight, CircleHelp, Database, File, FileCode2, FileEdit, FileJson, FileText, Folder, ListTodo, Loader2, Puzzle, Search, ShieldCheck, SquareTerminal, Wrench, type LucideIcon } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { memo, useState } from 'react';
 import type { ApprovalDecision, CommandScope, SubagentView, ToolCallView } from '../api/types';
 import { parseApprovalPreview } from '../lib/conversation';
@@ -8,7 +9,7 @@ import { parseUserQuestionPayload, questionAnswerText } from '../lib/userQuestio
 
 /// `write_result` payload emitted in the Finished detail for write tools —
 /// carries the before/after contents for the mini diff.
-interface WriteResult { kind: 'write_result'; path: string; before: string; after: string }
+interface WriteResult { kind: 'write_result'; path: string; before: string; after: string; added?: number; removed?: number }
 
 function writeResultOf(detail: string): WriteResult | null {
   try {
@@ -93,7 +94,6 @@ function rulePattern(call: ToolCallView, scope: CommandScope): string {
 /// can interleave rows with thinking nodes in event order.
 export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpenFile, onResolveApproval, onOpenSubagent, subagent }: { call: ToolCallView; onSelectFile?: (path: string) => void; onOpenFile?: (path: string) => void; onResolveApproval?: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) => void; onOpenSubagent?: (id: string) => void; subagent?: SubagentView }) {
   const [expanded, setExpanded] = useState(false);
-  const [scopeOpen, setScopeOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [denyOpen, setDenyOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
@@ -104,7 +104,13 @@ export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpe
   const target = targetOf(call);
   const writeResult = call.allowed ? writeResultOf(call.detail) : null;
   const askPayload = call.tool === 'ask_user' ? parseUserQuestionPayload(call.detail) : null;
-  const delta = writeResult ? countChanges(writeResult.before, writeResult.after) : null;
+  // Kernel ships full-content added/removed — before/after in the payload are
+  // 8KB-truncated for display, so recomputing them here would undercount.
+  const delta = writeResult
+    ? (writeResult.added != null && writeResult.removed != null
+      ? { added: writeResult.added, removed: writeResult.removed }
+      : countChanges(writeResult.before, writeResult.after))
+    : null;
   const panel = call.allowed ? (writeResult ? writeResult.path : (call.detail || '读取成功')) : `失败：${call.detail || '未知原因'}`;
   const subagentId = call.subagentId;
   const spawn = call.tool === 'spawn_subagent' && Boolean(onOpenSubagent && subagentId);
@@ -136,22 +142,27 @@ export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpe
           : <pre className="tool-approval-args">{preview?.kind === 'args' ? preview.arguments : call.detail}</pre>}
         <div className="tool-approval-actions">
           <button type="button" className="button-ghost" aria-label="批准工具调用" onClick={() => onResolveApproval(call.runId, 'allow_once')}>允许一次</button>
-          <div className="approval-always">
-            <button type="button" className="button-ghost" aria-label="始终允许工具调用"
-              onClick={() => call.tool === 'run_command' ? setScopeOpen((value) => !value) : onResolveApproval(call.runId, 'allow_always', 'exact')}>始终允许</button>
-            {scopeOpen && call.tool === 'run_command' && <div className="approval-scope-menu" role="menu">
-              <button type="button" role="menuitem" onClick={() => { setScopeOpen(false); onResolveApproval(call.runId, 'allow_always', 'exact'); }}>
-                <span>仅此命令（推荐）</span>
-                <code>{rulePattern(call, 'exact')}</code>
-              </button>
-              <button type="button" role="menuitem" onClick={() => { setScopeOpen(false); onResolveApproval(call.runId, 'allow_always', 'prefix'); }}>
-                <span>命令前缀（更宽）</span>
-                <code>{rulePattern(call, 'prefix')}</code>
-              </button>
-            </div>}
-          </div>
-          <button type="button" className="button-ghost" aria-label="拒绝工具调用" onClick={() => setDenyOpen((value) => !value)}>拒绝</button>
-          <button type="button" className="button-ghost" aria-label="查看本会话授权规则" onClick={() => setRulesOpen(true)}><ShieldCheck size={12} />授权规则</button>
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <button type="button" className="button-ghost" aria-label="更多审批操作">更多<ChevronDown size={12} /></button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content className="dropdown-content approval-menu" align="start" sideOffset={4}>
+                <DropdownMenu.Item className="dropdown-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'exact')}>
+                  始终允许（仅此调用）<code className="approval-menu-pattern">{rulePattern(call, 'exact')}</code>
+                </DropdownMenu.Item>
+                {call.tool === 'run_command' && <DropdownMenu.Item className="dropdown-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'prefix')}>
+                  始终允许（命令前缀）<code className="approval-menu-pattern">{rulePattern(call, 'prefix')}</code>
+                </DropdownMenu.Item>}
+                <DropdownMenu.Item className="dropdown-item" onSelect={() => setRulesOpen(true)}>
+                  <ShieldCheck size={12} />授权规则…
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator className="dropdown-separator" />
+                <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => onResolveApproval(call.runId, 'deny')}>直接拒绝</DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => setDenyOpen((value) => !value)}>拒绝并反馈…</DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
         </div>
         <ApprovalRulesDialog runId={call.runId} open={rulesOpen} onOpenChange={setRulesOpen} />
         {denyOpen && <div className="tool-approval-feedback">

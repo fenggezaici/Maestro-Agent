@@ -476,6 +476,22 @@ impl Database {
         .await
     }
 
+    /// trusted_workspaces 全表——启动时载入内存副本，读路径不再逐次打 DB。
+    pub async fn list_trusted_workspaces(&self) -> AppResult<Vec<String>> {
+        self.call(move |connection| {
+            let mut stmt = connection
+                .prepare("SELECT path FROM trusted_workspaces")
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(db_error)?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(db_error)?;
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn trust_workspace(&self, path: String) -> AppResult<()> {
         self.call(move |connection| {
             connection
@@ -1022,6 +1038,66 @@ impl Database {
         .await
     }
 
+    /// 架构沙盘 Session 工具历史：`audit.action='tool_history'`，detail 为
+    /// `{"tool","target"}` JSON —— 与 `tool_allowed` 展示行分开，避免迁移。
+    pub async fn record_tool_history(
+        &self,
+        run_id: i64,
+        tool: String,
+        target: String,
+    ) -> AppResult<()> {
+        self.call(move |connection| {
+            let detail = serde_json::json!({ "tool": tool, "target": target }).to_string();
+            connection
+                .execute(
+                    "INSERT INTO audit (run_id, action, detail) VALUES (?1, 'tool_history', ?2)",
+                    params![run_id, detail],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 一个 Session 跨全部 Run 的成功调用历史（架构 Requirement/Extension
+    /// 满足度判定用）；子智能体的调用不写入父 Session。
+    pub async fn session_tool_history(
+        &self,
+        session_id: i64,
+    ) -> AppResult<Vec<crate::domain::HistoryEntry>> {
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT run_id, detail FROM audit WHERE action='tool_history'
+                     AND run_id IN (SELECT id FROM runs WHERE session_id = ?1) ORDER BY id",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([session_id], |row| {
+                    let run_id: i64 = row.get(0)?;
+                    let detail: String = row.get(1)?;
+                    let parsed = serde_json::from_str::<serde_json::Value>(&detail)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    Ok(crate::domain::HistoryEntry {
+                        run_id,
+                        tool: parsed
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        target: parsed
+                            .get("target")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .map_err(db_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        })
+        .await
+    }
+
     pub async fn save_metrics(&self, metrics: RunMetrics) -> AppResult<()> {
         self.call(move |connection| {
             let input = metrics.input_tokens.map(i64::try_from).transpose().map_err(|_| "Provider token usage exceeds database range")?;
@@ -1397,9 +1473,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 18 {
+    if version > 19 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 18"
+            "Database schema {version} is newer than supported version 19"
         ));
     }
     connection
@@ -1715,6 +1791,17 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 19 {
+        // v19: audit 此前无索引——架构 gate 每次工具批次都跑
+        // session_tool_history 的 action+run_id 过滤（全表扫描且单调膨胀），
+        // run 期会把单 worker DB 队列拖死，连沙盘加载都排队超时。
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS audit_action_run ON audit(action, run_id);
+                 PRAGMA user_version = 19;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -1964,7 +2051,7 @@ mod tests {
         for column in ["reasoning_tokens", "first_token_ms", "elapsed_ms", "last_input_tokens"] {
             assert!(columns.iter().any(|name| name == column), "missing {column}");
         }
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2020,7 +2107,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(has_parts, 1, "run_parts must be created when upgrading from v12");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2032,7 +2119,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 19)
+                    .pragma_update(None, "user_version", 20)
                     .map_err(db_error)
             })
             .await

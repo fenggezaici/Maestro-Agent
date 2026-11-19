@@ -11,6 +11,7 @@ import './index.css';
 import './styles/phase1.css';
 import './styles/phase2.css';
 import './styles/phase3.css';
+import './styles/phase4.css';
 
 const PreviewApp = lazy(() => import('./preview/PreviewApp'));
 const preview = !isTauri() && new URLSearchParams(window.location.search).get('preview') === '1';

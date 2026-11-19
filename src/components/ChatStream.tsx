@@ -1,6 +1,6 @@
 /// Dumb chat stream: renders conversation turns, tool-call blocks, reasoning
 /// panes and plan cards. Everything arrives as props — no IPC, no stores.
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { memo, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { BrainCircuit, ChevronDown, ChevronRight, Clock3, Copy, Pencil, ThumbsDown, ThumbsUp, WandSparkles, Wrench } from 'lucide-react';
 
 import type { ApprovalDecision, CommandScope, ContextCompaction, PersistedPart, PersistedReasoning, PlanCard as Plan, PlanDecision, RunView, SubagentView, ToolCallView } from '../api/types';
@@ -11,6 +11,14 @@ import PlanCard from './PlanCard';
 import ToolCallBlocks, { ToolCallRow } from './ToolCallBlocks';
 import MarkdownMessage from './MarkdownMessage';
 import { compactTokens } from './SessionStats';
+
+/// 运行中的流式 markdown：useDeferredValue 让陈旧帧的全量 remark 解析被
+/// React 丢弃——解析率自适应到可用算力，流式高峰期 invoke 响应与
+/// lazy `import()`（架构沙盘）不再被饿死。
+const DeferredMarkdownMessage = memo(function DeferredMarkdownMessage({ content, light }: { content: string; light: boolean }) {
+  const deferred = useDeferredValue(content);
+  return <MarkdownMessage content={deferred} light={light} />;
+});
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 
 /// Models without `reasoning_content` emit inline <think>…</think> blocks —
@@ -305,9 +313,10 @@ const ChatStream = memo(function ChatStream({ historyRef, onScroll, runs, loadin
                   else blocks.push({ key: `e${index}`, items: [item] });
                 });
                 const hasContent = blocks.some((block) => block.text !== undefined);
+                const MD = run.status === 'running' ? DeferredMarkdownMessage : MarkdownMessage;
                 return <>
                   {blocks.map((block, index) => block.text !== undefined
-                    ? <div key={block.key} aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={block.text} light={theme === 'light'} /></div>
+                    ? <div key={block.key} aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MD content={block.text} light={theme === 'light'} /></div>
                     : <ExecutionGroup key={block.key} timeline={block.items!} running={run.status === 'running' && index === blocks.length - 1}>
                         {block.items!.map((item, itemIndex) => {
                           if (item.kind === 'reasoning') return <ReasoningNode key={`r${itemIndex}`} segment={item.segment} display={reasoningDisplay} />;
@@ -316,7 +325,7 @@ const ChatStream = memo(function ChatStream({ historyRef, onScroll, runs, loadin
                         })}
                       </ExecutionGroup>)}
                   {!hasContent && (body !== '' || run.status !== 'running') &&
-                    <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
+                    <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MD content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
                 </>;
               })()
               : <>
@@ -343,7 +352,7 @@ const ChatStream = memo(function ChatStream({ historyRef, onScroll, runs, loadin
                   <CollapsibleBlock title="思考" icon={<BrainCircuit size={13} />} contentClass="reasoning-content"><ReasoningText text={inlineReasoning} streaming={false} /></CollapsibleBlock>}
               </>}
             {!timeline?.length && (body !== '' || run.status !== 'running') &&
-              <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy"><MarkdownMessage content={body || '无输出'} light={theme === 'light'} />{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
+              <div aria-label={`回复内容 ${run.id}`} aria-busy={run.status === 'running'} className="agent-copy">{(() => { const MD = run.status === 'running' ? DeferredMarkdownMessage : MarkdownMessage; return <MD content={body || '无输出'} light={theme === 'light'} />; })()}{run.status === 'running' && <span aria-hidden="true" className="typing-cursor" />}</div>}
             {body !== '' && <MessageActions run={run} onCopyError={onCopyError} />}
           </>;
         })()}

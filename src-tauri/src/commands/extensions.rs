@@ -6,7 +6,7 @@ use crate::{
     adapters::fs::workspace::WorkspaceService,
     commands::require_main,
     domain::{
-        AppResult, CommandView, McpServerConfig, McpServerView, RecommendedItem,
+        AppResult, CommandView, McpServerConfig, McpServerView, PluginView, RecommendedItem,
         SkillImportOutcome, SkillSource, SkillView,
     },
     services::kernel::Kernel,
@@ -247,6 +247,24 @@ pub async fn recommended_mcps(
     require_main(&window)?;
     let _ = kernel;
     Ok(crate::adapters::mcp::recommended_mcps())
+}
+
+/// 声明式插件清单：`.maestro/plugins/*.json`（项目覆盖全局同名）。
+/// 无独立插件运行时——清单只声明对 Skill/MCP 的依赖引用。
+#[tauri::command]
+pub async fn scan_plugins(
+    window: WebviewWindow,
+    kernel: State<'_, Arc<Kernel>>,
+    workspace: State<'_, WorkspaceService>,
+) -> AppResult<Vec<PluginView>> {
+    require_main(&window)?;
+    let root = kernel
+        .trusted_project_root(workspace.current_root().as_deref())
+        .await;
+    Ok(kernel
+        .extensions()
+        .plugins
+        .scan(kernel.extensions().maestro_dir(), root.as_deref()))
 }
 
 #[tauri::command]

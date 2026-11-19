@@ -78,6 +78,16 @@ fn sensitive_denied() -> String {
     "路径命中敏感文件保护（凭据/私钥/dotenv），禁止读写".into()
 }
 
+/// `.maestro/` 是配置区：graph_rules.json、skills、plugins、commands、agents
+/// 都住在这里。模型若能写入，就可以改写架构规则自救，或自造 Skill/插件
+/// 清单来满足必选扩展依赖——所以整个目录对模型写入一律硬拒绝（规则文件由
+/// 「架构沙盘」IPC 落盘，不走本函数）。读取保持允许。
+pub fn is_maestro_config_path(rel: &str) -> bool {
+    let normalized = rel.trim().replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./");
+    normalized == ".maestro" || normalized.starts_with(".maestro/")
+}
+
 /// Resolve a workspace-relative path under `root`.
 pub fn scoped_path(root: &Path, rel: &str) -> AppResult<PathBuf> {
     let rel_path = Path::new(rel);
@@ -333,6 +343,9 @@ pub fn scoped_write_path(root: &Path, rel: &str) -> AppResult<PathBuf> {
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err("路径必须在工作区内".into());
+    }
+    if is_maestro_config_path(rel) {
+        return Err(".maestro/ 为扩展与架构规则配置区，模型不可写入；请在扩展页或架构沙盘中调整".into());
     }
     let file_name = rel_path
         .file_name()

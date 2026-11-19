@@ -9,7 +9,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde_json::{json, Value};
@@ -88,7 +91,9 @@ fn resolve_program(command: &str, _path_var: Option<&std::ffi::OsStr>) -> (PathB
 #[derive(Default)]
 pub struct McpManager {
     config_path: Mutex<Option<PathBuf>>,
-    running: AsyncMutex<HashMap<String, RunningServer>>,
+    // Servers are shared by Arc: the map lock only covers lookup, so a slow
+    // request never serializes tool_specs/running_tools/gate reads behind it.
+    running: AsyncMutex<HashMap<String, Arc<RunningServer>>>,
     /// Last startup error per server, surfaced in list_mcp_servers.
     errors: Mutex<HashMap<String, String>>,
     /// Current workspace root: PATH directories inside it are excluded from
@@ -145,6 +150,7 @@ impl McpManager {
                     trust: server.trust,
                     running,
                     tool_count: 0, // Filled by the async list_servers caller.
+                    tools: Vec::new(),
                     error: errors.get(name).cloned(),
                 }
             })
@@ -158,12 +164,28 @@ impl McpManager {
             if let Some(server) = running.get(&view.name) {
                 view.running = true;
                 view.tool_count = server.tools.len();
+                view.tools = server.tools.clone();
                 if let Some(error) = &server.failed {
                     view.error = Some(error.clone());
                 }
             }
         }
         Ok(views)
+    }
+
+    /// 运行中 Server -> 已列出工具名（架构求值快照用）。
+    pub async fn running_tools(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.running
+            .lock()
+            .await
+            .iter()
+            .map(|(name, server)| {
+                (
+                    name.clone(),
+                    server.tools.iter().map(|tool| tool.name.clone()).collect(),
+                )
+            })
+            .collect()
     }
 
     /// Merge a config entry (from UI or imported JSON) into mcp.json.
@@ -241,15 +263,19 @@ impl McpManager {
                     trust: config.trust,
                     running: true,
                     tool_count: server.tools.len(),
+                    tools: server.tools.clone(),
                     error: server.failed.clone(),
                 });
             }
         }
         match self.spawn(&name, &config).await {
             Ok(server) => {
-                let tools = server.tools.len();
+                let tools = server.tools.clone();
                 let failed = server.failed.clone();
-                self.running.lock().await.insert(name.clone(), server);
+                self.running
+                    .lock()
+                    .await
+                    .insert(name.clone(), Arc::new(server));
                 self.errors.lock().unwrap().remove(&name);
                 Ok(McpServerView {
                     name,
@@ -260,7 +286,8 @@ impl McpManager {
                     auto_start: config.auto_start,
                     trust: config.trust,
                     running: true,
-                    tool_count: tools,
+                    tool_count: tools.len(),
+                    tools,
                     error: failed,
                 })
             }
@@ -304,12 +331,12 @@ impl McpManager {
         }));
         tokio::spawn(read_loop(BufReader::new(stdout), pending.clone()));
         let mut server = RunningServer {
-            child,
-            stdin,
+            child: AsyncMutex::new(child),
+            stdin: AsyncMutex::new(stdin),
             pending,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
-            trust: config.trust,
+            trust: AtomicBool::new(config.trust),
             failed: None,
         };
         let handshake = async {
@@ -322,13 +349,14 @@ impl McpManager {
                         "clientInfo": { "name": "maestro", "version": env!("CARGO_PKG_VERSION") },
                     }),
                     HANDSHAKE_TIMEOUT,
+                    None,
                 )
                 .await?;
             server
                 .notify("notifications/initialized", json!({}))
                 .await?;
             let listed = server
-                .request("tools/list", json!({}), HANDSHAKE_TIMEOUT)
+                .request("tools/list", json!({}), HANDSHAKE_TIMEOUT, None)
                 .await?;
             Ok::<_, String>(listed)
         };
@@ -338,18 +366,18 @@ impl McpManager {
                 Ok(server)
             }
             Err(error) => {
-                let _ = server.child.kill().await;
+                let _ = server.child.lock().await.kill().await;
                 Err(error)
             }
         }
     }
 
     pub async fn stop(&self, name: &str) -> AppResult<()> {
-        if let Some(mut server) = self.running.lock().await.remove(name) {
+        if let Some(server) = self.running.lock().await.remove(name) {
             for (_id, tx) in server.pending.lock().unwrap().replies.drain() {
                 let _ = tx.send(Err("MCP 服务已停止".into()));
             }
-            let _ = server.child.kill().await;
+            let _ = server.child.lock().await.kill().await;
         }
         Ok(())
     }
@@ -417,12 +445,23 @@ impl McpManager {
             .collect()
     }
 
-    pub async fn call_tool(&self, qualified: &str, arguments: Value) -> AppResult<String> {
+    pub async fn call_tool(
+        &self,
+        qualified: &str,
+        arguments: Value,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> AppResult<String> {
         let (server_name, tool_name) =
             split_mcp_tool(qualified).ok_or_else(|| format!("非法 MCP 工具名：{qualified}"))?;
-        let mut running = self.running.lock().await;
-        let server = running
-            .get_mut(server_name)
+        // Clone the Arc and drop the map lock before awaiting the request —
+        // a hung server must not serialize unrelated gate reads, and the
+        // run's cancel signal reaches the wait directly.
+        let server = self
+            .running
+            .lock()
+            .await
+            .get(server_name)
+            .cloned()
             .ok_or_else(|| format!("MCP 服务 {server_name} 未在运行"))?;
         if !server.tools.iter().any(|tool| tool.name == tool_name) {
             return Err(format!("MCP 服务 {server_name} 没有工具 {tool_name}"));
@@ -432,6 +471,7 @@ impl McpManager {
                 "tools/call",
                 json!({ "name": tool_name, "arguments": arguments }),
                 CALL_TIMEOUT,
+                cancel,
             )
             .await?;
         call_result_text(&result)
@@ -450,7 +490,7 @@ impl McpManager {
                         .tools
                         .iter()
                         .find(|tool| tool.name == tool_name)
-                        .map(|tool| (server.trust, tool.read_only))
+                        .map(|tool| (server.trust.load(Ordering::Relaxed), tool.read_only))
                 })
                 .map(|(trust, read_only)| tools::effective_read_only(trust, read_only))
                 .unwrap_or(false),
@@ -468,16 +508,16 @@ impl McpManager {
             .ok_or_else(|| format!("MCP 服务 {name} 不存在"))?;
         server.trust = trust;
         self.save(&file)?;
-        if let Some(running) = self.running.lock().await.get_mut(&name) {
-            running.trust = trust;
+        if let Some(running) = self.running.lock().await.get(&name) {
+            running.trust.store(trust, Ordering::Relaxed);
         }
         Ok(())
     }
 
     pub async fn shutdown(&self) {
         let mut running = self.running.lock().await;
-        for (_name, mut server) in running.drain() {
-            let _ = server.child.kill().await;
+        for (_name, server) in running.drain() {
+            let _ = server.child.lock().await.kill().await;
         }
     }
 }
@@ -579,5 +619,121 @@ mod tests {
         // start_enabled skips disabled entries without spawning anything.
         manager.start_enabled().await;
         assert!(!manager.list_servers().await.unwrap()[0].running);
+    }
+
+    /// A stdio child that never produces a valid response: anything written
+    /// to it yields no JSON-RPC reply, so a request stays pending until
+    /// timeout or cancel.
+    fn silent_server() -> Arc<RunningServer> {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "findstr", "x"]);
+            command
+        };
+        // `cat` echoes stdin back as non-JSON lines: the reader drops them.
+        #[cfg(unix)]
+        let mut command = Command::new("cat");
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn silent child");
+        let stdout = child.stdout.take().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let pending = Arc::new(Mutex::new(Pending {
+            replies: HashMap::new(),
+        }));
+        tokio::spawn(read_loop(BufReader::new(stdout), pending.clone()));
+        Arc::new(RunningServer {
+            child: AsyncMutex::new(child),
+            stdin: AsyncMutex::new(stdin),
+            pending,
+            next_id: AtomicU64::new(0),
+            tools: vec![crate::domain::McpToolView {
+                name: "slow".into(),
+                description: String::new(),
+                input_schema: json!({}),
+                read_only: false,
+            }],
+            trust: AtomicBool::new(false),
+            failed: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn call_tool_honours_the_run_cancel_signal() {
+        let manager = Arc::new(McpManager::default());
+        let server = silent_server();
+        manager.running.lock().await.insert("slow".into(), server.clone());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let call = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .call_tool("mcp__slow__slow", json!({}), Some(cancel_rx))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_tx.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("cancelled call must return promptly")
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("已取消"), "{error}");
+        assert!(server.pending.lock().unwrap().replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_tool_returns_immediately_when_already_cancelled() {
+        let manager = McpManager::default();
+        let server = silent_server();
+        manager.running.lock().await.insert("slow".into(), server);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let error = manager
+            .call_tool("mcp__slow__slow", json!({}), Some(cancel_rx))
+            .await
+            .unwrap_err();
+        assert!(error.contains("已取消"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_call_does_not_block_gate_reads_or_stop() {
+        let manager = Arc::new(McpManager::default());
+        let server = silent_server();
+        manager.running.lock().await.insert("slow".into(), server);
+        let worker = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.call_tool("mcp__slow__slow", json!({}), None).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The map lock must not be held across the request: every read path
+        // that gate evaluation and tool listing depend on stays responsive.
+        tokio::time::timeout(std::time::Duration::from_secs(2), manager.tool_specs())
+            .await
+            .expect("tool_specs blocked behind an in-flight call");
+        tokio::time::timeout(std::time::Duration::from_secs(2), manager.running_tools())
+            .await
+            .expect("running_tools blocked behind an in-flight call");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.tool_is_read_only("mcp__slow__slow"),
+        )
+        .await
+        .expect("tool_is_read_only blocked behind an in-flight call");
+        // stop() must also resolve promptly and fail the in-flight caller.
+        tokio::time::timeout(std::time::Duration::from_secs(2), manager.stop("slow"))
+            .await
+            .expect("stop must not wait for the in-flight call")
+            .unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("stopped call must return promptly")
+            .unwrap()
+            .is_err());
     }
 }

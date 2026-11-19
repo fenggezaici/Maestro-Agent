@@ -82,7 +82,7 @@ export interface WorkspaceStore {
   load: (path?: string, options?: { force?: boolean }) => Promise<void>;
   selectWorkspace: (path: string) => Promise<void>;
   refresh: () => Promise<void>;
-  selectFile: (path: string) => Promise<void>;
+  selectFile: (path: string, fallbackRoot?: string) => Promise<void>;
   disconnect: () => void;
 }
 
@@ -169,8 +169,16 @@ export const useWorkspaceStore = create<WorkspaceStore>()((set, get) => ({
   selectWorkspace: (path) => get().load(path),
   refresh: () => get().load(undefined, { force: true }),
 
-  selectFile: async (path: string) => {
-    const workspace = root;
+  selectFile: async (path: string, fallbackRoot?: string) => {
+    let workspace = root;
+    if (!workspace?.path && fallbackRoot) {
+      // A page reload (vite dev refresh) wipes this module state; the
+      // mount-time selectWorkspace round-trip may not have landed yet when
+      // the user clicks a file. Load the known project root instead of
+      // failing the first click outright.
+      await get().load(fallbackRoot);
+      workspace = root;
+    }
     if (!workspace?.path) {
       // Never leave the pane spinning on a workspace that was never loaded.
       set({ selectedPath: path, file: null, fileLoading: false, fileError: '工作区尚未加载，请先选择项目目录' });

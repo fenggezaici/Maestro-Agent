@@ -65,3 +65,56 @@ describe('subagent tool rows', () => {
     expect(finished.next[1][0].subagentId).toBe('sa-1-1');
   });
 });
+
+describe('pickSummaryRun', () => {
+  const run = (id: number, sessionId: number) => ({ id, sessionId, status: 'completed', output: '', mode: 'code' }) as never;
+
+  it('scopes activeRun/lastRun to the selected session', async () => {
+    const { pickSummaryRun } = await import('./conversation');
+    const foreign = run(7, 1);
+    const mine = run(3, 2);
+    // Another session's lastRun must not leak — fall back to this session's runs.
+    expect(pickSummaryRun({ activeRun: null, lastRun: foreign, runs: [mine], sessionId: 2 })?.id).toBe(3);
+    // Fresh session with no runs → null, no stale card.
+    expect(pickSummaryRun({ activeRun: null, lastRun: foreign, runs: [], sessionId: 2 })).toBeNull();
+    // Own session's activeRun wins.
+    expect(pickSummaryRun({ activeRun: mine, lastRun: foreign, runs: [], sessionId: 2 })?.id).toBe(3);
+  });
+});
+
+describe('reviewFiles write_result counts', () => {
+  const detail = (added: number, removed: number, after = 'x', netAdded?: number, netRemoved?: number, path = 'a.py') =>
+    JSON.stringify({ kind: 'write_result', path, before: '', after, added, removed, net_added: netAdded, net_removed: netRemoved });
+  const call = (runId: number, detailStr: string) => ({
+    runId, tool: 'write_file', detail: detailStr, allowed: true, pending: false, awaitingApproval: false,
+  }) as never;
+
+  it('carries kernel added/removed and swaps in net counts when merging a second write', async () => {
+    const { reviewFiles } = await import('./conversation');
+    const files = reviewFiles({ liveTools: { 1: [call(1, detail(346, 0, 'x', 346, 0))] }, pending: null, plans: [], runId: 1 });
+    expect(files[0].added).toBe(346);
+    expect(files[0].netAdded).toBe(346);
+
+    const merged = reviewFiles({
+      liveTools: { 1: [call(1, detail(346, 0, 'x', 346, 0)), call(1, detail(5, 1, 'y', 340, 6))] },
+      pending: null, plans: [], runId: 1,
+    });
+    expect(merged).toHaveLength(1);
+    expect(merged[0].after).toBe('y');
+    expect(merged[0].added).toBeUndefined();
+    expect(merged[0].netAdded).toBe(340);
+    expect(merged[0].netRemoved).toBe(6);
+  });
+
+  it('scopes applied rows to the summary run so earlier runs never leak', async () => {
+    const { reviewFiles } = await import('./conversation');
+    const liveTools = {
+      1: [call(1, detail(54, 0, 'v1', 54, 0, 'verify.py'))],
+      2: [call(2, detail(14, 4, 'v2', 14, 4, 'rig.py'))],
+    };
+    const files = reviewFiles({ liveTools, pending: null, plans: [], runId: 2 });
+    expect(files.map((file) => file.path)).toEqual(['rig.py']);
+    // No runId → no applied rows at all (pending/proposal still work).
+    expect(reviewFiles({ liveTools, pending: null, plans: [] })).toEqual([]);
+  });
+});

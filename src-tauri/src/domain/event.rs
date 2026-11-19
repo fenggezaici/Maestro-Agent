@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::domain::{
+    architecture::TraceStep,
     metrics::RunMetrics,
     plan::{PlanCard, PlanStep},
     session::{Mode, RunView},
@@ -133,6 +134,20 @@ pub enum EventData {
         #[serde(rename = "requestId")]
         request_id: String,
         questions: Vec<Question>,
+    },
+    /// 架构沙盘求值轨迹：命中 Trigger 的每次工具调用都发出（父 Run 专用），
+    /// 前端按 `steps[].nodeId` 高亮画布节点；被拦截的调用附带 `message`。
+    ArchitectureTrace {
+        #[serde(rename = "runId")]
+        run_id: i64,
+        #[serde(rename = "sessionId")]
+        session_id: i64,
+        tool: String,
+        target: String,
+        blocked: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        steps: Vec<TraceStep>,
     },
     SubagentFinished {
         #[serde(rename = "runId")]

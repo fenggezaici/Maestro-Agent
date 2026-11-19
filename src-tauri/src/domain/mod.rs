@@ -1,4 +1,5 @@
 //! Domain layer: pure data structures and side-effect-free rules.
+pub mod architecture;
 pub mod error;
 pub mod event;
 pub mod extension;
@@ -16,16 +17,28 @@ pub mod session;
 pub mod subagent;
 pub mod user_question;
 
+pub use architecture::{
+    armed_obligations, effective_after_set, evaluate as evaluate_architecture, optional_extensions,
+    parse_graph, path_matches, required_extensions, trigger_ancestors, validate_graph, ActionResult,
+    ArmedObligation, ArchitectureGraph, ExtensionData, ExtensionKind, ExtensionRequirement,
+    ExtensionSnapshot, GateMode, GateTiming, GraphDecision, GraphEdge, GraphNode, GraphNodeData,
+    GraphPosition, HistoryEntry, PendingCall, ResolvedPlugin, SatisfyScope, TraceStatus, TraceStep,
+    TriggerAction, GRAPH_VERSION, RULES_FILE_NAME,
+};
 pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
 pub use extension::{
-    CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, RecommendedItem,
-    SkillImportOutcome, SkillSource, SkillView, WorkspaceTrustStatus,
+    CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, PluginCondition,
+    PluginKind, PluginManifest, PluginView, RecommendedItem, SkillImportOutcome, SkillSource,
+    SkillView, WorkspaceTrustStatus,
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use activity::{ActivityDay, ActivitySnapshot};
 pub use agent::{AgentDefinition, AgentSource};
-pub use change::{RevertIssue, RevertPreview, RevertResult, RunChangeSummary, RunFileChange};
+pub use change::{
+    line_change_counts, merge_file_changes, RevertIssue, RevertPreview, RevertResult,
+    RunChangeSummary, RunFileChange,
+};
 pub use metrics::RunMetrics;
 pub use plan::{
     validate_plan_steps, PlanCard, PlanDecision, PlanDraft, PlanStatus, PlanStep, PlanStepStatus,

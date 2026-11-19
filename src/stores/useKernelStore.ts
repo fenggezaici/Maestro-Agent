@@ -8,7 +8,7 @@ import { kernelApi } from '../api/kernel';
 import { sessionsApi } from '../api/sessions';
 import { subagentsApi } from '../api/subagents';
 import type {
-  KernelEvent, Mode, PlanCard, PlanDecision, PlanStep, ProjectView, RunMetrics,
+  ArchitectureTrace, KernelEvent, Mode, PlanCard, PlanDecision, PlanStep, ProjectView, RunMetrics,
   ApprovalDecision, CommandScope, ContextCompaction, QuestionAnswer, SessionDetail, SessionView, Snapshot, SubagentView, ToolCallView, UserQuestion,
 } from '../api/types';
 import {
@@ -50,6 +50,8 @@ export interface KernelStore {
   currentPlan: PlanStep[];
   /** Latest applied write path, used to follow the live diff. */
   lastChangedPath: string | null;
+  /** 最近一次架构沙盘轨迹：节点状态高亮 + 被拦截时的警告文案。 */
+  architectureTrace: ArchitectureTrace | null;
   /** true while the agent stream connection is mounted. */
   connected: boolean;
 
@@ -214,6 +216,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     taskPlans: {},
     currentPlan: [],
     lastChangedPath: null,
+    architectureTrace: null,
     connected: false,
 
     dispatch: (action) => {
@@ -320,6 +323,19 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         // workspace views rescan with project `.maestro/` assets included.
         set((s) => ({ trustPrompt: null, workspaceTick: s.workspaceTick + 1 }));
       }
+      if (event.type === 'architecture_trace') {
+        set({
+          architectureTrace: {
+            runId: event.runId,
+            sessionId: event.sessionId,
+            tool: event.tool,
+            target: event.target,
+            blocked: event.blocked,
+            message: event.message ?? null,
+            steps: event.steps,
+          },
+        });
+      }
       if (event.type === 'task_plan_updated') {
         set((s) => ({
           taskPlans: { ...s.taskPlans, [event.sessionId]: event.steps },
@@ -338,6 +354,10 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         }
       }
       if (event.type === 'backend_error' || event.type === 'client_error') setError(event.message);
+      if (event.type === 'status' && event.run.status === 'running') {
+        // 新一轮 Run 开始：清理上一轮遗留的架构 Trace，避免陈旧拦截警告。
+        set((s) => s.architectureTrace && s.architectureTrace.runId !== event.run.id ? { architectureTrace: null } : s);
+      }
       if (event.type === 'status' && event.run.status === 'failed') setError(event.run.error ?? '模型请求失败');
       if (event.type === 'status' && event.run.status !== 'running') {
         const flushQueued = get().stoppingRunId === event.run.id;
@@ -431,6 +451,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         taskPlans: {},
         currentPlan: [],
         lastChangedPath: null,
+        architectureTrace: null,
         connected: false,
       });
     },

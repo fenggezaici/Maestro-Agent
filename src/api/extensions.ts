@@ -17,6 +17,13 @@ export interface CommandView {
   path: string;
 }
 
+export interface McpToolView {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  readOnly: boolean;
+}
+
 export interface McpServerView {
   name: string;
   command: string;
@@ -28,6 +35,23 @@ export interface McpServerView {
   trust: boolean;
   running: boolean;
   toolCount: number;
+  /** `tools/list` result for running servers; empty otherwise. */
+  tools: McpToolView[];
+  error: string | null;
+}
+
+/// 声明式插件清单视图（`.maestro/plugins/*.json`，无独立插件运行时）。
+export interface PluginView {
+  name: string;
+  description: string;
+  /** 清单解析失败时为 null，UI 以错误徽标呈现。 */
+  kind: 'skill' | 'mcp' | null;
+  target: string | null;
+  tool: string | null;
+  condition: 'required' | 'optional';
+  params: Record<string, string>;
+  source: SkillSource;
+  path: string;
   error: string | null;
 }
 
@@ -69,4 +93,5 @@ export const extensionsApi = {
   recommendedSkills: () => invoke<RecommendedItem[]>('recommended_skills'),
   recommendedMcps: () => invoke<RecommendedItem[]>('recommended_mcps'),
   readMcpConfig: () => invoke<string>('read_mcp_config'),
+  scanPlugins: () => invoke<PluginView[]>('scan_plugins'),
 };

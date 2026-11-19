@@ -20,7 +20,8 @@ use crate::{
         AppResult, ChatMessage, EventData, KernelEvent, Mode, PlanCard, PlanDecision, PlanDraft,
         ProjectView, RunMetrics, RunStatus, RunView, SessionDetail, SessionView, Snapshot,
         format_answers, parse_questions, validate_answers, ApprovalCandidate, ApprovalDecision, ApprovalRule, ReasoningSegment, RunPart,
-        canonical_json, ContextCompaction, MAX_RULE_PATTERN_CHARS,
+        canonical_json, line_change_counts, merge_file_changes, ArmedObligation, ContextCompaction, GraphDecision, HistoryEntry,
+        MAX_RULE_PATTERN_CHARS, TraceStatus, TraceStep,
         CommandScope, Question, QuestionAnswer, RunMessage, SubagentStatus,
         SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec, WorkspaceTrustStatus,
     },
@@ -155,6 +156,9 @@ pub struct Kernel {
     /// Cancellation channels for running children, so one child can stop alone.
     subagent_cancels: StdMutex<HashMap<String, watch::Sender<bool>>>,
     metrics_acc: StdMutex<HashMap<i64, MetricsAccumulator>>,
+    /// Per-run 按路径累计的 首版 before → 最新 after：write_result 载荷里的
+    /// before/after 有截断上限，面板合并多次写入时无法重算净差，由此下发权威计数。
+    write_net: StdMutex<HashMap<i64, HashMap<String, (String, String)>>>,
     /// Session-scoped "always allow" rules; cleared when the app exits.
     approval_rules: StdMutex<HashMap<i64, Vec<ApprovalRule>>>,
     /// Provider API keys at rest (DPAPI on Windows); the webview never persists them.
@@ -188,9 +192,12 @@ impl Kernel {
             subagents: StdMutex::new(HashMap::new()),
             subagent_cancels: StdMutex::new(HashMap::new()),
             metrics_acc: StdMutex::new(HashMap::new()),
+            write_net: StdMutex::new(HashMap::new()),
             approval_rules: StdMutex::new(HashMap::new()),
             credentials,
         });
+        // 全局架构规则不依赖工作区，启动即装载（项目规则随 set_workspace_root 生效）。
+        kernel.router.reload_architecture().await;
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
         Ok(kernel)
     }
@@ -238,10 +245,9 @@ impl Kernel {
         }
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let trusted = self
-            .database
-            .is_workspace_trusted(canonical.to_string_lossy().to_string())
-            .await
-            .unwrap_or(false);
+            .router
+            .is_trusted_canonical(&canonical.to_string_lossy())
+            .await;
         (!trusted).then(|| WorkspaceTrustStatus {
             path: root.to_string_lossy().to_string(),
             assets: assets.iter().map(|dir| dir.to_string()).collect(),
@@ -256,6 +262,8 @@ impl Kernel {
         self.database
             .trust_workspace(canonical.to_string_lossy().to_string())
             .await?;
+        // 同步内存副本——trusted_project_root 的读路径是零 DB 缓存。
+        self.router.mark_trusted(canonical.to_string_lossy().to_string());
         let mut state = self.state.lock().await;
         self.emit_locked(&mut state, EventData::WorkspaceTrusted { path });
         Ok(())
@@ -265,6 +273,50 @@ impl Kernel {
     /// workspace is untrusted so `.maestro/` content stays inert.
     pub async fn trusted_project_root(&self, root: Option<&std::path::Path>) -> Option<PathBuf> {
         self.router.trusted_project_root(root).await
+    }
+
+    /// 启动预热：载入 trusted_workspaces 内存副本，run 期间读路径零 DB。
+    pub async fn prefetch_workspace_trust(&self) {
+        self.router.prefetch_trusted().await;
+    }
+
+    /// e2e/debug 注入面：在 DB 里建真 session + running run，并经 emit_locked
+    /// 注入 Content 洪水（真实 channel、sequence、合并窗口）——回归
+    /// 「流式期间 invoke/沙盘加载不被 JS 渲染饥饿饿死」。仅 debug 构建存在。
+    #[cfg(debug_assertions)]
+    pub async fn debug_fake_stream(
+        self: &Arc<Self>,
+        session_id: Option<i64>,
+        seconds: u32,
+    ) -> AppResult<(i64, i64)> {
+        let session_id = match session_id {
+            Some(id) => id,
+            None => self.create_session(None).await?.id,
+        };
+        let run_id = self
+            .database
+            .create_run_in_session(session_id, "e2e flood".into(), Mode::Auto)
+            .await?;
+        let kernel = self.clone();
+        tauri::async_runtime::spawn(async move {
+            // ~1KB token 每 25ms：与真实流式同速率注入，未修复的渲染路径
+            // （每事件全量 concat + remark 重解析）会被迅速压满。
+            let chunk = "0123456789abcdef e2e-flood token burst.\n".repeat(24);
+            for _ in 0..seconds.saturating_mul(40) {
+                {
+                    let mut state = kernel.state.lock().await;
+                    kernel.emit_locked(&mut state, EventData::Content {
+                        run_id,
+                        session_id,
+                        token: chunk.clone(),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let mut state = kernel.state.lock().await;
+            kernel.emit_locked(&mut state, EventData::SessionsChanged);
+        });
+        Ok((session_id, run_id))
     }
 
     fn emit_locked(&self, state: &mut RuntimeState, data: EventData) {
@@ -368,6 +420,7 @@ impl Kernel {
             .create_run_in_session(session_id, prompt.clone(), mode)
             .await?;
         self.metrics_acc.lock().unwrap().remove(&id);
+        self.write_net.lock().unwrap().remove(&id);
         // Workspace fallback: sessions live inside projects — use the project's
         // path so read tools work even before the user opens the Explorer.
         {
@@ -418,16 +471,29 @@ impl Kernel {
     }
 
     pub async fn cancel(&self, run_id: i64) -> AppResult<()> {
-        // Cascade first: child subagents must stop even when the parent run is
-        // already gone (otherwise a stopped run leaves orphaned children).
-        let senders: Vec<_> = self.subagent_cancels.lock().unwrap().values().cloned().collect();
-        for sender in senders {
-            let _ = sender.send(true);
-        }
+        // Idempotent best-effort: a stale id (e.g. a retried abort for a run
+        // that already finished) must never cancel a NEW active run or its
+        // children — scope every effect to the run the caller actually saw.
         {
             let mut map = self.subagents.lock().unwrap();
+            let senders: Vec<_> = self
+                .subagent_cancels
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| {
+                    map.get(*id)
+                        .is_none_or(|view| view.run_id == run_id)
+                })
+                .map(|(_, sender)| sender.clone())
+                .collect();
+            for sender in senders {
+                let _ = sender.send(true);
+            }
+            // Cascade: child subagents must stop even when the parent run is
+            // already gone (otherwise a stopped run leaves orphaned children).
             for view in map.values_mut() {
-                if view.status == SubagentStatus::Running {
+                if view.run_id == run_id && view.status == SubagentStatus::Running {
                     view.status = SubagentStatus::Cancelled;
                     view.finished_at = Some(crate::domain::unix_now());
                 }
@@ -437,9 +503,9 @@ impl Kernel {
         // mutating command would otherwise make "stop" feel dead.
         let mut state = self.state.lock().await;
         let active = state.active_run.as_ref().map(|run| run.id);
-        // Idempotent best-effort: the control channel is a singleton for the
-        // single in-flight run, so an id mismatch or an already-finished run
-        // is a harmless no-op — never an error the UI should surface.
+        if active != Some(run_id) {
+            return Ok(());
+        }
         let Some(control) = state.control.as_mut() else { return Ok(()) };
         if control.finishing {
             return Ok(());
@@ -460,7 +526,6 @@ impl Kernel {
         // Flag after the control borrow ends: the loop polls this even if the
         // watch notification is lost.
         state.cancelled_run = active;
-        let _ = run_id;
         Ok(())
     }
 
@@ -915,6 +980,10 @@ impl Kernel {
                 true,
             )
             .await;
+        let _ = self
+            .database
+            .record_tool_history(run_id, "spawn_subagent".into(), description.into())
+            .await;
     }
 
     /// The only registered tool dispatcher. No frontend-selected effect or arbitrary SQL/path.
@@ -953,6 +1022,10 @@ impl Kernel {
         self.database
             .record_tool(run_id, tool.into(), "read-only".into(), true)
             .await?;
+        let _ = self
+            .database
+            .record_tool_history(run_id, tool.into(), ToolRouter::history_target(tool, "{}"))
+            .await;
         serde_json::from_str(&text).or_else(|_| {
             if text.is_empty() {
                 Err("No registered tool executor".into())
@@ -1009,16 +1082,18 @@ impl Kernel {
         feedback: Option<String>,
     ) -> AppResult<()> {
         let _command = self.commands.lock().await;
-        let mut state = self.state.lock().await;
-        Self::active_run_locked(&state, run_id)?;
-        let pending = state
-            .control
-            .as_mut()
-            .and_then(|control| control.pending.take())
-            .ok_or("没有等待批准的工具调用")?;
-        if decision == ApprovalDecision::AllowAlways {
+        // Release the state guard before any DB await: `cancel()` takes the
+        // same lock and must never queue behind the persistence worker.
+        let (pending, new_rules) = {
+            let mut state = self.state.lock().await;
+            Self::active_run_locked(&state, run_id)?;
+            let pending = state
+                .control
+                .as_mut()
+                .and_then(|control| control.pending.take())
+                .ok_or("没有等待批准的工具调用")?;
             let mut new_rules = Vec::new();
-            {
+            if decision == ApprovalDecision::AllowAlways {
                 let mut rules = self.approval_rules.lock().unwrap();
                 let entry = rules.entry(pending.session_id).or_default();
                 for candidate in &pending.candidates {
@@ -1029,14 +1104,15 @@ impl Kernel {
                     }
                 }
             }
-            // Persist before resolving so a crash can never grant without
-            // recording. Rules live per project (not in `.maestro/` on disk) —
-            // a cloned repo must never ship its own pre-approvals.
-            if !new_rules.is_empty() {
-                if let Ok(Some(project_id)) = self.database.project_id_for_session(pending.session_id).await {
-                    for rule in &new_rules {
-                        let _ = self.database.save_approval_rule(project_id, rule).await;
-                    }
+            (pending, new_rules)
+        };
+        // Persist before resolving so a crash can never grant without
+        // recording. Rules live per project (not in `.maestro/` on disk) —
+        // a cloned repo must never ship its own pre-approvals.
+        if !new_rules.is_empty() {
+            if let Ok(Some(project_id)) = self.database.project_id_for_session(pending.session_id).await {
+                for rule in &new_rules {
+                    let _ = self.database.save_approval_rule(project_id, rule).await;
                 }
             }
         }
@@ -1111,6 +1187,14 @@ impl Kernel {
         let _ = self
             .database
             .record_tool(run_id, "ask_user".into(), payload.clone(), true)
+            .await;
+        let _ = self
+            .database
+            .record_tool_history(
+                run_id,
+                "ask_user".into(),
+                ToolRouter::history_target("ask_user", arguments_json),
+            )
             .await;
         self.emit_tool(run_id, "ask_user", ToolPhase::Finished, &payload)
             .await;
@@ -1322,7 +1406,7 @@ impl Kernel {
             Allow(ToolEffect),
             Suspended(ToolEffect, ApprovalCandidate),
         }
-        let (run, run_root) = {
+        let (run, run_root, run_cancel) = {
             let _command = self.commands.lock().await;
             let state = self.state.lock().await;
             match Self::active_run_locked(&state, run_id) {
@@ -1332,6 +1416,7 @@ impl Kernel {
                         .control
                         .as_ref()
                         .and_then(|control| control.workspace_root.clone()),
+                    state.control.as_ref().map(|control| control.cancel.clone()),
                 ),
                 Err(reason) => return calls.iter().map(|_| Err(reason.clone())).collect(),
             }
@@ -1345,6 +1430,17 @@ impl Kernel {
         let mut read_only_allowlisted = Vec::with_capacity(calls.len());
         let mut any_suspended = false;
         self.ensure_rules_loaded(run.session_id).await;
+        // 架构沙盘：存在生效规则（或规则文件损坏）时载入本会话工具历史；
+        // Requirement/Extension 满足度据此判定，跨 Run 持久化于 audit 表。
+        let has_rules = self.router.has_architecture_rules().await;
+        let mut history: Vec<HistoryEntry> = if has_rules {
+            self.database
+                .session_tool_history(run.session_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for (index, (tool, arguments_json)) in calls.iter().enumerate() {
             let target = ToolRouter::call_target(tool, arguments_json);
             self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
@@ -1358,7 +1454,7 @@ impl Kernel {
             // current mode would otherwise demand. It can never lift a mode's
             // absolute denial (Plan), so the gate is resolved first.
             let auto = self.is_auto_approved(run.session_id, &candidate);
-            let gate = match self.router.classify(tool).await {
+            let mut gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
                 Ok(effect) => match policy::gate_call(mode, effect, command.as_deref()) {
                     ToolGate::Deny => Gate::Denied(
@@ -1381,23 +1477,68 @@ impl Kernel {
                     ToolGate::Allow => Gate::Allow(effect),
                 },
             };
+            // 架构预检（审批前）：本会话历史 + 本批次此前调用的乐观快照。
+            // 命中阻断即在进入审批前拦下；是否可放行仍以 Phase 3 真实历史为准。
+            if has_rules {
+                let effect = match &gate {
+                    Gate::Allow(effect) | Gate::Suspended(effect, _) => Some(*effect),
+                    Gate::Denied(_) => None,
+                };
+                if let Some(effect) = effect {
+                    let mut optimistic = history.clone();
+                    for (prior_tool, prior_args) in calls.iter().take(index) {
+                        optimistic.push(HistoryEntry {
+                            tool: prior_tool.clone(),
+                            target: ToolRouter::history_target(prior_tool, prior_args),
+                            run_id,
+                        });
+                    }
+                    let decision = self
+                        .router
+                        .architecture_decision(
+                            tool,
+                            arguments_json,
+                            effect,
+                            &optimistic,
+                            run_id,
+                            run_root.as_deref(),
+                            run.prompt.as_str(),
+                        )
+                        .await;
+                    self.emit_architecture_trace(run_id, run.session_id, subagent_id, tool, &target, &decision)
+                        .await;
+                    if decision.blocked {
+                        gate = Gate::Denied(
+                            self.block_tool_scoped(run_id, subagent_id, tool, Self::architecture_reason(&decision))
+                                .await,
+                        );
+                    }
+                }
+            }
             gates.push(gate);
         }
-        // Pure read-only batches run concurrently. Started events were already
-        // emitted in call order; Finished events are emitted in the same order,
-        // so the UI can match pending rows without extra call ids.
-        if !any_suspended && !calls.is_empty()
+        // Pure read-only batches run concurrently — 仅当没有架构规则时：
+        // 读工具同样可能被 Trigger(read) 命中，且历史顺序必须串行记录。
+        if !any_suspended && !has_rules && !calls.is_empty()
             && gates.iter().all(|gate| matches!(gate, Gate::Allow(ToolEffect::ReadOnly)))
         {
             let outcomes = futures_util::future::join_all(
-                calls.iter().map(|(tool, arguments_json)| self.router.execute(run.session_id, tool, arguments_json, run_root.as_deref(), None)),
+                calls.iter().map(|(tool, arguments_json)| {
+                    self.router.execute(
+                        run.session_id,
+                        tool,
+                        arguments_json,
+                        run_root.as_deref(),
+                        run_cancel.as_ref().map(|cancel| cancel.subscribe()),
+                    )
+                }),
             )
             .await;
             let mut results = Vec::with_capacity(calls.len());
             for ((tool, arguments_json), outcome) in calls.iter().zip(outcomes) {
                 let target = ToolRouter::call_target(tool, arguments_json);
                 results.push(
-                    self.finish_tool_outcome(run_id, run.session_id, subagent_id, tool, &target, "extension", ToolEffect::ReadOnly, outcome)
+                    self.finish_tool_outcome(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "extension", ToolEffect::ReadOnly, outcome)
                         .await,
                 );
             }
@@ -1462,10 +1603,29 @@ impl Kernel {
                         continue;
                     }
                     let target = ToolRouter::call_target(tool, arguments_json);
-                    results.push(
-                        self.finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "user approved", *effect)
-                            .await,
-                    );
+                    let (blocked, reminder) = self
+                        .architecture_gate(run_id, run.session_id, subagent_id, tool, arguments_json, &target, *effect, &history, has_rules, run_root.as_deref(), run.prompt.as_str())
+                        .await;
+                    if let Some(blocked) = blocked {
+                        results.push(blocked);
+                        continue;
+                    }
+                    let mut result = self
+                        .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "user approved", *effect)
+                        .await;
+                    if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                        // 放行+附言：提醒跟工具结果一起回到模型上下文。
+                        text.push_str("\n\n");
+                        text.push_str(reminder);
+                    }
+                    if result.is_ok() {
+                        history.push(HistoryEntry {
+                            tool: tool.clone(),
+                            target: ToolRouter::history_target(tool, arguments_json),
+                            run_id,
+                        });
+                    }
+                    results.push(result);
                 }
                 Gate::Allow(effect) => {
                     let audit = Self::audit_label(
@@ -1473,14 +1633,162 @@ impl Kernel {
                         read_only_allowlisted.get(index).copied().unwrap_or(false),
                     );
                     let target = ToolRouter::call_target(tool, arguments_json);
-                    results.push(
-                        self.finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, audit, *effect)
-                            .await,
-                    );
+                    let (blocked, reminder) = self
+                        .architecture_gate(run_id, run.session_id, subagent_id, tool, arguments_json, &target, *effect, &history, has_rules, run_root.as_deref(), run.prompt.as_str())
+                        .await;
+                    if let Some(blocked) = blocked {
+                        results.push(blocked);
+                        continue;
+                    }
+                    let mut result = self
+                        .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, audit, *effect)
+                        .await;
+                    if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                        text.push_str("\n\n");
+                        text.push_str(reminder);
+                    }
+                    if result.is_ok() {
+                        history.push(HistoryEntry {
+                            tool: tool.clone(),
+                            target: ToolRouter::history_target(tool, arguments_json),
+                            run_id,
+                        });
+                    }
+                    results.push(result);
                 }
             }
         }
         results
+    }
+
+    /// Phase 3 架构权威检查（执行前最后一次）：真实历史上的完整求值，
+    /// 命中时发出 trace 事件；返回 (Some(Err), _) 表示拦截结果，
+    /// 放行时可能带回 reminder（Remind 动作 / 欠账自动提醒），由调用点
+    /// 拼进工具结果随结果回到模型上下文。
+    #[allow(clippy::too_many_arguments)]
+    async fn architecture_gate(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        subagent_id: Option<&str>,
+        tool: &str,
+        arguments_json: &str,
+        target: &str,
+        effect: ToolEffect,
+        history: &[HistoryEntry],
+        has_rules: bool,
+        run_root: Option<&std::path::Path>,
+        user_message: &str,
+    ) -> (Option<AppResult<String>>, Option<String>) {
+        if !has_rules {
+            return (None, None);
+        }
+        let decision = self
+            .router
+            .architecture_decision(tool, arguments_json, effect, history, run_id, run_root, user_message)
+            .await;
+        self.emit_architecture_trace(run_id, session_id, subagent_id, tool, target, &decision)
+            .await;
+        if decision.blocked {
+            return (
+                Some(
+                    self.block_tool_scoped(run_id, subagent_id, tool, Self::architecture_reason(&decision))
+                        .await,
+                ),
+                None,
+            );
+        }
+        (None, decision.reminder)
+    }
+
+    /// 命中 Trigger 时向前端发出节点级执行轨迹（仅父 Run；子智能体评估
+    /// 照常，但不发事件以免污染父画布）。
+    async fn emit_architecture_trace(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        subagent_id: Option<&str>,
+        tool: &str,
+        target: &str,
+        decision: &GraphDecision,
+    ) {
+        if subagent_id.is_some() || !decision.matched {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if Self::active_run_locked(&state, run_id).is_ok() {
+            self.emit_locked(
+                &mut state,
+                EventData::ArchitectureTrace {
+                    run_id,
+                    session_id,
+                    tool: tool.into(),
+                    target: target.into(),
+                    blocked: decision.blocked,
+                    message: decision.message.clone(),
+                    steps: decision.trace.clone(),
+                },
+            );
+        }
+    }
+
+    /// 注入 agent_loop 请求的架构契约文本；无规则时为空串。
+    pub async fn architecture_brief(&self, run_root: Option<&std::path::Path>) -> String {
+        self.router.architecture_brief(run_root).await
+    }
+
+    /// Run 末欠账查询：会话历史中仍挂着未验收的事后义务（optional 义务也计入——
+    /// 它不拦调用但会追问）。非空时向画布发 pending trace 让节点亮琥珀色。
+    pub async fn architecture_outstanding(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        run_root: Option<&std::path::Path>,
+        user_message: &str,
+    ) -> Vec<ArmedObligation> {
+        self.ensure_rules_loaded(session_id).await;
+        if !self.router.has_architecture_rules().await {
+            return Vec::new();
+        }
+        let history = self
+            .database
+            .session_tool_history(session_id)
+            .await
+            .unwrap_or_default();
+        let outstanding = self
+            .router
+            .architecture_outstanding(&history, run_id, run_root, user_message)
+            .await;
+        if !outstanding.is_empty() {
+            let decision = GraphDecision {
+                matched: true,
+                blocked: false,
+                warn: false,
+                message: Some(
+                    outstanding
+                        .iter()
+                        .map(|item| item.message.clone())
+                        .collect::<Vec<_>>()
+                        .join("；"),
+                ),
+                reminder: None,
+                trace: outstanding
+                    .iter()
+                    .map(|item| TraceStep {
+                        node_id: item.node_id.clone(),
+                        status: TraceStatus::Pending,
+                    })
+                    .collect(),
+            };
+            self.emit_architecture_trace(run_id, session_id, None, "__run_end__", "", &decision)
+                .await;
+        }
+        outstanding
+    }
+
+    /// 保存规则后刷新运行时缓存（架构沙盘 IPC 调用）。
+    pub async fn reload_architecture(&self) {
+        self.router.reload_architecture().await;
     }
 
     /// One call's approval wait: installs the responder on the run's control
@@ -1521,6 +1829,19 @@ impl Kernel {
             Err(_) => (false, None),
         }
     }
+
+/// 架构拦截的模型可读理由：Warn 动作用警告前缀，仍属拦截。
+fn architecture_reason(decision: &GraphDecision) -> String {
+    let message = decision
+        .message
+        .clone()
+        .unwrap_or_else(|| "架构规则拦截".into());
+    if decision.warn {
+        format!("【架构警告】{message}")
+    } else {
+        message
+    }
+}
 
 /// Why a call ran without a prompt. A historical rule and an explicit user
 /// decision are stronger evidence than the read-only allowlist.
@@ -1589,26 +1910,6 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
     }
 }
 
-fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&str> = before.split('\n').collect();
-    let b: Vec<&str> = after.split('\n').collect();
-    if a.len() * b.len() > 4_000_000 {
-        return (b.len() as i64, a.len() as i64);
-    }
-    let mut dp = vec![vec![0u16; b.len() + 1]; a.len() + 1];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
-        }
-    }
-    let (mut i, mut j, mut added, mut removed) = (0, 0, 0i64, 0i64);
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] { i += 1; j += 1; }
-        else if dp[i + 1][j] >= dp[i][j + 1] { removed += 1; i += 1; }
-        else { added += 1; j += 1; }
-    }
-    (added + (b.len() - j) as i64, removed + (a.len() - i) as i64)
-}
-
     /// Execute the routed call, audit the terminal result, emit
     /// Finished/Failed and refresh the workspace on any side effect.
     #[allow(clippy::too_many_arguments)]
@@ -1638,7 +1939,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
             )
         };
         let outcome = self.router.execute(session_id, tool, arguments_json, run_root.as_deref(), cancel).await;
-        self.finish_tool_outcome(run_id, session_id, subagent_id, tool, target, audit, effect, outcome)
+        self.finish_tool_outcome(run_id, session_id, subagent_id, tool, arguments_json, target, audit, effect, outcome)
             .await
     }
 
@@ -1649,6 +1950,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         session_id: i64,
         subagent_id: Option<&str>,
         tool: &str,
+        arguments_json: &str,
         target: &str,
         audit: &str,
         effect: ToolEffect,
@@ -1656,10 +1958,25 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
     ) -> AppResult<String> {
         match outcome {
             Ok(outcome) => {
-                if let Some(report) = &outcome.write {
-                    let (added, removed) = Self::line_change_counts(&report.before, &report.after);
+                let write_counts = if let Some(report) = &outcome.write {
+                    let (added, removed) = line_change_counts(&report.before, &report.after);
                     let _ = self.database.record_file_change(run_id, session_id, report.path.clone(), added, removed, report.before.clone(), report.after.clone()).await;
-                }
+                    // 累计净差：与 DB merge_file_changes 同口径（首 before → 末 after），
+                    // 含子代理写入（同一 run_id）；before/after 截断后这是唯一权威计数。
+                    let net = {
+                        let mut map = self.write_net.lock().unwrap();
+                        let entry = map
+                            .entry(run_id)
+                            .or_default()
+                            .entry(report.path.clone())
+                            .or_insert_with(|| (report.before.clone(), report.after.clone()));
+                        entry.1 = report.after.clone();
+                        line_change_counts(&entry.0, &entry.1)
+                    };
+                    Some((added, removed, net.0, net.1))
+                } else {
+                    None
+                };
                 let detail = if target.is_empty() {
                     audit.to_string()
                 } else {
@@ -1669,6 +1986,15 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
                     self.database
                         .record_tool(run_id, tool.into(), detail, true)
                         .await?;
+                    // 架构沙盘 Session 历史：跨 Run 判定 Requirement/扩展满足度。
+                    let _ = self
+                        .database
+                        .record_tool_history(
+                            run_id,
+                            tool.into(),
+                            ToolRouter::history_target(tool, arguments_json),
+                        )
+                        .await;
                 }
                 if let Some(steps) = &outcome.plan {
                     let mut state = self.state.lock().await;
@@ -1689,6 +2015,13 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
                         "path": report.path,
                         "before": report.before.chars().take(8192).collect::<String>(),
                         "after": report.after.chars().take(8192).collect::<String>(),
+                        // before/after are display-bounded — ship the full-content
+                        // counts so panels never recompute on truncated text.
+                        "added": write_counts.map(|counts| counts.0).unwrap_or_default(),
+                        "removed": write_counts.map(|counts| counts.1).unwrap_or_default(),
+                        // 同文件多次写入的累计净差（首 before → 末 after），与变更卡口径一致。
+                        "net_added": write_counts.map(|counts| counts.2).unwrap_or_default(),
+                        "net_removed": write_counts.map(|counts| counts.3).unwrap_or_default(),
                     })
                     .to_string(),
                     None => outcome.text.chars().take(2048).collect::<String>(),
@@ -1739,11 +2072,19 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
     }
 
     pub async fn run_change_summary(&self, run_id: i64) -> AppResult<crate::domain::RunChangeSummary> {
-        self.database.run_change_summary(run_id).await
+        // Keep DB-side files/state, but report net additions/deletions over the
+        // merged per-path diff (first before → last after) so the summary card
+        // matches the diff the review panel actually renders.
+        let mut summary = self.database.run_change_summary(run_id).await?;
+        let merged = merge_file_changes(self.database.run_changes(run_id).await?);
+        summary.additions = merged.iter().map(|change| change.added).sum();
+        summary.deletions = merged.iter().map(|change| change.removed).sum();
+        summary.files = merged.len() as i64;
+        Ok(summary)
     }
 
     pub async fn run_changes(&self, run_id: i64) -> AppResult<Vec<crate::domain::RunFileChange>> {
-        self.database.run_changes(run_id).await
+        Ok(merge_file_changes(self.database.run_changes(run_id).await?))
     }
 
     /// Revert writes must target the directory the run actually used — resolve
@@ -2332,6 +2673,7 @@ fn line_change_counts(before: &str, after: &str) -> (i64, i64) {    let a: Vec<&
         if let Some(metrics) = dirty_metrics {
             let _ = self.database.save_metrics(metrics).await;
         }
+        self.write_net.lock().unwrap().remove(&run_id);
         self.emit_locked(&mut state, EventData::Status { run });
         self.emit_locked(&mut state, EventData::SessionsChanged);
     }
@@ -2925,6 +3267,40 @@ mod tests {
         kernel.cancel(1).await.unwrap();
         assert!(*rx1.borrow_and_update(), "sa-1 must be cancelled with the parent");
         assert!(*rx2.borrow_and_update(), "sa-2 must be cancelled with the parent");
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_with_a_stale_run_id_is_a_noop() {
+        let (kernel, _) = test_kernel().await;
+        let (id, mut receiver) = seed_run(&kernel).await;
+        // A retried abort for an already-finished run must not touch the
+        // currently active one (the documented idempotent contract).
+        kernel.cancel(id + 10_000).await.unwrap();
+        assert!(!kernel.is_cancelled(id).await);
+        assert!(!*receiver.borrow_and_update(), "stale id must not fire the active control channel");
+        kernel.cancel(id).await.unwrap();
+        assert!(kernel.is_cancelled(id).await);
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_leaves_other_runs_children_alone() {
+        let (kernel, _) = test_kernel().await;
+        let (id, _rx) = seed_run(&kernel).await;
+        // A child that belongs to a different run id must not be hit by this
+        // run's stop — the cascade is scoped, not global.
+        let mut foreign = subagent_fixture("sa-other", SubagentStatus::Running);
+        foreign.run_id = id + 10_000;
+        kernel.subagents.lock().unwrap().insert(foreign.id.clone(), foreign);
+        let (foreign_tx, mut foreign_rx) = tokio::sync::watch::channel(false);
+        kernel.register_subagent_cancel("sa-other".into(), foreign_tx);
+        kernel.cancel(id).await.unwrap();
+        assert!(!*foreign_rx.borrow_and_update(), "foreign-run child must not be cancelled");
+        assert_eq!(
+            kernel.subagents.lock().unwrap()["sa-other"].status,
+            SubagentStatus::Running
+        );
         kernel.shutdown().await.unwrap();
     }
 
@@ -3617,6 +3993,50 @@ mod tests {
         kernel.cancel(id).await.unwrap();
         assert!(call.await.unwrap().is_err());
         assert!(!workspace.path().join("c.txt").exists());
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_result_carries_cumulative_net_counts_across_writes() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        kernel
+            .execute_model_tool(id, "write_file", r#"{"path":"n.txt","content":"a\nb\nc\n"}"#)
+            .await
+            .unwrap();
+        kernel
+            .execute_model_tool(id, "write_file", r#"{"path":"n.txt","content":"a\nx\n"}"#)
+            .await
+            .unwrap();
+        let details: Vec<serde_json::Value> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.data {
+                EventData::ToolCall { phase: ToolPhase::Finished, detail, .. }
+                    if detail.contains("write_result") =>
+                {
+                    Some(serde_json::from_str(detail).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(details.len(), 2);
+        // 首次写入：净差与逐次计数一致（新文件 3 行）。
+        assert_eq!(details[0]["added"], 3);
+        assert_eq!(details[0]["net_added"], 3);
+        assert_eq!(details[0]["net_removed"], 0);
+        // 第二次写入逐次 diff：a\nb\nc\n → a\nx\n = +1 −2；
+        // 净差按 首版 before("")→ 最新 after 计 = +2 −0，与 DB 合并口径一致。
+        assert_eq!(details[1]["added"], 1);
+        assert_eq!(details[1]["removed"], 2);
+        assert_eq!(details[1]["net_added"], 2);
+        assert_eq!(details[1]["net_removed"], 0);
+        kernel.finish(id, RunStatus::Completed, None).await;
         kernel.shutdown().await.unwrap();
     }
 

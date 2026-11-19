@@ -196,6 +196,81 @@ try {
     `);
     if (!Number.isFinite(value) || value <= 0) throw new Error(`aria-valuenow=${value}`);
   });
+
+  // Regression for "运行中沙盘卡死/一片空白": inject a real streaming flood
+  // through the kernel channel (debug-only command) and assert IPC + the
+  // lazy-loaded sandbox stay responsive instead of starving behind
+  // per-token concat + remark re-parses.
+  await check('streaming flood keeps IPC responsive', async () => {
+    const fake = await execute(`
+      return (async () => await window.__TAURI_INTERNALS__.invoke('debug_start_fake_stream', { seconds: 8 }))()
+    `);
+    if (!fake?.sessionId) throw new Error(`fake stream failed: ${JSON.stringify(fake)}`);
+
+    // Pull the fake run into view through the same store instance the app
+    // uses (vite dev serves the actual module graph).
+    await execute(`
+      return (async () => {
+        const mod = await import('/src/stores/useKernelStore.ts');
+        mod.useKernelStore.getState().selectSession(${fake.sessionId});
+        return true;
+      })()
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+
+    const latency = await execute(`
+      return (async () => {
+        const started = performance.now();
+        await window.__TAURI_INTERNALS__.invoke('get_snapshot');
+        return performance.now() - started;
+      })()
+    `);
+    if (!(Number.isFinite(latency) && latency < 2000)) {
+      throw new Error(`invoke latency during flood = ${Math.round(latency ?? -1)}ms`);
+    }
+  });
+
+  await check('sandbox opens during stream flood', async () => {
+    const nav = async () => execute(`
+      const button = [...document.querySelectorAll('.navigation-item')]
+        .find((item) => /sandbox|沙盘|架构/i.test(item.textContent ?? ''));
+      button?.click();
+      return Boolean(button);
+    `);
+    const waitLoaded = async (timeout, label) => {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        const state = await execute(`
+          return {
+            fallback: Boolean(document.querySelector('.dashboard-loading')),
+            root: Boolean(document.querySelector('.sandbox-root')),
+          };
+        `);
+        if (state?.root && !state?.fallback) return;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw new Error(label);
+    };
+    // Pre-warm the lazy chunk: a cold vite transform of the sandbox module
+    // graph can take seconds and would swamp the regression signal.
+    if (!(await nav())) throw new Error('sandbox nav button not found');
+    await waitLoaded(15_000, 'sandbox did not load even without flood');
+    await execute(`document.querySelector('.back-to-chat')?.click(); return true;`);
+    // Flood again — and select the new session so its streaming markdown is
+    // actually mounted (the pre-fix starvation amplifier). Then navigate.
+    const fake = await execute(`return (async () => await window.__TAURI_INTERNALS__.invoke('debug_start_fake_stream', { seconds: 6 }))()`);
+    if (!fake?.sessionId) throw new Error('second fake stream failed');
+    await execute(`
+      return (async () => {
+        const mod = await import('/src/stores/useKernelStore.ts');
+        mod.useKernelStore.getState().selectSession(${fake.sessionId});
+        return true;
+      })()
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (!(await nav())) throw new Error('sandbox nav button not found on re-entry');
+    await waitLoaded(6_000, 'sandbox still stuck on "Loading sandbox…" under flood');
+  });
 } catch (error) {
   failures.push(`session: ${error.message}`);
   console.error(`  FAIL session: ${error.message}\n${driverLogs}`);

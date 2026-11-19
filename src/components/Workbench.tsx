@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as Popover from '@radix-ui/react-popover';
 import * as Tooltip from '@radix-ui/react-tooltip';
-import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Copy, FolderGit2, GitBranch, HelpCircle, ListChecks, ListTodo, Monitor, Moon, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldAlert, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowDown, ArrowUp, ArrowUpRight, Bot, BrainCircuit, ChartNoAxesColumnIncreasing, Check, ChevronDown, Clock3, Code2, Copy, FolderGit2, GitBranch, GitBranchPlus, HelpCircle, ListChecks, ListTodo, Monitor, Moon, PanelRightClose, PanelRightOpen, Paperclip, Plus, Puzzle, Settings2, ShieldAlert, ShieldCheck, Sparkles, Square, Sun, WandSparkles, Zap } from 'lucide-react';
 import type { Mode, PlanCard as Plan, PlanDecision, PlanStep, ProjectView, RunView, SessionDetail, SessionView, Snapshot, RunMetrics } from '../api/types';
 import CollapsibleBlock from './CollapsibleBlock';
 import MaestroLogo from './MaestroLogo';
@@ -43,7 +43,7 @@ import { flattenFileTree } from '../commandCenter';
 import { readPinnedSessions, savePinnedSessions } from '../sessionGroups';
 import { mockExplorerFiles } from './workbenchMock';
 import { pickDirectory } from '../api/dialog';
-import { agentStatus, pendingApproval, reviewFiles, type TimelineItem } from '../lib/conversation';
+import { agentStatus, pendingApproval, pickSummaryRun, reviewFiles, type TimelineItem } from '../lib/conversation';
 import { useAppearance } from '../useAppearance';
 import LocalAttachments, { type LocalAttachment } from './LocalAttachments';
 import SessionStats from './SessionStats';
@@ -53,7 +53,17 @@ import { resolveCapability } from '../modelCatalog';
 import type { ProviderId } from '../modelCapabilities';
 
 const ActivityDashboard = lazy(() => import('./ActivityDashboard'));
+const ArchitectureSandbox = lazy(() => import('./ArchitectureSandbox'));
 const EMPTY_PLAN: PlanStep[] = [];
+
+/// sessionStorage 中的面板恢复快照：vite dev reload 后右栏保持原状。
+type RestoredPanel = { reviewOpen?: boolean; listTab?: ListTab; activeFile?: ActiveFile | null };
+function readRestoredPanel(key: string): RestoredPanel | null {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(key) ?? 'null');
+    return value && typeof value === 'object' ? value as RestoredPanel : null;
+  } catch { return null; }
+}
 const MODE_LABEL: Record<Mode, string> = { plan: 'Plan 模式', code: 'Code 模式', confirm: 'Confirm 模式', auto: 'Auto 模式' };
 
 export interface WorkbenchController {
@@ -93,6 +103,8 @@ export interface WorkbenchController {
   resolveApproval?: (runId: number, decision: import('../api/types').ApprovalDecision, commandScope?: import('../api/types').CommandScope, feedback?: string) => unknown;
   setMode: (mode: Mode) => unknown;
   decidePlan: (plan: Plan, decision: PlanDecision) => unknown;
+  /** 架构沙盘：最近一次工具调用的规则求值 Trace。 */
+  architectureTrace?: import('../api/types').ArchitectureTrace | null;
   /** Untrusted `.maestro/` assets awaiting a trust decision. */
   trustPrompt?: import('../api/types').WorkspaceTrustStatus | null;
   trustWorkspace?: (path: string) => Promise<void>;
@@ -100,13 +112,17 @@ export interface WorkbenchController {
   dismissTrustPrompt?: () => void;
 }
 
-function fallbackChanges(files: { path: string; before: string; after: string }[]): RunFileChange[] {
+function fallbackChanges(files: { path: string; before: string; after: string; added?: number; removed?: number; netAdded?: number; netRemoved?: number }[]): RunFileChange[] {
   return files.map((file) => {
-    const lines = lineDiff(file.before, file.after);
+    // 多次写入的合并行只有净差可信；单次写入净差与逐次计数一致，统一优先净差。
+    const counts = file.netAdded != null && file.netRemoved != null
+      ? { added: file.netAdded, removed: file.netRemoved }
+      : (file.added != null && file.removed != null ? { added: file.added, removed: file.removed } : null);
+    const lines = counts == null ? lineDiff(file.before, file.after) : null;
     return {
       path: file.path,
-      added: lines.filter((line) => line.kind === 'added').length,
-      removed: lines.filter((line) => line.kind === 'removed').length,
+      added: counts?.added ?? lines!.filter((line) => line.kind === 'added').length,
+      removed: counts?.removed ?? lines!.filter((line) => line.kind === 'removed').length,
       before: file.before,
       after: file.after,
       createdAt: 0,
@@ -120,9 +136,12 @@ function mergeRunChanges(changes: RunFileChange[]): RunFileChange[] {
   for (const change of changes) {
     const existing = merged.get(change.path);
     if (existing) {
-      existing.added += change.added;
-      existing.removed += change.removed;
       existing.after = change.after;
+      existing.createdAt = Math.max(existing.createdAt, change.createdAt);
+      // Same net-diff semantics as the backend merge — never sum per-write churn.
+      const lines = lineDiff(existing.before, existing.after);
+      existing.added = lines.filter((line) => line.kind === 'added').length;
+      existing.removed = lines.filter((line) => line.kind === 'removed').length;
     } else {
       order.push(change.path);
       merged.set(change.path, { ...change });
@@ -168,26 +187,42 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => () => { for (const url of attachmentUrls.current) URL.revokeObjectURL(url); attachmentUrls.current.clear(); }, []);
   const composerRef = useRef<ComposerHandle>(null);
-  const [navigation, setNavigation] = useState<UiView>(() => preferences.startupView);
+  // 视图状态按会话存活（sessionStorage）：dev 下 agent 写 src/ 会触发 vite
+  // 整页 reload，持久化让 Workbench remount 后回到点击前视图，而不是落回
+  // startupView（曾表现为「点文件后主面板跳到活动页」）。冷启动仍读 startupView。
+  const navStorageKey = `maestro.ui.nav.${source}`;
+  const [navigation, setNavigation] = useState<UiView>(() => {
+    try {
+      const saved = sessionStorage.getItem(navStorageKey);
+      if (saved && (['agents', 'activity', 'automations', 'extensions', 'sandbox'] as UiView[]).includes(saved as UiView)) {
+        return saved as UiView;
+      }
+    } catch { /* Storage unavailable. */ }
+    return preferences.startupView;
+  });
+  const panelStorageKey = `maestro.ui.panel.${source}`;
+  const restoredPanel = useMemo(() => readRestoredPanel(panelStorageKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- read once on mount
+    []);
   const [selectedPlanId, setSelectedPlanId] = useState<number | null>(null);
-  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(() => restoredPanel?.reviewOpen === true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
-  const [listTab, setListTab] = useState<ListTab>('changes');
+  const [listTab, setListTab] = useState<ListTab>(() => restoredPanel?.listTab && ['explorer', 'changes', 'tasks', 'subagents'].includes(restoredPanel.listTab) ? restoredPanel.listTab : 'changes');
   const [openTabs, setOpenTabs] = useState<ListTab[]>(['explorer', 'changes']);
   const tasksDismissed = useRef(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<number[]>(() => readPinnedSessions(source));
   const workspace = useWorkspace(!preview && ((reviewOpen && listTab === 'explorer' && openTabs.includes('explorer')) || paletteOpen));
   const [explorerView, setExplorerView] = useState<ExplorerViewState>({ selected: null, closedFolders: [] });
-  const liveExtensions = useExtensions(!preview && navigation === 'extensions');
+  const liveExtensions = useExtensions(!preview && (navigation === 'extensions' || navigation === 'sandbox'));
   const extensions = suppliedExtensions ?? liveExtensions;
   const [toastError, setToastError] = useState<string | null>(null);
   const dismissToast = useCallback(() => setToastError(null), []);
-  const [activeFile, setActiveFile] = useState<ActiveFile | null>(null);
+  const [activeFile, setActiveFile] = useState<ActiveFile | null>(() => restoredPanel?.activeFile ?? null);
   const [runSummary, setRunSummary] = useState<RunChangeSummary | null>(null);
   const [runChanges, setRunChanges] = useState<RunFileChange[]>([]);
   const [runChangesLoaded, setRunChangesLoaded] = useState(false);
@@ -224,10 +259,35 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const stoppingActiveRun = c.stoppingRunId != null;
   const planRunning = !stoppingActiveRun && (c.planRunning ?? (c.state.activeRun?.status === 'running' && c.state.activeRun.sessionId === c.selectedSessionId));
   const approval = useMemo(() => pendingApproval(c.liveTools), [c.liveTools]);
-  const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans }), [c.liveTools, approval, plans]);
+  // 与变更卡同一把尺子：applied 行只取 summaryRun 这一轮的事件，
+  // 否则 liveTools 里上一轮 run 的写入会一直残留在面板上。
+  const summaryRun = pickSummaryRun({ activeRun: c.state.activeRun, lastRun: c.state.lastRun, runs: c.runs, sessionId: c.selectedSessionId });
+  const summaryRunId = summaryRun?.id ?? null;
+  const reviewFileList = useMemo(() => reviewFiles({ liveTools: c.liveTools, pending: approval, plans, runId: summaryRunId }), [c.liveTools, approval, plans, summaryRunId]);
 
-  const panelReviewFiles = useMemo(() => reviewFileList.length ? reviewFileList : runChanges.map((change) => ({ path: change.path, before: change.before, after: change.after, status: 'applied' as const, tool: 'write_file' })), [reviewFileList, runChanges]);
+  // applied 行以 DB 合并记录为准（完整 before/after + 净差），liveTools 只补
+  // pending/proposal 与 DB 未覆盖行；subagent 写入不走 liveTools，由 DB 兜底。
+  const panelReviewFiles = useMemo(() => {
+    const byPath = new Map(runChanges.map((row) => [row.path, row]));
+    const files = reviewFileList.map((file) => {
+      const row = file.status === 'applied' ? byPath.get(file.path) : undefined;
+      return row ? { ...file, before: row.before, after: row.after, added: row.added, removed: row.removed, netAdded: row.added, netRemoved: row.removed } : file;
+    });
+    const livePaths = new Set(reviewFileList.map((file) => file.path));
+    for (const row of runChanges) {
+      if (!livePaths.has(row.path)) files.push({ path: row.path, before: row.before, after: row.after, status: 'applied' as const, tool: 'write_file', added: row.added, removed: row.removed });
+    }
+    return files;
+  }, [reviewFileList, runChanges]);
   const status = agentStatus({ running: !stoppingActiveRun && (c.state.activeRun?.status === 'running' || (c.runs ?? []).some((run) => run.status === 'running')), liveCalls: c.selectedSessionId != null ? c.liveTools?.[c.selectedSessionId] : undefined, reasoning: Object.values(c.liveTimeline ?? {}).some((items) => items.some((item) => item.kind === 'reasoning' && item.segment.endedAt === undefined)) ? 'x' : '', hasApproval: Boolean(approval) });
+  // 架构规则红色拦截反馈：仅展示与当前会话当前运行相关的最近一次 Trace。
+  const architectureWarning = useMemo(() => {
+    const trace = c.architectureTrace;
+    if (!trace?.blocked || trace.sessionId !== c.selectedSessionId) return null;
+    const runId = c.state.activeRun?.id ?? c.state.lastRun?.id ?? null;
+    if (runId !== null && trace.runId !== runId) return null;
+    return trace.message ?? '工具调用被架构规则拦截。';
+  }, [c.architectureTrace, c.selectedSessionId, c.state.activeRun?.id, c.state.lastRun?.id]);
   // Surface suspended tool calls in the Review pane the moment they appear —
   // the diff/command preview is what the user actually approves.
   useEffect(() => {
@@ -265,8 +325,6 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       .catch((reason) => { if (!cancelled) setActivityError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { cancelled = true; };
   }, [preview, navigation, currentProject.id]);
-  const summaryRun = c.state.activeRun ?? c.state.lastRun ?? c.runs.at(-1);
-  const summaryRunId = summaryRun?.id ?? null;
   const panelReviewFilesRef = useRef(panelReviewFiles);
   useEffect(() => { panelReviewFilesRef.current = panelReviewFiles; }, [panelReviewFiles]);
   const summaryRunRef = useRef<number | null>(null);
@@ -296,7 +354,10 @@ export default function Workbench({ controller: c, source = 'live', projects: su
         if (cancelled) return;
         if (summary.files > 0) {
           setRunSummary(summary);
-          setRunChangesLoaded(false);
+          // 面板 applied 行以 DB 为准：终态即预取明细，不再等卡片展开。
+          void runChangesApi(summaryRun.id)
+            .then((rows) => { if (!cancelled) { setRunChanges(mergeRunChanges(rows)); setRunChangesLoaded(true); } })
+            .catch(() => { setRunChangesLoaded(false); });
         } else if (terminal) fallback();
       })
       .catch(() => { if (terminal) fallback(); });
@@ -401,6 +462,25 @@ export default function Workbench({ controller: c, source = 'live', projects: su
     if (tab === 'tasks') tasksDismissed.current = true;
   }, [openTabs, listTab]);
 
+  useEffect(() => {
+    try { sessionStorage.setItem(navStorageKey, navigation); } catch { /* Storage unavailable. */ }
+  }, [navigation, navStorageKey]);
+  useEffect(() => {
+    try { sessionStorage.setItem(panelStorageKey, JSON.stringify({ reviewOpen, listTab, activeFile })); } catch { /* Storage unavailable. */ }
+  }, [reviewOpen, listTab, activeFile, panelStorageKey]);
+  // Remount 只恢复了 activeFile 的指针；文件内容随模块状态丢失。等工作区
+  // root 就绪后补一次 selectFile —— 这是 reload 后「首点加载不出来」的另一半。
+  const restoredFilePending = useRef<string | null>(
+    restoredPanel?.activeFile?.kind === 'workspace' ? restoredPanel.activeFile.path : null,
+  );
+  useEffect(() => {
+    const pending = restoredFilePending.current;
+    if (!pending || preview || !reviewOpen || listTab !== 'explorer'
+      || activeFile?.kind !== 'workspace' || activeFile.path !== pending
+      || !workspace.info?.path) return;
+    restoredFilePending.current = null;
+    if (workspace.selectedPath !== pending) void workspace.selectFile(pending, currentProject.path || undefined);
+  }, [preview, reviewOpen, listTab, activeFile, workspace, currentProject.path]);
   useEffect(() => { if (c.error) setToastError(c.error); }, [c.error]);
   // The `workspace_trust_required` event does not replay — poll once per
   // mount/project so a reload still surfaces the prompt.
@@ -436,6 +516,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
       { id: 'agents', label: 'Go to Agents', icon: <Bot size={14} />, run: () => setNavigation('agents') },
       { id: 'activity', label: 'Go to Activity', hint: formatShortcut(preferences.shortcuts.activity), icon: <ChartNoAxesColumnIncreasing size={14} />, run: () => setNavigation('activity') },
       { id: 'extensions', label: 'Go to Extensions', hint: formatShortcut(preferences.shortcuts.extensions), icon: <Puzzle size={14} />, run: () => setNavigation('extensions') },
+      { id: 'sandbox', label: 'Go to Architecture Sandbox', icon: <GitBranchPlus size={14} />, run: () => setNavigation('sandbox') },
       { id: 'automations', label: 'Go to Automations', icon: <Zap size={14} />, run: () => setNavigation('automations') },
       { id: 'review', label: 'Toggle Review Panel', hint: formatShortcut(preferences.shortcuts.review), icon: <PanelRightOpen size={14} />, run: () => setReviewOpen((value) => !value) },
       { id: 'settings', label: 'Open Settings', hint: formatShortcut(preferences.shortcuts.settings), icon: <Settings2 size={14} />, run: () => setSettingsOpen(true) },
@@ -509,8 +590,8 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
     setReviewOpen(true);
     setListTab('explorer');
     setActiveFile({ kind: 'workspace', path });
-    if (!preview) void workspace.selectFile(path);
-  }, [preview, workspace]);
+    if (!preview) void workspace.selectFile(path, currentProject.path || undefined);
+  }, [preview, workspace, currentProject.path]);
 
   // Stable identities for the chat subtree: without these, memo(ChatStream)
   // never matches and every keystroke re-renders the whole history.
@@ -531,11 +612,11 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
   const handleResolveApproval = useCallback((runId: number, decision: Parameters<NonNullable<typeof c.resolveApproval>>[1], commandScope?: Parameters<NonNullable<typeof c.resolveApproval>>[2], feedback?: string) => {
     void c.resolveApproval?.(runId, decision, commandScope, feedback);
   }, [c.resolveApproval]);
-  const footerNode = useMemo(() => runSummary && runSummary.files > 0 && !running ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
+  const footerNode = useMemo(() => runSummary && runSummary.files > 0 && !running && summaryRun?.sessionId === c.selectedSessionId ? <ChangeSummaryCard summary={runSummary} changes={runChanges}
     loading={runChangesLoading} error={runChangesError} running={running} onExpand={loadRunChanges}
     onReview={(path) => { setListTab('changes'); setReviewOpen(true); setActiveFile({ kind: 'change', path }); }}
-    onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path); }}
-    onRevert={previewRevert} /> : null, [runSummary, runChanges, runChangesLoading, runChangesError, running, preview, workspace]);
+    onOpen={(path) => { setActiveFile({ kind: 'workspace', path }); if (!preview) void workspace.selectFile(path, currentProject.path || undefined); }}
+    onRevert={previewRevert} /> : null, [runSummary, runChanges, runChangesLoading, runChangesError, running, preview, workspace, summaryRun?.sessionId, c.selectedSessionId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -572,6 +653,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
           <button className="navigation-item" aria-current={navigation === 'agents' ? 'page' : undefined} onClick={() => setNavigation('agents')}><Bot size={17} strokeWidth={1.5} /><span>{text.agents}</span><span className="navigation-count">{c.sessions.length}</span></button>
           <button className="navigation-item" aria-current={navigation === 'automations' ? 'page' : undefined} onClick={() => setNavigation('automations')}><Zap size={17} strokeWidth={1.5} /><span>{text.automations}</span><span className="soon-label">待接入</span></button>
           <button className="navigation-item" aria-current={navigation === 'extensions' ? 'page' : undefined} onClick={() => setNavigation('extensions')}><Puzzle size={17} strokeWidth={1.5} /><span>{text.extensions}</span>{preview && <span className="soon-label">模拟</span>}</button>
+          <button className="navigation-item" aria-current={navigation === 'sandbox' ? 'page' : undefined} onClick={() => setNavigation('sandbox')}><GitBranchPlus size={17} strokeWidth={1.5} /><span>{text.sandbox}</span></button>
         </nav>
         <button type="button" className="navigation-item activity-navigation" aria-label="活动" aria-current={navigation === 'activity' ? 'page' : undefined} onClick={() => setNavigation('activity')}>
           <ChartNoAxesColumnIncreasing size={16} strokeWidth={1.5} /><span>活动</span><span className="activity-navigation-summary">今日 {dashboardData.todayLines} 行</span>
@@ -619,9 +701,9 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
         </div>
       </aside>
       } conversation={
-      <main aria-label={navigation === 'activity' ? 'Activity 工作区' : 'Agent 对话'} className="conversation-pane">
+      <main aria-label={navigation === 'activity' ? 'Activity 工作区' : 'Agent 对话'} className={`conversation-pane${c.pendingQuestion ? ' has-question' : ''}`}>
         <header className="conversation-header">
-          <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← {text.backToChat}</button>}<span className="eyebrow">{navigation === 'agents' ? text.agentSession : text.workspace}</span><h2>{navigation === 'agents' ? session?.title ?? text.newAgent : navigation === 'activity' ? text.workspaceOverview : navigation === 'extensions' ? text.extensions : text.automations}</h2></div>
+          <div className="conversation-title">{navigation !== 'agents' && <button type="button" className="back-to-chat" onClick={() => setNavigation('agents')}>← {text.backToChat}</button>}<span className="eyebrow">{navigation === 'agents' ? text.agentSession : text.workspace}</span><h2>{navigation === 'agents' ? session?.title ?? text.newAgent : navigation === 'activity' ? text.workspaceOverview : navigation === 'extensions' ? text.extensions : navigation === 'sandbox' ? text.sandbox : text.automations}</h2></div>
           <div className="header-actions"><IconButton label="切换右侧面板" onClick={() => setReviewOpen(!reviewOpen)}>{reviewOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}</IconButton>
             <IconButton label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></IconButton></div>
         </header>
@@ -632,7 +714,8 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
         {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
           <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} loading={!preview && !liveDashboard && !activityError} error={activityError} />
-        </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} /> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
+        </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} />
+          : navigation === 'sandbox' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading sandbox…</div>}><ArchitectureSandbox preview={preview} extensions={extensions} trace={c.architectureTrace ?? null} /></Suspense> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
               detailTools={c.detail?.tools} detailReasoning={c.detail?.reasoning} detailParts={c.detail?.parts} liveTools={c.liveTools} liveTimeline={c.liveTimeline}
@@ -653,9 +736,15 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
                 onTrust={(path) => { void c.trustWorkspace?.(path).catch((reason: unknown) => setToastError(reason instanceof Error ? reason.message : String(reason))); }}
                 onDismiss={() => c.dismissTrustPrompt?.()} />
             )}
+            <div className={`composer-stack${c.pendingQuestion ? ' has-question' : ''}`}>
+            {c.pendingQuestion && <div className="user-question-dock">
+              <UserQuestionDialog request={c.pendingQuestion} pending={Boolean(c.pending)}
+                onSubmit={(answers) => { const request = c.pendingQuestion; if (request && c.answerQuestion) void c.answerQuestion(request.runId, request.requestId, answers); }} />
+            </div>}
             <Composer atBottom={atBottom} onScrollBottom={scroll.stickToBottom}
               ref={composerRef} onSubmit={submit} attachments={attachments} onAttachmentsChange={setAttachments}
               blocked={blocked}
+              architectureWarning={architectureWarning}
               preview={preview} mode={c.state.mode} onSetMode={(mode) => void c.setMode(mode)}
               status={status} currentProject={currentProject} projects={projects}
               onSelectProject={(id) => c.selectProject?.(id)}
@@ -668,12 +757,11 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
               onCancel={() => { const run = c.state.activeRun; if (run) void c.cancel(run.id); }}
               runs={c.runs} metrics={c.metrics} context={capability.context} modelLabel={capability.model} sessionId={c.selectedSessionId}
               slash={{ actions: slashActions, skills: slashSources.skills, commands: slashSources.commands, onRefresh: slashSources.refresh, onRunCommand: runSlashCommand }} />
+            </div>
           </>}
       </main>
       } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} subagents={sessionSubagents} activeSubagentId={activeSubagentId} onActiveSubagent={setActiveSubagentId} onCancelSubagent={cancelSubagent} reasoningDisplay={preferences.reasoningDisplay} light={theme === 'light'} onOpenWorkspaceFile={openWorkspaceFile} /> : null} />
     </div>
-    <UserQuestionDialog request={c.pendingQuestion ?? null} pending={Boolean(c.pending)}
-      onSubmit={(answers) => { const request = c.pendingQuestion; if (request && c.answerQuestion) void c.answerQuestion(request.runId, request.requestId, answers); }} />
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
       files={paletteFiles} filesLoading={!preview && paletteOpen && workspace.loading}

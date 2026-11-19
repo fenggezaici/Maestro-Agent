@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   extensionsApi,
   type McpServerView,
+  type PluginView,
   type RecommendedItem,
   type SkillSource,
   type SkillView,
@@ -11,6 +12,8 @@ import { workspaceApi } from '../api/workspace';
 export interface ExtensionsController {
   skills: SkillView[];
   servers: McpServerView[];
+  /** 声明式插件清单（`.maestro/plugins/*.json`）。 */
+  plugins: PluginView[];
   recommendedSkills: RecommendedItem[];
   recommendedMcps: RecommendedItem[];
   mcpConfigText: string;
@@ -40,6 +43,7 @@ const errorMessage = (reason: unknown) =>
 export default function useExtensions(enabled: boolean): ExtensionsController {
   const [skills, setSkills] = useState<SkillView[]>([]);
   const [servers, setServers] = useState<McpServerView[]>([]);
+  const [plugins, setPlugins] = useState<PluginView[]>([]);
   const [recommendedSkills, setRecommendedSkills] = useState<RecommendedItem[]>([]);
   const [recommendedMcps, setRecommendedMcps] = useState<RecommendedItem[]>([]);
   const [mcpConfigText, setMcpConfigText] = useState('');
@@ -56,16 +60,18 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
     if (!enabled) return;
     setLoading(true);
     try {
-      const [skillList, serverList, skills, mcps, config, info] = await Promise.all([
+      const [skillList, serverList, skills, mcps, config, info, pluginList] = await Promise.all([
         extensionsApi.scanSkills(),
         extensionsApi.listMcpServers(),
         extensionsApi.recommendedSkills(),
         extensionsApi.recommendedMcps(),
         extensionsApi.readMcpConfig(),
         workspaceApi.info().catch(() => ({ name: '', path: null })),
+        extensionsApi.scanPlugins().catch(() => []),
       ]);
       setSkills(skillList);
       setServers(serverList);
+      setPlugins(pluginList);
       setRecommendedSkills(skills);
       setRecommendedMcps(mcps);
       setMcpConfigText(config);
@@ -93,7 +99,7 @@ export default function useExtensions(enabled: boolean): ExtensionsController {
   }, []);
 
   return {
-    skills, servers, recommendedSkills, recommendedMcps, mcpConfigText, loading, pending, refresh,
+    skills, servers, plugins, recommendedSkills, recommendedMcps, mcpConfigText, loading, pending, refresh,
     importSummary, real: true, hasWorkspace, installErrors,
     isInstalled: (item) => item.kind === 'skill'
       ? installedRepos.includes(item.id) || skills.some((skill) => skill.name === item.id)

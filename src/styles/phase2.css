@@ -333,6 +333,22 @@
 .user-question-dialog { display: flex; flex-direction: column; gap: 12px; }
 .user-question-list { display: flex; flex-direction: column; gap: 14px; }
 .user-question-item { display: flex; flex-direction: column; gap: 6px; }
+/* Composer stack: the pending-question card floats as an overlay anchored to
+   the stack's top edge, so it never shrinks the chat scroll area. */
+.composer-stack { position: relative; flex-shrink: 0; }
+.user-question-dock { position: absolute; left: 0; right: 0; bottom: 100%; z-index: 6; width: 100%; max-width: 960px; margin: 0 auto; padding: 0 32px 10px; }
+/* Room to scroll the last messages above the overlay (matches card max-height). */
+.conversation-pane.has-question .chat-history { padding-bottom: calc(min(60dvh, 34rem) + 24px); }
+.user-question-card { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--color-border); border-radius: 12px; background: var(--color-card); box-shadow: 0 8px 24px rgba(0,0,0,.28); max-height: min(60dvh, 34rem); overflow-y: auto; overscroll-behavior: contain; }
+.user-question-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.user-question-header-badge { max-width: 16em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px; border: 1px solid var(--color-border); border-radius: 999px; color: var(--color-foreground-subtle); font-size: var(--text-ui-xs); }
+.user-question-progress { margin-left: auto; color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); font-variant-numeric: tabular-nums; }
+.user-question-card-head:empty { display: none; }
+.user-question-card-foot { display: flex; align-items: center; gap: 8px; }
+.user-question-spacer { flex: 1; }
+@media (max-width: 650px) {
+  .user-question-dock { padding: 0 18px 10px; }
+}
 .user-question-header { margin: 0; color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); text-transform: uppercase; letter-spacing: .04em; }
 .user-question-text { margin: 0; color: var(--color-foreground); font-size: var(--text-ui-caption); font-weight: 500; }
 .user-question-options { display: flex; flex-direction: column; gap: 6px; }
@@ -368,13 +384,10 @@
 .dialog-content-palette { top: 76px; transform: translateX(-50%); z-index: 121; width: min(560px, calc(100vw - 32px)); max-height: min(480px, calc(100dvh - 110px)); }
 .dialog-content .dialog-close { position: absolute; top: 12px; right: 12px; }
 
-.approval-always { position: relative; display: inline-flex; }
-.approval-scope-menu { position: absolute; right: 0; bottom: calc(100% + 4px); z-index: 6; display: grid; min-width: 112px; padding: 4px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-popover); box-shadow: var(--shadow-overlay); }
-.approval-scope-menu button { padding: 6px 8px; border: 0; border-radius: 5px; background: transparent; color: var(--color-foreground-subtle); text-align: left; font-size: var(--text-ui-sm); }
-.approval-scope-menu button:hover { background: var(--color-hover); color: var(--color-foreground); }
-.approval-scope-menu { min-width: 230px; }
-.approval-scope-menu button { display: grid; gap: 2px; }
-.approval-scope-menu code { color: var(--color-foreground-subtlest); font-family: var(--code-font); font-size: var(--text-ui-xs); white-space: pre-wrap; word-break: break-all; }
+.approval-menu { min-width: 230px; }
+.approval-menu .dropdown-item { flex-wrap: wrap; }
+.approval-menu-pattern { flex-basis: 100%; color: var(--color-foreground-subtlest); font-family: var(--code-font); font-size: var(--text-ui-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dropdown-separator { height: 1px; margin: 4px -4px; background: var(--color-border); }
 .approval-rules-list { display: grid; gap: 8px; max-height: 320px; overflow: auto; }
 .approval-rule-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--color-border); border-radius: 8px; }
 .approval-rule-row > div { display: grid; gap: 2px; min-width: 0; }

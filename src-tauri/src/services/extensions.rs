@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    adapters::{mcp::McpManager, skills::SkillStore},
+    adapters::{mcp::McpManager, plugins::PluginStore, skills::SkillStore},
     domain::{AppResult, ToolSpec},
 };
 
@@ -10,6 +10,8 @@ use crate::{
 pub struct ExtensionManager {
     pub skills: SkillStore,
     pub mcp: McpManager,
+    /// 声明式插件清单（`.maestro/plugins/*.json`）—— 无独立插件运行时。
+    pub plugins: PluginStore,
     maestro_dir: PathBuf,
 }
 
@@ -26,6 +28,7 @@ impl ExtensionManager {
         Ok(Self {
             skills: SkillStore::default(),
             mcp,
+            plugins: PluginStore::default(),
             maestro_dir,
         })
     }

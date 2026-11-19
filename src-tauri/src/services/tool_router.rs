@@ -2,7 +2,7 @@
 //! call — built-in workspace reads, session reads, the skill loader, and
 //! namespaced MCP tools. Authorization (mode policy) stays on the caller;
 //! the router resolves effects and executes.
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::SystemTime};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex as StdMutex}, time::SystemTime};
 
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -10,8 +10,13 @@ use tokio::sync::Mutex;
 use crate::{
     adapters::{db::Database, fs},
     domain::{
+        armed_obligations, effective_after_set, evaluate_architecture, optional_extensions,
+        required_extensions, trigger_ancestors,
         policy::{self, ToolGate},
-        validate_plan_steps, AppResult, Mode, PlanStep, RevertIssue, RevertPreview, RevertResult, RunFileChange, ToolEffect, ToolSpec,
+        validate_plan_steps, AppResult, ArchitectureGraph, ArmedObligation, ExtensionKind,
+        ExtensionSnapshot, GraphDecision, HistoryEntry, merge_file_changes, Mode,
+        PendingCall, PlanStep, PluginKind, ResolvedPlugin, RevertIssue, RevertPreview, RevertResult,
+        RunFileChange, ToolEffect, ToolSpec,
     },
     services::extensions::ExtensionManager,
 };
@@ -87,10 +92,19 @@ struct BgTask {
     handle: crate::adapters::exec::BackgroundHandle,
 }
 
+/// 已装载的架构沙盘规则（项目优先、全局回退）；`error` 表示文件存在但
+/// 无法解析——此时副作用工具按「解析失败」整体拦截，直到用户修复。
+#[derive(Default)]
+struct ArchitectureState {
+    graph: Option<ArchitectureGraph>,
+    error: Option<String>,
+}
+
 pub struct ToolRouter {
     extensions: ExtensionManager,
     workspace: Mutex<Option<PathBuf>>,
     database: Arc<Database>,
+    architecture: Mutex<ArchitectureState>,
     /// Canonical path → fingerprint the agent last observed via `read_file`
     /// (or produced via a successful write). Write tools refuse a file that
     /// was never read or changed since — the ZCode read-before-write rule.
@@ -99,6 +113,10 @@ pub struct ToolRouter {
     /// spawned them (ZCode task registry analog).
     background: Mutex<HashMap<String, BgTask>>,
     bg_seq: std::sync::atomic::AtomicU64,
+    /// trusted_workspaces 全表内存副本（None=未加载）。信任表极小且本进程
+    /// 独占 DB 写——读路径（含沙盘加载/tool_specs/gate）零 DB 往返，
+    /// 否则 agent run 期间会被单 worker 的 DB 队列卡死。
+    trusted: StdMutex<Option<HashSet<String>>>,
 }
 
 fn file_stamp(path: &Path) -> FileStamp {
@@ -112,9 +130,11 @@ impl ToolRouter {
             extensions: ExtensionManager::new(maestro_dir)?,
             workspace: Mutex::new(None),
             database,
+            architecture: Mutex::new(ArchitectureState::default()),
             file_stamps: Mutex::new(HashMap::new()),
             background: Mutex::new(HashMap::new()),
             bg_seq: std::sync::atomic::AtomicU64::new(0),
+            trusted: StdMutex::new(None),
         })
     }
 
@@ -123,23 +143,7 @@ impl ToolRouter {
     }
 
     fn merge_changes(changes: &[RunFileChange]) -> Vec<RunFileChange> {
-        let mut order: Vec<String> = Vec::new();
-        let mut merged: HashMap<String, RunFileChange> = HashMap::new();
-        for change in changes {
-            match merged.get_mut(&change.path) {
-                Some(existing) => {
-                    existing.added += change.added;
-                    existing.removed += change.removed;
-                    existing.after = change.after.clone();
-                    existing.created_at = existing.created_at.max(change.created_at);
-                }
-                None => {
-                    order.push(change.path.clone());
-                    merged.insert(change.path.clone(), change.clone());
-                }
-            }
-        }
-        order.into_iter().filter_map(|path| merged.remove(&path)).collect()
+        merge_file_changes(changes.to_vec())
     }
 
     /// `root` is the workspace the recorded run actually wrote into — the
@@ -248,7 +252,206 @@ impl ToolRouter {
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
         *self.workspace.lock().await = root.clone();
         // MCP 启动器解析复用同一 root：工作区内 PATH 目录不得提供 shim。
-        self.extensions.mcp.set_workspace_root(root);
+        self.extensions.mcp.set_workspace_root(root.clone());
+        self.reload_architecture().await;
+    }
+
+    /// （重）装载当前生效的架构规则：受信任项目根下的
+    /// `.maestro/graph_rules.json` 优先，否则全局 `~/.maestro/graph_rules.json`。
+    /// 工作区未受信任时项目规则不生效（与 skills/agents 同一信任语义）。
+    pub async fn reload_architecture(&self) {
+        let trusted = self
+            .trusted_project_root(self.workspace.lock().await.as_deref())
+            .await;
+        let found = crate::services::architecture::effective_path(
+            self.extensions.maestro_dir(),
+            trusted.as_deref(),
+        );
+        let state = match found {
+            Some((_, path)) => {
+                let (graph, error) = crate::services::architecture::load_path(&path);
+                ArchitectureState { graph, error }
+            }
+            None => ArchitectureState::default(),
+        };
+        *self.architecture.lock().await = state;
+    }
+
+    /// 存在生效规则或规则文件损坏（损坏也要拦副作用工具）。
+    pub async fn has_architecture_rules(&self) -> bool {
+        let state = self.architecture.lock().await;
+        state.graph.is_some() || state.error.is_some()
+    }
+
+    /// 扩展世界快照：求值时刻的已安装 Skill、已配置/运行中 MCP、插件清单。
+    async fn extension_snapshot(&self, workspace_root: Option<&Path>) -> ExtensionSnapshot {
+        let trusted = self.trusted_project_root(workspace_root).await;
+        let maestro = self.extensions.maestro_dir();
+        let skills = self
+            .extensions
+            .skills
+            .scan(maestro, trusted.as_deref())
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        let mcp_configured = self
+            .extensions
+            .mcp
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|view| view.name)
+            .collect();
+        let mcp_tools = self
+            .extensions
+            .mcp
+            .running_tools()
+            .await
+            .into_iter()
+            .map(|(server, tools)| (server, tools.into_iter().collect()))
+            .collect();
+        let plugins = self
+            .extensions
+            .plugins
+            .manifests(maestro, trusted.as_deref())
+            .into_iter()
+            .map(|(name, manifest)| {
+                (
+                    name,
+                    ResolvedPlugin {
+                        kind: match manifest.kind {
+                            PluginKind::Skill => ExtensionKind::Skill,
+                            PluginKind::Mcp => ExtensionKind::Mcp,
+                        },
+                        target: manifest.target,
+                        tool: manifest.tool,
+                    },
+                )
+            })
+            .collect();
+        ExtensionSnapshot { skills, mcp_configured, mcp_tools, plugins }
+    }
+
+    /// Restriction 的检查体：write_file 的新内容、apply_patch 的模拟结果、
+    /// run_command 的命令文本；其余工具返回 None（Restriction 恒通过）。
+    fn simulated_content(
+        workspace_root: Option<&Path>,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        match tool {
+            "write_file" => arguments
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            "apply_patch" => {
+                let rel = arguments.get("path")?.as_str()?;
+                let root = workspace_root?;
+                let original = fs::read_file(root, rel).ok();
+                if let Some(edits) = arguments.get("edits").and_then(|v| v.as_array()) {
+                    let mut current = original.clone().unwrap_or_default();
+                    for edit in edits {
+                        let before = edit.get("before")?.as_str()?;
+                        let after = edit.get("after")?.as_str()?;
+                        if before.is_empty() {
+                            current = after.to_string();
+                        } else {
+                            if current.matches(before).count() != 1 {
+                                return None;
+                            }
+                            current = current.replacen(before, after, 1);
+                        }
+                    }
+                    Some(current)
+                } else {
+                    let before = arguments.get("before")?.as_str()?;
+                    let after = arguments.get("after")?.as_str()?;
+                    if before.is_empty() {
+                        Some(after.to_string())
+                    } else {
+                        let original = original?;
+                        if original.matches(before).count() != 1 {
+                            return None;
+                        }
+                        Some(original.replacen(before, after, 1))
+                    }
+                }
+            }
+            "run_command" => arguments
+                .get("command")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// 工具执行前的架构判定。`history` 为「本会话已成功 + 本批次乐观」的
+    /// 调用历史；`run_id` 用于 `scope: run` 节点判定。
+    pub async fn architecture_decision(
+        &self,
+        tool: &str,
+        arguments_json: &str,
+        effect: ToolEffect,
+        history: &[HistoryEntry],
+        run_id: i64,
+        workspace_root: Option<&Path>,
+        user_message: &str,
+    ) -> GraphDecision {
+        let (graph, error) = {
+            let state = self.architecture.lock().await;
+            (state.graph.clone(), state.error.clone())
+        };
+        if let Some(error) = error {
+            // 规则文件损坏 → 失败关闭：副作用调用全部拦截，直到用户修复。
+            if effect != ToolEffect::ReadOnly {
+                return GraphDecision {
+                    matched: true,
+                    blocked: true,
+                    warn: false,
+                    message: Some(format!(
+                        "架构规则文件无法解析（{error}）。修复或删除 graph_rules.json 前，写入/命令调用将被拦截。"
+                    )),
+                    reminder: None,
+                    trace: Vec::new(),
+                };
+            }
+            return GraphDecision::default();
+        }
+        let Some(graph) = graph else {
+            return GraphDecision::default();
+        };
+        let arguments: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
+        let call = PendingCall {
+            tool: tool.to_string(),
+            target: Self::history_target(tool, arguments_json),
+            content: Self::simulated_content(workspace_root, tool, &arguments),
+        };
+        let snapshot = self.extension_snapshot(workspace_root).await;
+        evaluate_architecture(&graph, &call, history, run_id, &snapshot, user_message)
+    }
+
+    /// Run 末欠账查询：会话历史中仍挂着未验收的事后义务。
+    /// 规则损坏时返回空——fail-closed 拦截已在 decision 层生效，不再追问。
+    pub async fn architecture_outstanding(
+        &self,
+        history: &[HistoryEntry],
+        run_id: i64,
+        workspace_root: Option<&Path>,
+        user_message: &str,
+    ) -> Vec<ArmedObligation> {
+        let (graph, error) = {
+            let state = self.architecture.lock().await;
+            (state.graph.clone(), state.error.clone())
+        };
+        if error.is_some() {
+            return Vec::new();
+        }
+        let Some(graph) = graph else {
+            return Vec::new();
+        };
+        let snapshot = self.extension_snapshot(workspace_root).await;
+        armed_obligations(&graph, history, run_id, &snapshot, user_message)
     }
 
     pub async fn workspace_root(&self) -> Option<PathBuf> {
@@ -266,13 +469,55 @@ impl ToolRouter {
             return Some(root.to_path_buf());
         }
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        match self
-            .database
-            .is_workspace_trusted(canonical.to_string_lossy().to_string())
+        self.is_trusted_canonical(&canonical.to_string_lossy())
             .await
+            .then(|| root.to_path_buf())
+    }
+
+    /// canonical 路径的信任判断：内存副本命中直接返回，未加载时一次性
+    /// 全表载入（信任表极小）。run 期间热路径全程零 DB——否则会被
+    /// 单 worker 的 DB 队列卡死（架构沙盘加载超时的病根之一）。
+    pub async fn is_trusted_canonical(&self, canonical_path: &str) -> bool {
+        let hit = {
+            let cache = self.trusted.lock().unwrap_or_else(|e| e.into_inner());
+            cache.as_ref().map(|set| set.contains(canonical_path))
+        };
+        if let Some(trusted) = hit {
+            return trusted;
+        }
+        self.prefetch_trusted().await;
+        let cache = self.trusted.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .as_ref()
+            .is_some_and(|set| set.contains(canonical_path))
+    }
+
+    /// 启动预热：把 trusted_workspaces 一次性载入内存。启动时 DB 空闲，
+    /// 瞬时完成；此后读路径不再依赖 DB 队列。
+    pub async fn prefetch_trusted(&self) {
         {
-            Ok(true) => Some(root.to_path_buf()),
-            _ => None,
+            let cache = self.trusted.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.is_some() {
+                return;
+            }
+        }
+        let set: HashSet<String> = self
+            .database
+            .list_trusted_workspaces()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        *self.trusted.lock().unwrap_or_else(|e| e.into_inner()) = Some(set);
+    }
+
+    /// trust_workspace 写 DB 成功后同步内存副本——立即生效无需重载。
+    /// 缓存未加载时不预填单条（否则会被当成已初始化而漏掉其它信任路径）；
+    /// 下次读取会全表载入，自然包含刚写入的行。
+    pub fn mark_trusted(&self, canonical_path: String) {
+        let mut cache = self.trusted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = cache.as_mut() {
+            set.insert(canonical_path);
         }
     }
 
@@ -529,12 +774,9 @@ impl ToolRouter {
         visible
     }
 
-    /// Extract the one-line "what" of a call for display: `path` for file
-    /// tools, `command` for run_command, `name` for load_skill, the first
-    /// string argument for `mcp__*` tools, or the bounded args JSON.
-    /// Never returns the full payload — it goes straight into the UI.
-    pub fn call_target(tool: &str, arguments_json: &str) -> String {
-        const MAX_TARGET_CHARS: usize = 120;
+    /// 与 `call_target` 相同的目标提取，但不截断——Session 工具历史与架构
+    /// 规则匹配需要完整路径/命令文本（120 字符截断会让长路径永远失配）。
+    pub fn history_target(tool: &str, arguments_json: &str) -> String {
         let arguments: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
         let arg = |key: &str| arguments.get(key).and_then(|v| v.as_str());
@@ -570,7 +812,19 @@ impl ToolRouter {
                 .unwrap_or_else(|| arguments_json.trim().to_string()),
             _ => String::new(),
         };
-        target.chars().take(MAX_TARGET_CHARS).collect()
+        target
+    }
+
+    /// Extract the one-line "what" of a call for display: `path` for file
+    /// tools, `command` for run_command, `name` for load_skill, the first
+    /// string argument for `mcp__*` tools, or the bounded args JSON.
+    /// Never returns the full payload — it goes straight into the UI.
+    pub fn call_target(tool: &str, arguments_json: &str) -> String {
+        const MAX_TARGET_CHARS: usize = 120;
+        Self::history_target(tool, arguments_json)
+            .chars()
+            .take(MAX_TARGET_CHARS)
+            .collect()
     }
 
     /// Bounded preview for the approval card shown while a call is suspended.
@@ -852,10 +1106,173 @@ impl ToolRouter {
                 None,
             ),
             _ if tool.starts_with("mcp__") => {
-                (self.extensions.mcp.call_tool(tool, arguments).await?, None)
+                (self.extensions.mcp.call_tool(tool, arguments, cancel).await?, None)
             }
             _ => return Err("未注册的工具".into()),
         };
         Ok(ToolOutcome { text, write, plan })
+    }
+
+    /// 注入 System Prompt 的架构契约：列举必选 Skill/MCP/Plugin（带触发
+    /// 上下文）、预注入必选 Skill 正文（≤8 个、≤32KB）、可选建议，并明确
+    /// 「正文已给但工具调用仍必须真实发生」——Rust 在执行前按图校验。
+    pub async fn architecture_brief(&self, workspace_root: Option<&Path>) -> String {
+        const MAX_INJECTED_SKILLS: usize = 8;
+        const MAX_BRIEF_BYTES: usize = 32 * 1024;
+        let (graph, error) = {
+            let state = self.architecture.lock().await;
+            (state.graph.clone(), state.error.clone())
+        };
+        if let Some(error) = error {
+            return format!(
+                "【架构契约】规则文件无法解析（{error}）。所有写入与命令调用都会被 Rust 拦截，直到用户在架构沙盘中修复或删除 graph_rules.json。"
+            );
+        }
+        let Some(graph) = graph else {
+            return String::new();
+        };
+        let trusted = self.trusted_project_root(workspace_root).await;
+        let maestro = self.extensions.maestro_dir();
+        let plugins = self.extensions.plugins.manifests(maestro, trusted.as_deref());
+        let mut out = String::from(
+            "【架构契约】本工作区启用了用户在架构沙盘中定义的规则。以下契约由 Rust 在工具执行前强制校验：\
+            不满足时对应调用会被拒绝并返回拦截消息，文件不会被写入、命令不会执行。\n",
+        );
+        let mut lines: Vec<String> = Vec::new();
+        let mut skill_names: Vec<String> = Vec::new();
+        // 事后判定用有效时机（含沿 pass 边继承），否则继承的 Skill 会被写成「修改前必需」。
+        let after_set = effective_after_set(&graph);
+        for node in &graph.nodes {
+            let Some(ext) = node.data.extension.as_ref() else { continue };
+            if !ext.is_required() {
+                continue;
+            }
+            let target = ext.target.as_deref().unwrap_or_default();
+            let kind = ext.kind.unwrap_or(ExtensionKind::Skill);
+            let after = after_set.contains(node.id.as_str());
+            let ctx = trigger_ancestors(&graph, &node.id)
+                .into_iter()
+                .map(|data| describe_trigger(&data))
+                .collect::<Vec<_>>()
+                .join(" 或 ");
+            let prefix = if ctx.is_empty() {
+                String::new()
+            } else if after {
+                format!("完成{ctx}之后，")
+            } else {
+                format!("在{ctx}前，")
+            };
+            let scope_note = if ext.scope() == crate::domain::SatisfyScope::Run {
+                "（每轮对话需重新满足）"
+            } else {
+                ""
+            };
+            let (resolved_kind, resolved_target, resolved_tool) = match kind {
+                ExtensionKind::Plugin => match plugins.get(target) {
+                    Some(manifest) => (
+                        match manifest.kind {
+                            PluginKind::Skill => ExtensionKind::Skill,
+                            PluginKind::Mcp => ExtensionKind::Mcp,
+                        },
+                        manifest.target.clone(),
+                        manifest.tool.clone(),
+                    ),
+                    None => {
+                        lines.push(format!("- {prefix}插件 {target} 未安装：相关调用一律被拦截，请先安装该插件。"));
+                        continue;
+                    }
+                },
+                _ => (kind, target.to_string(), ext.tool.clone()),
+            };
+            match resolved_kind {
+                ExtensionKind::Skill => {
+                    if after {
+                        lines.push(format!(
+                            "- {prefix}必须调用 load_skill {resolved_target}{scope_note} 完成验收——未完成前其它实质操作会被拦截，本轮回复也无法结束。该技能正文已在下方预注入，调用本身仍必须真实发生。"
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "- {prefix}必须先调用 load_skill {resolved_target}{scope_note}。该技能正文已在下方预注入供参考，但调用本身仍必须真实发生——未调用就直接写入会被拦截。"
+                        ));
+                    }
+                    if !skill_names.contains(&resolved_target) {
+                        skill_names.push(resolved_target);
+                    }
+                }
+                ExtensionKind::Mcp => {
+                    let tool_part = resolved_tool
+                        .as_deref()
+                        .map(|tool| format!("mcp__{resolved_target}__{tool}"))
+                        .unwrap_or_else(|| format!("MCP 服务 {resolved_target} 的任意工具"));
+                    if after {
+                        lines.push(format!(
+                            "- {prefix}必须成功调用 {tool_part}{scope_note} 完成验收——未完成前其它实质操作会被拦截，本轮回复也无法结束。该服务的工具已全部暴露。"
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "- {prefix}必须先成功调用 {tool_part}{scope_note}。该服务的工具已全部暴露，未真实调用过的调用会被拦截。"
+                        ));
+                    }
+                }
+                ExtensionKind::Plugin => unreachable!(),
+            }
+        }
+        let optional = optional_extensions(&graph)
+            .into_iter()
+            .map(|ext| ext.target.as_deref().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        if !optional.is_empty() {
+            lines.push(format!("- 可选扩展建议（不强制）：{}", optional.join("、")));
+        }
+        if required_extensions(&graph).is_empty() {
+            lines.push("- 图中包含前置要求（Requirement）与禁止内容（Restriction）约束：命中触发器时按连线顺序校验。".into());
+        } else {
+            lines.push("- 图中还包含前置要求（Requirement）与禁止内容（Restriction）约束：命中触发器时按连线顺序校验。".into());
+        }
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        // 必选 Skill 正文预注入（上限内）。
+        for name in skill_names.into_iter().take(MAX_INJECTED_SKILLS) {
+            if out.len() >= MAX_BRIEF_BYTES {
+                out.push_str("\n…（契约长度达到 32KB 上限，其余技能正文未注入；工具调用要求不变）\n");
+                break;
+            }
+            match self.extensions.skills.body(&name, maestro, trusted.as_deref()) {
+                Ok(body) => {
+                    out.push_str(&format!(
+                        "\n<skill_preload name=\"{name}\">\n{}\n</skill_preload>\n",
+                        body.chars().take(8192).collect::<String>()
+                    ));
+                }
+                Err(_) => {
+                    out.push_str(&format!("\n（技能 {name} 当前未安装，相关调用会被拦截并提示）\n"));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 契约行的触发上下文描述：`action + targetDir`。
+fn describe_trigger(data: &crate::domain::GraphNodeData) -> String {
+    let dir = data
+        .target_dir
+        .as_deref()
+        .map(crate::domain::architecture::normalize_rel)
+        .unwrap_or_default();
+    let dir = if dir.is_empty() { "任意目标".to_string() } else { format!("`{dir}`") };
+    match data.action.unwrap_or(crate::domain::TriggerAction::Any) {
+        crate::domain::TriggerAction::Modify => format!("修改 {dir}"),
+        crate::domain::TriggerAction::Read => format!("读取 {dir}"),
+        crate::domain::TriggerAction::Command => {
+            if dir == "任意目标" { "执行命令".into() } else { format!("执行包含 {dir} 的命令") }
+        }
+        crate::domain::TriggerAction::Plan => "提交计划".into(),
+        crate::domain::TriggerAction::Any => format!("使用 {dir} 相关工具"),
+        crate::domain::TriggerAction::Prompt => {
+            if dir == "任意目标" { "用户发送任意消息".into() } else { format!("用户输入包含 {dir}") }
+        }
     }
 }

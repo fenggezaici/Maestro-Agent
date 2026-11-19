@@ -2,6 +2,23 @@ import { useRef, useState } from 'react';
 import Workbench from '../components/Workbench';
 import { usePreviewExtensions } from '../components/workbenchMock';
 import { previewDetail, previewProjects, previewSnapshot, previewTaskPlan } from './fixtures';
+import type { ArchitectureTrace } from '../api/types';
+
+/// 沙盘示例图的模拟执行轨迹：技能未加载 → fail 分支拦截；MCP 已满足。
+const previewArchitectureTrace: ArchitectureTrace = {
+  runId: 1001,
+  sessionId: 101,
+  tool: 'write_file',
+  target: 'src/ui/Button.tsx',
+  blocked: true,
+  message: '请先加载 ui-guidelines 技能。',
+  steps: [
+    { nodeId: 'sample-trigger', status: 'matched' },
+    { nodeId: 'sample-skill', status: 'failed' },
+    { nodeId: 'sample-action-skill', status: 'blocked' },
+    { nodeId: 'sample-mcp', status: 'passed' },
+  ],
+};
 
 // Explicit browser-only visual preview; deliberately no useKernel/invoke/listen imports.
 export default function PreviewApp() {
@@ -44,7 +61,7 @@ export default function PreviewApp() {
   }} controller={{
     state, sessions: projects.flatMap((project) => project.sessions.map((item) => item.session)), selectedSessionId, detail, runs: detail?.runs ?? [],
     loadingSession: false, pending: false, error: null,
-    currentPlan: previewTaskPlan, planRunning: true,
+    currentPlan: previewTaskPlan, planRunning: true, architectureTrace: previewArchitectureTrace,
     selectSession: setSelectedSessionId,
     createSession: () => undefined, start: async () => undefined, cancel: () => undefined,
     setMode: (mode) => setState((current) => ({ ...current, mode })), decidePlan: () => undefined,

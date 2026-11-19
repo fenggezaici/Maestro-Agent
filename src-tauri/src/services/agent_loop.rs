@@ -227,17 +227,22 @@ fn truncate_middle(text: &str, max: usize) -> String {
     )
 }
 
-/// Same as `conversation`, plus a bounded block of earlier child reports so a
+/// Same as `conversation`, plus the architecture contract (user-drawn rules
+/// enforced by Rust) and a bounded block of earlier child reports so a
 /// follow-up turn can still cite what subagents found in previous runs.
 pub fn conversation_with_reports(
     detail: &SessionDetail,
     run: &RunView,
     reports: &str,
     context_window: Option<u64>,
+    architecture_brief: &str,
 ) -> Vec<ChatMessage> {
     let mut messages = conversation(detail, run, context_window);
     if !reports.trim().is_empty() {
         messages.insert(1, ChatMessage::text("system", reports));
+    }
+    if !architecture_brief.trim().is_empty() {
+        messages.insert(1, ChatMessage::text("system", architecture_brief.to_string()));
     }
     messages
 }
@@ -982,15 +987,21 @@ pub(crate) async fn run(
         }
         let detail = kernel.session_detail(run.session_id).await?;
         let reports = kernel.recent_subagent_reports(run.session_id).await.unwrap_or_default();
-        let mut messages = conversation_with_reports(&detail, &run, &reports, config.context_window);
+        let run_root = kernel.run_workspace_root(run.id).await;
+        // 架构契约在拼装会话时注入：必选 Skill 正文预读 + 硬性调用要求。
+        let architecture_brief = kernel.architecture_brief(run_root.as_deref()).await;
+        let mut messages = conversation_with_reports(&detail, &run, &reports, config.context_window, &architecture_brief);
         let mut saved_upto = messages.len();
         let mut next_seq = 0i64;
-        let run_root = kernel.run_workspace_root(run.id).await;
         let tools = kernel.agent_tools(run.mode, run_root.as_deref()).await;
         let provider = kernel.llm_provider(&config);
         let max_rounds = max_tool_rounds();
         let mut last_input_tokens: Option<u64> = None;
         let mut compaction_failures = 0u32;
+        // 事后验收追问上限：模型无视欠账连续收尾时避免死循环，2 次后放行。
+        // 会话级欠账仍在——下一轮首个实质调用照样被 Layer-B 拦。
+        let mut post_nudges = 0u32;
+        const POST_NUDGE_LIMIT: u32 = 2;
         for _round in 0..max_rounds {
             if kernel.is_cancelled(run.id).await {
                 return Ok(false);
@@ -1056,6 +1067,24 @@ pub(crate) async fn run(
                 last_input_tokens = outcome.input_tokens;
             }
             if outcome.tool_calls.is_empty() {
+                // 事后验收欠账：模型想结束时若仍有验收义务未履行，
+                // 注入合成追问强制续跑（封顶 POST_NUDGE_LIMIT 次）。
+                let outstanding = kernel
+                    .architecture_outstanding(run.id, run.session_id, run_root.as_deref(), &run.prompt)
+                    .await;
+                if !outstanding.is_empty() && post_nudges < POST_NUDGE_LIMIT {
+                    post_nudges += 1;
+                    let lines = outstanding
+                        .iter()
+                        .map(|item| format!("- {}", item.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    messages.push(ChatMessage::text(
+                        "user",
+                        format!("【架构规则】本轮尚有未完成的验收义务：\n{lines}\n请先完成上述验收调用，再给出最终答复。"),
+                    ));
+                    continue;
+                }
                 // 长度截断的回复与正常完成不可区分是误导性的——
                 // finish_reason 透出后向用户标记（DSH 同款语义）。
                 if let Some(reason) = outcome.finish_reason.as_deref() {

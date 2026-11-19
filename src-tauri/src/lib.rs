@@ -146,13 +146,22 @@ pub fn run() {
             app.manage(WorkspaceService::default());
             // Restore MCP servers in the background: a slow npx download must
             // never delay the window or the first chat turn.
+            {
+                let kernel = kernel.clone();
+                tauri::async_runtime::spawn(async move {
+                    kernel.start_enabled_mcp().await;
+                });
+            }
+            // 启动预热信任缓存：DB 空闲时一次性载入，之后 run 期间
+            // trusted_project_root / 沙盘加载不再依赖 DB 队列。
             tauri::async_runtime::spawn(async move {
-                kernel.start_enabled_mcp().await;
+                kernel.prefetch_workspace_trust().await;
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::kernel::get_snapshot,
+            commands::debug::debug_start_fake_stream,
             commands::activity::activity_snapshot,
             commands::agents::list_agents,
             commands::agents::save_agent,
@@ -207,6 +216,9 @@ pub fn run() {
             commands::extensions::recommended_skills,
             commands::extensions::recommended_mcps,
             commands::extensions::read_mcp_config,
+            commands::extensions::scan_plugins,
+            commands::architecture::get_architecture_graph,
+            commands::architecture::save_architecture_graph,
             commands::kernel::stream_chat,
             commands::models::fetch_models,
             commands::models::model_catalog,

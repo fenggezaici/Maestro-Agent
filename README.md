@@ -1,275 +1,95 @@
 # Maestro-Agent
 
-**A Rust-native AI desktop workbench — streaming conversations, persistent sessions, and read-only workspace exploration.**
+**A Rust-native AI desktop workbench — Tauri 2 + React 19 + Rust, no Electron.**
 
-Maestro-Agent 是基于 **Tauri 2 + React 19 + Rust** 的早期 AI 桌面工作台。它将对话、会话管理和代码审查组织在可调整的三栏界面中，使用系统 WebView，不引入 Electron。
+对话、工具调用循环、可视化规则编排与代码审查组织在可调整的三栏界面中；所有特权操作由 Rust 模式门禁（Plan/Code/Confirm/Auto）与审批卡片兜底。
 
-> **开发阶段：Phase 3。**真实模型聊天、工具调用循环（Skill/MCP）、只读文件浏览，以及经批准的写入/命令执行已经实现。部分界面用于明确标注的 Mock 演示。
+> **开发阶段：Phase 3+。** 真实模型聊天、工具循环（Skill/MCP/子智能体）、架构沙盘规则编排、写入/命令审批已实现；部分界面为明确标注的 Mock 演示。
 
 ## 界面预览
 
 ![Maestro-Agent workbench](artifacts/ui/maestro-workbench.png)
 
-<details>
-<summary>查看 Explorer / 代码预览</summary>
+## 核心能力
 
-![Readonly Explorer preview](artifacts/ui/maestro-explorer.png)
-
-</details>
-
-<details>
-<summary>查看轮次预览卡片</summary>
-
-![Timeline turn hover card](artifacts/ui/maestro-turn-card.png)
-
-</details>
-
-以上为项目自带 Mock 数据的浏览器截图，展示布局与交互，不代表真实工作区、模型执行或原生桌面验收结果。
-
-## 功能状态
-
-| 功能 | 当前状态 |
+| 能力 | 要点 |
 | --- | --- |
-| Provider 聊天 | `LlmProvider` 适配器统一 SSE（OpenAI 兼容/Anthropic），reasoning/content 在 Rust 侧分类后经 `kernel-event` 单通道下发（投递前在 32ms 窗口内合并相邻同 key 的 token 事件，防止逐 token eval 打满 webview 主线程）；OpenCode Go/Zen 端点自动附加稳定 `x-opencode-session` 与自有 User-Agent |
-| 执行时间线 | reasoning、tool_call 与正文都进入同一条时间线；连续思考/工具折叠为「已工作 X 秒」执行阶段，正文按真实事件位置穿插，不再固定堆在底部 |
-| 工具事件行 | 工具/思考行右侧 Chevron 展开详情；执行中亮色 + Loader，完成后整行与图标灰化、hover 恢复；点击文件名打开右侧 Explorer 并加载代码预览 |
-| 停止生成 | 前端乐观终结当前 run、立即隐藏“工作中”胶囊与停止按钮，并继续丢弃迟到 token；停止期间新输入进入 `queuedStart`，旧 run terminal 后自动启动；Rust 使用独立 `cancelled_run` 标志 + 250ms 流轮询，取消不排队于命令锁 |
-| 本地会话 | SQLite 持久化多轮对话、运行结果和内部审计，恢复异常中断记录 |
-| 桌面生命周期 | Tauri 单实例、单个活动运行、取消与退出排空 |
-| 工作区 Explorer | 显式选择目录，读取真实文件树和 UTF-8 文本，Shiki 代码预览（`@pierre/diffs`）；树结果缓存，`workspace_changed` 防抖刷新，扫描不持锁且在飞合并去重；折叠子树按需渲染（不驻留 DOM），忽略 `__pycache__`/`venv`/`.venv` |
-| Review / 审批 | 提议 Diff 与单次计划决定；**计划批准即把会话切换为 Code**（ZCode plan→code，已完成的 run 不回写、对下一个 run 生效）；Code 模式写文件直接执行，只读白名单命令免审、其余命令生成审批卡片；Confirm 仍全部审批；审批支持允许一次 / 始终允许 / 拒绝并反馈，拒绝原因回传给模型；始终允许写入**持久化规则库**（SQLite，重启后仍在，`list_approval_rules`/`revoke_approval_rule` 可查看与撤销；默认精确匹配完整命令或参数，可选前缀并在卡片上显示实际规则）；审批决定**逐工具调用**做出，一批挂起调用逐张卡片独立裁决；Plan 下历史授权不能越过模式禁止 |
-| IDE 工作台 | 三栏（侧栏 + 对话 + 右侧面板，按需打开），侧栏 280（220-360）可拖拽并持久化；右侧面板为可增删的 文件/变更/任务 Tab（+ 添加、x 关闭），变更使用 ZCode 风格轻量统一 Diff；右侧分栏为 pointer + rAF + CSS 变量的 ZCode 式拖拽，松手才提交；会话搜索、项目分组、Settings、快捷键 |
-| 轮次预览 | 悬停左侧刻度显示深色预览卡片：`You → Maestro` 角色、相对时间、问题/回答摘要、状态与最近工具；点击跳转并短暂高亮目标轮次 |
-| Composer 统计 | 对齐 DSH StatsLine：`N 轮 M 步 · X tok/s · Y tok · 缓存命中 Z% · W%`；步=已完成 LLM 请求数（attempts，即 DSH step/end 计数），tok/s=输出速度 TPS=ΣdecodeTokens/ΣdecodeMs（decode 窗口=首个 content/reasoning/tool-call delta → 流结束，仅计入首 delta 与 output usage 同有的请求，reasoning 不重复计、工具时间不计入），Y=计费输入+输出（流式中为估算增量标 est.），Z=cacheRead/计费输入整数百分比，W=上下文占用；provider 多在请求结束上报 usage，会话 TPS/token 按请求边界跳变、Usage 一到达即刷新；流式期间 liveSurfaceTokens（在途请求 surface 文本估算，含 reasoning，usage 样本到达即清零）驱动 token 增量与 `≈tok/s` 本轮速度（估），永不持久化，与 DSH surfaceTokens 一致；无 Done 的失败请求仅 usage 进累计、不进 TPS/TTFT/步数（DSH tokenUsage 与 sessionStats 分离语义）；同请求多次 usage 后值替换前值；取消不计；子智能体的 LLM 调用作为真实 step 折进父会话统计（执行期间行持续跳动），但 W% 仅由主会话请求的最新 inputTokens 驱动、子调用不得覆盖（ZCode `shouldUseModelUsageForContext` 口径），百分比经 Intl percent 保留一位小数（0.2% 不显示为 0%）；点击展开详情（模型用时/工具调用用时/首 token 平均/输出速度/本轮速度（估）/最近请求 TPS + token 明细）；缺失字段显示 —，持久化速度绝不用文本估算 |
-| 结构化提问 | 只读工具 `ask_user`：1-4 题、每题 2-4 选项、单选/多选 + 自定义输入；Kernel 挂起该轮并发出 `user_question`，UI 模态提交/跳过后把结构化答案作为 tool result 返回；停止生成会取消等待 |
-| 弹窗适配层 | `src/components/ui/dialog.tsx` 统一 Portal/Overlay/固定居中/z-index 与 default/form/panel/palette 变体；8 个弹窗全部迁移，业务类只保留内容排版 |
-| 消息操作 | 最终回答下方 Copy / ThumbsUp / ThumbsDown / 时间戳；点赞点踩为本地 UI 状态，不上报后端 |
-| 品牌 / 图标 | 双色 M MaestroLogo；Tauri 桌面图标由 `app-icon.svg` 生成（ico/icns/png/Square/StoreLogo） |
-| 国际化 | 默认 zh-CN；英文切换目前覆盖基础导航与设置标签，完整 i18n 仍在后续 |
-| Command Center | `Ctrl/Cmd+K` 顶部快速面板：命令 / 会话 / 文件模糊搜索、方向键导航、本地搜索历史 |
-| 会话列表 | 单行极简：状态点 + 标题 + 相对时间；轮数/#id/完整标题在 tooltip 与 aria-label；本地置顶与日期分组；置顶仅存 localStorage |
-| 计划 / 任务 | 计划卡待审批展开、已结案折叠；`update_plan` 任务步骤实时进入右侧 Tasks Tab，聊天区顶部显示“任务 N/M”胶囊；已完成步骤灰化+删除线 |
-| 消息操作 | 用户气泡下方 hover 显示复制/编辑；编辑把该轮 prompt 回填输入框并聚焦，不改写历史 |
-| 模型能力 / 会话统计 | 从 models.dev 目录读取 context 与 reasoning levels；智能配置自动匹配，高级配置可编辑输入类型/能力/推理等级/参数映射；Provider usage/计时，缺失用量标为估算；Composer 960px、正文 896px |
-| 主题 / 消息 | 实际 Dark/Light/System、Markdown 高亮与复制，本地图片/视频缩略图（不上传） |
-| Skills | `~/.maestro/skills/` + 项目 `.maestro/skills/` 双源扫描（项目覆盖全局；**项目源仅在工作区被显式信任后生效**，防止克隆仓库自带扩展自动注入），SKILL.md frontmatter 解析，新建（可选全局/项目）、删除、本地/GitHub 导入；模型经 `load_skill` 工具加载技能正文 |
-| MCP | 最小 stdio JSON-RPC 客户端（`~/.maestro/mcp.json`），启停子进程、`tools/list`/`tools/call`，工具以 `mcp__<server>__<tool>` 注入模型；`trust` 默认 false，只有显式信任的服务才允许 `readOnlyHint` 生效；Windows 自动解析 PATH 中的 `.cmd`/`.bat`（npx/npm 可用），支持 env、编辑配置；`auto_start` 默认 false，只有显式启用过的服务才在启动时恢复，失败只显示行内错误 |
-| 斜杠命令 | 输入 `/` 打开分组面板：内置动作（模式切换、新建会话、停止、设置、扩展、活动、审查面板、清空）、技能（`/skill-name` 生成 load_skill 指令）、`.maestro/commands/*.md` 自定义命令（frontmatter + `$ARGUMENTS`，项目覆盖全局）；↑/↓/Enter/Tab/Esc 键盘操作，展开结果先写入输入框再发送 |
-| 工具循环 | `ToolRouter` 统一注册内置/MCP 工具（标准 JSON Schema），`AgentLoop` 执行-续流，全程走模式授权与审计；同一批只读工具并行执行，写/命令保持串行；`spawn_subagent` 提供只读研究子智能体：`explore`/`general` 内置，`~/.maestro/agents/*.md` 与 `<workspace>/.maestro/agents/*.md` 可新增自定义 agent（项目覆盖全局、覆盖内置），子循环固定按 Plan 门禁执行，写文件与命令一律拒绝；每个子智能体有独立 trace（prompt/思考/工具/正文/用量），右侧「子智能体」面板可实时下钻并在重启后回看，子工具不再混入父时间线，最近 6 份报告（≤16KB）会注入后续轮次；子智能体支持 600s 超时（`MAESTRO_SUBAGENT_TIMEOUT` 可调）、20 次工具预算、轮次耗尽保留结论与单独停止；OpenCode 网关下每个子智能体使用独立 `x-opencode-session`，默认最多 3 个并行（`MAESTRO_MAX_SUBAGENTS` 可调）；模型连接按 opencode retry 策略自动退避重试 |
-| 滚动 | 流式期间自动贴底；用户上滑暂停、回底恢复；`requestAnimationFrame` + `ResizeObserver` 处理批量工具节点与折叠过渡 |
-| Activity | 项目级真实聚合：plans approved、run_metrics tokens（v10 起含 cache write/reasoning/attempts/TTFT）、每日 token 趋势；修改行数从接入后的 run_file_changes 统计，历史数据不回填；Cost 暂无真实价格显示 —；preview 仍为 Mock |
-| 变更卡 / 撤销 | 对话结束或手动停止后显示 ZCode 风格可折叠变更卡：summary 先行、展开懒加载明细、审查/打开；撤销走 preview(safe/unsafe/ignored) → apply，只回退安全文件，已撤销保留卡片 |
-| 侧栏对齐 | 导航、项目行、会话标题统一 x=46；行盒右边界 248，计数/时间戳 244；项目/会话操作按钮 absolute 悬浮，hover 不推挤内容 |
-
-**Workspace writes and commands are real, but gated by mode.** Plan is the backend default and read-only; Code applies write/patch directly and only suspends dangerous commands (rm -rf, format, git reset --hard, etc.), safe commands execute; Confirm suspends every tool call; Auto executes already-authorized tools directly. Approving a plan transitions the session from Plan to Code — the sanction to execute — while the finished run keeps its Plan identity in history. MCP tools honor the active mode and each server's `readOnlyHint` only after the user explicitly trusts that server; `load_skill` is a read-only skill loader. Legacy Execute is retained in historical records only.
+| **架构沙盘（规则编排）** | React Flow 节点图取代 YAML/静态门禁：Trigger（modify/read/command/plan/any）→ Requirement/Restriction/扩展节点（Skill·MCP·插件，必选项要求真实调用）→ Action（Block/Warn/Remind + 自定义拦截语）。事前拦截、事后验收欠账（还清前其他实质操作被拦、Run 结束被追问）、多路 fail 汇入同一 Action 时逐条列出全部未满足项（merge 语义）。DAG 校验、项目规则优先全局回退、`architecture_trace` 实时节点高亮；提示语留空自动按上游关卡派生、支持 `{call}`/`{target}` 占位符 |
+| **Provider 聊天** | OpenAI 兼容/Anthropic SSE 统一适配；reasoning/content Rust 侧分类，经单一 `kernel-event` 通道下发（32ms 窗口合并同 key token，前端再按 40ms tick 合并调度——流式高峰期不饿死 invoke 与懒加载） |
+| **工具循环与审批** | `ToolRouter` 统一注册内置/MCP 工具；Plan 只读、Code 写直接执行+危险命令审批、Confirm 全审、Auto 放行；只读调用并行、写/命令串行；拒绝原因回传模型；「始终允许」写入持久化规则库（可列出/撤销） |
+| **Skills / MCP / 命令** | `~/.maestro` + `<workspace>/.maestro` 双源（项目覆盖全局，项目源需显式信任工作区）；`load_skill` 真实加载；MCP stdio 客户端 `mcp__server__tool` 注入、trust/readOnlyHint 门禁；`/` 斜杠命令面板 |
+| **子智能体** | `spawn_subagent` 只读研究循环（内置 explore/general + 自定义 `.maestro/agents`），独立 trace 面板可下钻/回看，超时/预算/单独停止 |
+| **停止与队列** | 前端乐观终结 + 迟到 token 丢弃；停止期间输入入队，旧 run 终态后自动续跑；取消按 run_id 精确作用域，不误伤新 run |
+| **执行时间线** | reasoning/工具/正文按真实事件顺序穿插，连续项折叠为「已工作 X 秒」；running 块 markdown 用 `useDeferredValue`，陈旧帧不重解析 |
+| **会话与项目** | SQLite 持久化（专用 OS 线程 + 有界 mpsc，audit 已建索引）；多项目分组、归档/删除级联、异常中断恢复 |
+| **变更卡 / 撤销** | 轮级变更卡（summary 先行、明细含多次写入的累计净差），preview(safe/unsafe) → apply 只回退安全文件 |
+| **IDE 工作台** | 三栏可拖拽（rAF + CSS 变量），右侧 文件/变更/任务 Tab；`Ctrl/Cmd+K` 命令面板；Explorer Shiki 预览（只读限界 + in-flight 去重） |
 
 ## 快速开始
 
-### 1. 获取项目
+前端仅预览（无需 Rust/Key）：
 
 ```powershell
-git clone https://github.com/fenggezaici/Maestro-Agent.git
-Set-Location Maestro-Agent
+corepack.cmd enable pnpm && pnpm.cmd install --frozen-lockfile
+pnpm.cmd dev:ui        # → http://127.0.0.1:1420/?preview=1
 ```
 
-前端使用 **Node.js 24 + pnpm 12**，版本由 `packageManager` 和 `pnpm-lock.yaml` 固定。
-
-### 2. 只看前端 UI
-
-无需 Rust、WebView2 或 API Key：
+桌面客户端（需 Rust MSVC + VS C++ Build Tools + WebView2）：
 
 ```powershell
-corepack.cmd enable pnpm
-pnpm.cmd install --frozen-lockfile
-pnpm.cmd dev:ui
+pnpm.cmd tauri dev     # 启动后 Settings → Models 填 Provider/Key/Model
 ```
 
-自动打开 **http://127.0.0.1:1420/?preview=1**。这是隔离的本地 Mock 预览：可以切换项目、调整布局并创建模拟会话，但不能发送真实聊天或读取磁盘。
+## 安全边界
 
-如无法启用 pnpm shim，可直接使用 `corepack.cmd pnpm install --frozen-lockfile` 和 `corepack.cmd pnpm dev:ui`。非 PowerShell 环境可使用对应的 `pnpm` / `corepack` 命令。
+- API Key 走 Windows DPAPI，不落地 localStorage/数据库
+- Plan 模式拒绝一切副作用工具；`.maestro/` 项目扩展未信任不注入
+- Workspace 读取限界（路径/链接/扫描预算），敏感文件 denylist（`.env`/私钥/`.ssh` 等）对模型一律拒绝
+- `run_command` 只读白名单免审；shell 元字符/管道/重定向一律转审批
 
-### 3. 运行 Windows 桌面客户端
-
-另需 Rust MSVC 工具链、Visual Studio C++ Build Tools / Windows SDK，以及 WebView2 Runtime：
-
-```powershell
-pnpm.cmd tauri dev
-```
-
-进入左下角 **Settings → Models**，填写并保存：
-
-- **Provider / Base URL**：选择 OpenAI、DeepSeek、Anthropic 或 Ollama，独立保存配置；Rust 自动补全兼容端点或 Anthropic `/messages`。
-- **API Key**：服务提供的访问密钥；本地 Ollama 可为空，其他 Provider 不会复制已有 Key。
-- **Model**：该服务支持的模型名称。
-
-输入消息并发送，或按 **Ctrl/Cmd+Enter**。右侧 **Explorer** 在开发模式下默认浏览当前仓库，也可通过路径栏选择其他本地项目。
-
-更新 Rust 后，先关闭旧窗口、在启动终端按 Ctrl+C，再重新运行 `pnpm.cmd tauri dev`。当前开发与打包流程面向 Windows；其他平台尚未完成验证。
-
-动态思考能力、估算统计、本地附件和 v3 模式迁移的说明见 [核心交互与模型能力](docs/core-interactions.md)。
-
-## 安全与数据边界
-
-> **API Key 存入系统凭据保险库（Windows DPAPI，`CryptProtectData` 绑定当前用户），不再经过前端 localStorage；**前端只在保存时一次性提交给后端。仅建议优先配置 HTTPS 的私有网关。
-
-- 配置凭据不会主动写入会话数据库、审计或日志；模型错误文本会脱敏。
-- 会话数据库包含用户消息与模型回复，请视为私人数据。位置为 Tauri `app_data_dir()/maestro.sqlite3`。
-- 所有 SQLite 操作由 `maestro-sqlite` 专用 OS 线程独占，通过有界 `mpsc` 与异步调用者通信；不会在异步线程直接执行阻塞 SQL。
-- Rust 持有模式与运行授权；Plan Mode 拒绝副作用工具和未知名称，但允许应用内部会话/审计落库。
-- Workspace reads run separately in `spawn_blocking`, skip `.git`, `node_modules`, `target`, `__pycache__`, `venv` and `.venv`, and enforce path, link, scan-budget and file-size limits. The selected root is cloned before scanning, so long scans never hold the state lock; concurrent refreshes coalesce into at most one active scan plus one pending rerun, and same-path file reads share an in-flight request. The Explorer caches the last tree and refreshes on debounced `workspace_changed`.
-- System prompt tells the model that paths outside the selected workspace cannot be read: it must ask the user to copy/move the file into the workspace instead of probing the sandbox.
-- 文件浏览不会自动把内容发送给模型。只读检查不是完整 OS 沙箱；并发恶意文件系统下的残余 TOCTOU 风险见[工作区文档](docs/workspace-filesystem.md)。
-- 扩展数据存放于 `~/.maestro/`（`skills/`、`commands/`、`mcp.json`）。MCP 子进程以无 stderr 输出的 stdin/stdout 管道启动，20s 握手/30s 调用超时，应用退出时统一回收；Windows 下 `.cmd`/`.bat` 启动器经 `cmd /C` 解析，启用状态写入 `disabled` 并在下次启动时后台恢复；导入与 GitHub 克隆仅接受 HTTPS 地址且经路径校验。
-
-真实聊天上下文由 Rust 从指定会话的已完成记录重建，附加模式提示。前端使用带运行/会话 ID 与序号的 IPC 事件，避免串流和重复追加。
-
-## 技术架构
+## 架构
 
 ```text
-React 19 + TypeScript + Vite + Tailwind CSS 4
-  components (dumb) ← hooks ← zustand stores ← api/ (唯一 invoke/listen 边界)
-					  │ Tauri IPC: invoke + 单一 kernel-event 通道
-					  ▼
-commands/ (仅透传) → services/ (kernel · agent_loop · tool_router · extensions)
-	→ adapters/ (llm · mcp · fs · skills · db) → domain/ (纯类型与策略)
+React 19 + TS + Vite + Tailwind 4
+  components(dumb) ← hooks ← zustand stores ← api/(唯一 IPC 边界)
+                    │ invoke + 单 kernel-event 通道
+                    ▼
+commands/(透传) → services/(kernel·agent_loop·tool_router·extensions)
+  → adapters/(llm·mcp·fs·skills·db) → domain/(纯类型与策略)
 ```
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/api/` | 唯一 IPC 边界：types/kernel/sessions/extensions/workspace/dialog/models |
-| `src/stores/` | `useKernelStore`、`useWorkspaceStore`（zustand 全局状态与命令） |
-| `src/hooks/` | `useAgentStream`（事件订阅/重放/对齐）、`useKernel`、`useWorkspace`、`useExtensions`、`useStickyScroll`（rAF/ResizeObserver 贴底与用户上滑暂停） |
-| `src/lib/` | `conversation.ts` 纯函数：reducer、快照重放、reasoning/tool/content 时间线切分、会话拼装 |
-| `src/components/` | Dumb 组件（ChatStream、Composer、WorkbenchLayout 自定义 flex 分栏、ContextRing 等），只接 props 不碰 IPC |
-| `src/i18n.tsx` | 轻量 I18nProvider / useT，按语言提供统一文案字典 |
-| `src/preview/` | 与真实 IPC/凭据隔离的前端预览数据（不调 invoke/listen） |
-| `src-tauri/src/commands/` | IPC 接口层，仅参数透传与错误包装 |
-| `src-tauri/src/services/` | `kernel`（生命周期/事件/取消）、`agent_loop`（ReAct）、`tool_router`（统一注册/分发）、`extensions` |
-| `src-tauri/src/adapters/` | `llm/`（LlmProvider trait + SSE + OpenAI/Anthropic/catalog）、`mcp/`（config/transport/tools）、`fs/`（受限读）、`skills`、`db`（SQLite 线程/迁移） |
-| `src-tauri/src/domain/` | 纯类型与策略：session/message/plan/metrics/extension/policy/event/error |
-| `src-tauri/capabilities/`, `permissions/` | 本地主窗口的最小命令权限 |
+| `src/api/` | 唯一 invoke/listen 边界与 wire 类型 |
+| `src/stores/` | `useKernelStore`/`useWorkspaceStore` |
+| `src/lib/` | `conversation.ts`/`architectureGraph.ts`/`streamMerge.ts` 纯函数 |
+| `src/components/` | dumb 组件（ChatStream/Workbench/ArchitectureSandbox…） |
+| `src-tauri/src/commands/` | IPC 接口层（含 `debug_assertions` 注入面） |
+| `src-tauri/src/services/` | kernel 生命周期、agent_loop ReAct、tool_router、architecture |
+| `src-tauri/src/adapters/` | llm/mcp/fs/skills/db（SQLite 线程+迁移 v19） |
+| `src-tauri/src/domain/` | 纯类型：session/plan/metrics/architecture/policy/event |
 
 ## 测试与构建
 
 ```powershell
-pnpm.cmd build
-pnpm.cmd test
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+pnpm.cmd build && pnpm.cmd test            # 前端构建 + vitest
+cargo test --workspace                     # Rust 单测（db/architecture/kernel…）
+node scripts/e2e-preview.mjs               # ?preview=1 Chromium 冒烟
+node scripts/e2e-desktop.mjs               # 真实 exe + WebDriver（含流式洪水回归）
+cargo build --features tauri/test          # e2e-desktop 前置
 ```
 
-Rust 测试包含本地 OpenAI 兼容 SSE 服务、取消/错误、会话恢复，以及真实目录与 Windows junction 场景；不需要云端 API Key。前端组件测试与浏览器截图检查不等于完整原生 UI 验收。
+本地一键门禁：`corepack pnpm verify:fast` / `verify` / `verify:desktop`。
 
-生成可重复的 Mock 截图：
+## 文档
 
-```powershell
-pnpm.cmd exec playwright install chromium
-pnpm.cmd screenshot
-```
-
-Chromium 仅是开发测试工具，不进入桌面运行时，也不引入 Electron。原生生命周期检查可使用 `scripts/smoke-desktop.ps1 -NativeOnly`；完整模型 UI 测试需要有效配置及显式 `-AllowModelRequest`，可能产生费用。
-
-Windows 打包：
-
-```powershell
-pnpm.cmd tauri build
-```
-
-NSIS 输出位于 `target/release/bundle/nsis/`。优先复用系统 WebView2，缺失时下载 bootstrapper，不捆绑完整 Chromium。打包工具缓存位于 `target/.tauri/`。安装包大小和内存占用请以当前版本实测为准；低内存目标尚未完成验收。
-
-## 本地 CI
-
-远端 GitHub Actions 暂未启用（`.github/workflows/ci.yml` 仅作参考）。日常校验使用本地一键门禁：
-
-| 命令 | 内容 | 典型耗时 |
-| --- | --- | --- |
-| `corepack pnpm verify:fast` | 前端测试 + 构建 | ~35s |
-| `corepack pnpm verify` | 前端测试/构建 + `cargo clippy -D warnings` + `cargo test --workspace` + preview E2E | ~2 分钟 |
-| `corepack pnpm verify:desktop` | 上述全部 + 真实 IPC 桌面 E2E | 约多 1 分钟 |
-
-- `scripts/ci.mjs` 会用 `vswhere` 找到 VS 并 `call vcvars64.bat`，因此在 Git Bash / PowerShell 里都能直接跑 `cargo`，不需要手工开 DevShell。
-- 可选 pre-push 钩子：`node scripts/install-git-hooks.mjs`（推送前跑 `verify:fast`，`git push --no-verify` 可临时跳过）。
-- CI 不需要任何 secrets：E2E 使用本地假 provider，Rust/前端测试使用 stub，不接触真实凭据。
-
-## 文档与后续方向
-
-- [真实模型配置、重启与流式协议](docs/llm-streaming.md)
-- [工作区文件读取和安全限制](docs/workspace-filesystem.md)
-- [IDE UI 控件与预览边界](docs/ide-ui-upgrade.md)
-- [UI 设计、Activity 与截图](docs/ui-redesign.md)
-- [初始阶段验证记录（历史）](docs/verification.md)
-
-## Code 模式只读命令白名单
-
-`run_command` 在 Code 模式下默认挂起审批。只有同时满足以下三层的命令才免审执行，且**不经过 shell**（解析成 argv 后直接 spawn 已解析的绝对路径）：
-
-1. 程序名命中白名单，且是裸名字（`C:\...\git.exe`、`./git` 一律不认）。
-2. 子命令命中该程序允许的只读子命令。
-3. 每一个 `-` 参数都在该子命令的显式参数表内。
-
-| 程序 | 允许的只读子命令 / 参数 |
-| --- | --- |
-| `git` | `status` `diff` `log` `show` `rev-parse` `ls-files` `blame` `describe` `shortlog` `branch`（仅列表）`config`（仅 `--get`/`--get-all`/`--list`）`tag`（仅 `-l`/`-n` 列表）`remote`（仅 `-v`/`get-url`）`stash`（仅 `list`/`show`）`grep` 及各自的显式 flag 表 |
-| `rg` | `-n` `-i` `-l` `-c` `-S` `-w` `-F` `--files` `--hidden` `--no-heading` 与 `-g/-t/-e/-A/-B/-C/-m/--max-depth`（带值） |
-| `cat` `head` `tail` `wc` `more` `ls` `tree` `fd` `grep` | 各自的只读 flag 表；位置参数必须是工作区相对路径（绝对路径、`..`、盘符一律转审批） |
-| `pwd` `ver` `hostname` `whoami` `echo` | 无文件副作用（`pwd`/`ver`/`hostname`/`whoami` 不接受参数） |
-| `where` `which` | 仅位置参数（`/R`、`-x` 等开关需审批） |
-| `node` `npm` `python` `cargo` `go` 等版本探测 | 仅 `-v`/`-V`/`--version`/`version` 单参数 |
-
-`-rn`/`-la` 这类合并短旗标按每个字符逐项校验，必须全部是已登记的非取值旗标。
-
-安全边界：
-
-- 命令中任何 shell 元字符（`&`、`|`、`;`、`<`、`>`、`^`、`%`、`$`、反引号、`(`、`)`、`{`、`}`、`[`、`]`、`*`、`?`、`~`、`!`、`#`）或换行都会被拒 → 管道、重定向、命令替换、`%PATH%`、通配符全部转为审批。
-- `git` 的第一个参数必须是子命令，`git -c core.pager=calc diff` 这类全局选项需要审批；`git diff --output=…`、`git log --format=…` 同样需要审批。
-- 白名单命令只在 `PATH` 中解析，跳过空条目（Windows 上等价当前目录）与落在工作区内的同名文件，防止仓库内放一个 `git.exe` 劫持。
-- `git` 额外注入 `GIT_PAGER=cat`、`GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0`，避免分页阻塞与索引刷新写入。
-- 命中白名单的调用在审计里记为 `read-only allowlist`，与 `auto-approved` / `user approved` / `extension` 区分。
+- [核心交互与模型能力](docs/core-interactions.md)
+- [流式协议](docs/llm-streaming.md) · [工作区文件边界](docs/workspace-filesystem.md) · [UI 规范](docs/ui-redesign.md)
 
 ## Roadmap
 
-已完成：
-
-- 真实模型聊天、工具循环、Skills/MCP、只读 Explorer、写入/命令审批
-- `ask_user` 结构化提问（1-4 题、选项 + 自定义输入）、`update_plan` 任务追踪、Tasks Tab、任务胶囊
-- Code 模式写自动、只读白名单命令免审、其余命令审批
-- 只读子智能体（内置 explore/general + 自定义 agent 全局/项目双源）、只读工具并发
-- 斜杠命令（内置动作 + 技能 + `.maestro/commands` 自定义命令）
-- 子智能体 trace 持久化、右侧下钻、跨轮报告、超时/用量/单独停止
-- MCP 跨重启恢复、env 配置与 Windows `.cmd` 启动器支持
-- 模型目录 reasoning levels、智能/高级模型配置
-- opencode 风格连接重试、provider-only tok/s
-- ZCode 轻量 Diff、变更卡、preview/apply 撤销
-- Activity 项目级真实聚合（历史行数不回填）
-- 右侧 rAF 分栏、停止后输入队列、侧栏对齐
-- 统一 Dialog 适配层（8 个弹窗，Portal/Overlay/固定居中/变体）
-- DeepSeek Harness StatsLine 统计（轮/步·tok/s·tok·缓存命中·上下文）与 run_metrics v15 持久化（成对 decode/ttft_steps/tool_ms，旧行近似回退不回填）
-- 工具审批 allow-once / allow-always / deny feedback（会话级规则、命令前缀/精确命令）
-- 中断/失败轮次上下文回放（部分输出 + 工具动作摘要），同一会话继续追问不丢工作记忆
-- ZCode 风格 context_compaction：80% 自动触发、`/compact` 手动触发、持久摘要与 pre/post token 分隔行
-- run 内工具消息持久化与回放（v12），同一 session 新 run 不再丢失上一轮工具上下文
-- ZCode 风格 reasoning/content chunk 合并（32ms/512 字符），长思考不再每 token 重渲染
-- Anthropic 协议修复：多 system 消息合并进 `system` 字段、thinking 块（含 signature）持久化回传、工具轮 assistant 正文保留、压缩切分不产生孤儿 tool 消息、`finish_reason` 透出并标记 `length` 截断
-- Run 级 workspace root 快照：run 期间切换 Explorer 目录不会重定向在途工具执行与撤销
-- 项目 `.maestro/` 扩展信任门槛：agents/skills/commands 仅在显式信任工作区后扫描与注入（持久化 `trusted_workspaces`，前端信任横幅）
-- 敏感文件 denylist：`.env`（除 example/sample/template 等模板）、私钥与凭据扩展名、`.ssh`/`.gnupg`/`.aws`/`.docker`/`.kube` 目录对模型读/写/删除一律拒绝
-- 只读搜索工具 `glob_files`/`grep_files`（全模式可用、工作区限界、敏感文件感知），`read_file` 支持 `offset`/`limit` 行窗口与行号
-- 写工具 read-before-write 与陈旧内容检测（外部修改拒绝覆写），`apply_patch` 多 hunk
-- `run_command` 模型可调 `timeout_ms`（1s–600s）与 `background` 后台任务（`task_output`/`task_stop` 管理）
-- 只读命令白名单扩充：文件读取类（cat/head/tail/wc/ls/tree/fd/grep/more）、系统探测（pwd/ver/hostname/whoami/echo）、版本探测（node/npm/python/cargo/go… 仅 -v/--version）、git 追加 `tag`/`remote`/`stash`/`grep` 只读子命令
-- 审批逐调用决定；始终允许写入 SQLite 持久化规则（可列出/撤销），重启后仍生效
-- 计划批准触发 Plan→Code 会话迁移（持久化 `record_mode` + `ModeChanged` 事件）
-- Anthropic `cache_control` 断点（system/tools/消息尾部共 3 个 ephemeral），cache read/write 用量已入 run_metrics
-- 压缩改为 provider usage 口径（`input + max_output ≥ 90%·window`，无样本回落字符估算 80%）；microcompact 先裁剪陈旧工具结果；summarize 连续失败 3 次熔断改启发式摘要
-
-后续重点：
-
-- 可写子智能体（按工具授权 + 独立审批）、子会话目录与侧栏
-- Activity 费用估算（接入模型价格表）与历史行数回填
-- 完整中英文 i18n 与消息目录
-- 模型文件上下文授权、执行前基线核验
-- 自动任务、附件后端与系统凭据保护
+- 可写子智能体（独立授权+审批）、Activity 费用估算、完整 i18n、自动任务
 
 ## License
 
-当前仓库尚未指定项目许可证；公开源码不等于授权自由使用、修改或再分发。依赖组件遵循各自许可证。
+当前仓库尚未指定项目许可证；公开源码不等于授权自由使用、修改或再分发。

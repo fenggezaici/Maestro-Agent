@@ -50,6 +50,7 @@ export function kernelReducer(state: Snapshot, action: KernelAction): Snapshot {
     case 'user_question':
     case 'reasoning': return next;
     case 'metrics': return next;
+    case 'architecture_trace': return next;
   }
 }
 
@@ -201,13 +202,20 @@ export interface ReviewFile {
   runId?: number;
   exists?: boolean;
   tool?: string;
+  /// Full-content counts from the kernel (before/after may be truncated).
+  added?: number;
+  removed?: number;
+  /// Cumulative net diff for the run (first before → latest after); matches the
+  /// summary card's merged counts, present even when before/after are truncated.
+  netAdded?: number;
+  netRemoved?: number;
 }
 
-function writeResult(detail: string): { path: string; before: string; after: string } | null {
+function writeResult(detail: string): { path: string; before: string; after: string; added?: number; removed?: number; netAdded?: number; netRemoved?: number } | null {
   try {
-    const value = JSON.parse(detail) as { kind?: string; path?: string; before?: string; after?: string };
+    const value = JSON.parse(detail) as { kind?: string; path?: string; before?: string; after?: string; added?: number; removed?: number; net_added?: number; net_removed?: number };
     return value.kind === 'write_result' && typeof value.before === 'string' && typeof value.after === 'string'
-      ? { path: value.path ?? '', before: value.before, after: value.after }
+      ? { path: value.path ?? '', before: value.before, after: value.after, added: value.added, removed: value.removed, netAdded: value.net_added, netRemoved: value.net_removed }
       : null;
   } catch {
     return null;
@@ -216,10 +224,13 @@ function writeResult(detail: string): { path: string; before: string; after: str
 
 /// Flatten every diff-shaped thing the run produced into one ordered list —
 /// pending write beats applied beats proposal for the same path.
+/// `runId` scopes applied rows to the summary run: liveTools accumulates every
+/// run of the session, and the card counts only one run's DB records.
 export function reviewFiles(input: {
   liveTools: Record<number, ToolCallView[]> | undefined;
   pending: PendingApprovalView | null;
   plans: { id: number; draft: { diffs: { path: string; before: string; after: string }[] } }[];
+  runId?: number | null;
 }): ReviewFile[] {
   const files: ReviewFile[] = [];
   const seen = new Set<string>();
@@ -231,21 +242,21 @@ export function reviewFiles(input: {
     push({ path: preview.path, before: preview.old, after: preview.new, status: 'pending', runId: input.pending.runId, exists: preview.exists, tool: input.pending.tool });
   }
   const appliedByPath = new Map<string, number>();
-  for (const calls of Object.values(input.liveTools ?? {})) {
-    for (const call of calls) {
-      if (!call.allowed || call.pending || call.awaitingApproval) continue;
-      const result = writeResult(call.detail);
-      if (!result) continue;
-      // Same path written repeatedly → merge into a cumulative diff
-      // (first before → latest after) so the panel never goes stale.
-      const previous = appliedByPath.get(result.path);
-      if (previous !== undefined) {
-        files[previous] = { ...files[previous], after: result.after, runId: call.runId };
-      } else if (!seen.has(result.path)) {
-        seen.add(result.path);
-        appliedByPath.set(result.path, files.length);
-        files.push({ path: result.path, before: result.before, after: result.after, status: 'applied', runId: call.runId, tool: call.tool });
-      }
+  for (const call of input.runId != null ? input.liveTools?.[input.runId] ?? [] : []) {
+    if (!call.allowed || call.pending || call.awaitingApproval) continue;
+    const result = writeResult(call.detail);
+    if (!result) continue;
+    // Same path written repeatedly → merge into a cumulative diff
+    // (first before → latest after) so the panel never goes stale.
+    const previous = appliedByPath.get(result.path);
+    if (previous !== undefined) {
+      // Per-write counts no longer apply to a merged row; the kernel's
+      // cumulative net counts do — they survive before/after truncation.
+      files[previous] = { ...files[previous], after: result.after, runId: call.runId, added: undefined, removed: undefined, netAdded: result.netAdded, netRemoved: result.netRemoved };
+    } else if (!seen.has(result.path)) {
+      seen.add(result.path);
+      appliedByPath.set(result.path, files.length);
+      files.push({ path: result.path, before: result.before, after: result.after, status: 'applied', runId: call.runId, tool: call.tool, added: result.added, removed: result.removed, netAdded: result.netAdded, netRemoved: result.netRemoved });
     }
   }
   for (const plan of input.plans) {
@@ -284,6 +295,21 @@ export function conversationRuns(detail: SessionDetail | null, sessionId: number
     if (run?.sessionId === sessionId) runs.set(run.id, run);
   }
   return [...runs.values()].sort((left, right) => left.id - right.id);
+}
+
+/// The change-summary card must only reflect a run that belongs to the
+/// selected session: snapshot.activeRun/lastRun are global (cross-session),
+/// so they are valid candidates only when scoped to this session. A fresh
+/// session or another project's session yields null — no card.
+export function pickSummaryRun(input: {
+  activeRun: RunView | null;
+  lastRun: RunView | null;
+  runs: RunView[];
+  sessionId: number | null;
+}): RunView | null {
+  const { activeRun, lastRun, runs, sessionId } = input;
+  const scoped = (run: RunView | null) => (run?.sessionId === sessionId ? run : null);
+  return scoped(activeRun) ?? scoped(lastRun) ?? runs.at(-1) ?? null;
 }
 
 export function chatMessages(runs: RunView[], sessionId: number, prompt: string, images?: string[]): ChatMessage[] {

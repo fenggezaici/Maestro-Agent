@@ -8,4 +8,5 @@ pub mod exec;
 pub mod fs;
 pub mod llm;
 pub mod mcp;
+pub mod plugins;
 pub mod skills;

@@ -2,7 +2,7 @@
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
 import { useEffect, useImperativeHandle, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type Ref, type RefObject, type SetStateAction } from 'react';
 import * as Popover from '@radix-ui/react-popover';
-import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, Search, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, Search, ShieldAlert, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
 import type { PendingApprovalView } from '../lib/conversation';
 
 import type { Mode, RunMetrics, RunView } from '../api/types';
@@ -35,13 +35,15 @@ export interface ComposerHandle { setText: (text: string) => void; clear: () => 
 /// back into Workbench state, which would re-render the shell on every keystroke.
 let draftCache = '';
 
-function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, slash, sessionId }: {
+function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAttachmentsChange, blocked, architectureWarning, preview, mode, onSetMode, currentProject, projects, onSelectProject, onSetProjectPath, onBrowse, onNewProject, preferences, onPreferences, settingsVersion, onError, onCapability, running, pending, onCancel, runs, metrics, context, modelLabel, status, slash, sessionId }: {
   atBottom: boolean;
   onScrollBottom: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>, value: string) => boolean | Promise<boolean>;
   attachments: LocalAttachment[];
   onAttachmentsChange: Dispatch<SetStateAction<LocalAttachment[]>>;
   blocked: boolean;
+  /** 架构沙盘规则拦截反馈（红色警告，展示在输入框上方）。 */
+  architectureWarning?: string | null;
   preview: boolean;
   mode: Mode;
   onSetMode: (mode: Mode) => void;
@@ -162,7 +164,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
     promptInput.current?.focus();
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={(event) => {
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{architectureWarning && <div className="composer-architecture-warning" role="alert"><ShieldAlert size={14} /><span><strong>架构规则拦截：</strong>{architectureWarning}</span></div>}{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={(event) => {
       const accepted = onSubmit(event, draft);
       if (typeof accepted === 'boolean') { if (accepted) setDraft(''); return; }
       void accepted.then((ok) => { if (ok) setDraft(''); });
