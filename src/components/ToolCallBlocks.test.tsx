@@ -61,6 +61,23 @@ it('defaults non-command tools to a single exact rule in the dropdown', async ()
   expect(onResolveApproval).toHaveBeenCalledWith(7, 'allow_always', 'exact');
 });
 
+it('offers batch and session decisions for a suspended command', async () => {
+  const onResolveApproval = vi.fn();
+  render(<ToolCallRow call={awaiting({})} onResolveApproval={onResolveApproval} />);
+
+  const menu = await openApprovalMenu();
+  fireEvent.click(within(menu).getByText('本批全部允许'));
+  expect(onResolveApproval).toHaveBeenCalledWith(7, 'allow_batch');
+
+  const menu2 = await openApprovalMenu();
+  fireEvent.click(within(menu2).getByText('本会话全部放行'));
+  expect(onResolveApproval).toHaveBeenCalledWith(7, 'allow_session');
+
+  const menu3 = await openApprovalMenu();
+  fireEvent.click(within(menu3).getByText('本批全部拒绝'));
+  expect(onResolveApproval).toHaveBeenCalledWith(7, 'deny_batch');
+});
+
 it('lists session rules and revokes one', async () => {
   listApprovalRules.mockResolvedValue([
     { tool: 'run_command', pattern: 'npm', prefix: true },

@@ -44,11 +44,11 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
       catch (error) { setBindingError(error instanceof Error ? error.message : '无效快捷键'); }
     }}>
       <div className="settings-rail"><DialogTitle><Settings2 size={17} />{text.settings}</DialogTitle>
-        <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{(text as Record<string, string>)[id === 'agents' ? 'subagents' : id]}</button>)}</nav>
+        <nav aria-label="设置分类">{sections.map(({ id, icon: Icon }) => <button type="button" key={id} className="settings-nav-item" aria-current={section === id ? 'page' : undefined} onClick={() => { setSection(id); setCapture(null); }}><Icon size={15} />{String(text[(id === 'agents' ? 'subagents' : id) as keyof typeof text] ?? id)}</button>)}</nav>
         <span className="settings-version">MAESTRO / 桌面版</span>
       </div>
       <div className="settings-content"><DialogDescription className="settings-intro">{preview ? '前端预览 · 无真实配置读取或执行' : '连接配置与思考强度真实保存；上下文为模型能力参考，实际限制以服务端为准。'}</DialogDescription>
-        <h3>{(text as Record<string, string>)[section === 'agents' ? 'subagents' : section]}</h3>
+        <h3>{String(text[(section === 'agents' ? 'subagents' : section) as keyof typeof text] ?? section)}</h3>
         <div hidden={section !== 'general'}>
           <div className="preference-row"><div><strong>语言</strong><p>前端导航与设置标签</p></div><Choice label="界面语言" value={preferences.language} onChange={(value) => update({ language: value as UiPreferences['language'] })} options={[{ value: 'en', label: 'English' }, { value: 'zh-CN', label: '简体中文' }]} /></div>
           <div className="preference-row"><div><strong>启动视图</strong><p>下次打开时的工作区视图，不是 OS 自启动</p></div><Choice label="启动视图" value={preferences.startupView} onChange={(value) => update({ startupView: value as UiPreferences['startupView'] })} options={[{ value: 'agents', label: '会话' }, { value: 'activity', label: '活动' }, { value: 'extensions', label: '扩展' }]} /></div>

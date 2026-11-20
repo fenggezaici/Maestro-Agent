@@ -384,8 +384,12 @@
 .dialog-content-palette { top: 76px; transform: translateX(-50%); z-index: 121; width: min(560px, calc(100vw - 32px)); max-height: min(480px, calc(100dvh - 110px)); }
 .dialog-content .dialog-close { position: absolute; top: 12px; right: 12px; }
 
-.approval-menu { min-width: 230px; }
+/* ZCode 式窄审批菜单：固定宽度，长命令 pattern 在第二行截断。 */
+.approval-menu { width: 300px; }
 .approval-menu .dropdown-item { flex-wrap: wrap; }
+.approval-menu-item { flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 2px; }
+.approval-menu-title { color: var(--color-foreground); }
+.approval-menu-hint { color: var(--color-foreground-subtlest); font-size: var(--text-ui-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .approval-menu-pattern { flex-basis: 100%; color: var(--color-foreground-subtlest); font-family: var(--code-font); font-size: var(--text-ui-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dropdown-separator { height: 1px; margin: 4px -4px; background: var(--color-border); }
 .approval-rules-list { display: grid; gap: 8px; max-height: 320px; overflow: auto; }

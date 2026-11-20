@@ -67,6 +67,8 @@ export interface CapabilityOverride {
   reasoning?: ReasoningKind;
   reasoningLevels?: string[];
   reasoningMapping?: string;
+  /// 高级配置「输入类型」芯片；含 'image' 时放行视觉附件。
+  inputTypes?: string[];
 }
 
 export function capabilityOverrides(provider: ProviderId | (string & {})): Record<string, CapabilityOverride> {
@@ -74,8 +76,8 @@ export function capabilityOverrides(provider: ProviderId | (string & {})): Recor
   // enabled rows contribute overrides.
   const map: Record<string, CapabilityOverride> = {};
   for (const item of readProviderModels(provider)) {
-    if (item.enabled && (item.context !== undefined || item.reasoning !== undefined)) {
-      map[item.id] = { context: item.context, reasoning: item.reasoning, reasoningLevels: item.reasoningLevels, reasoningMapping: item.reasoningMapping };
+    if (item.enabled && (item.context !== undefined || item.reasoning !== undefined || item.inputTypes !== undefined)) {
+      map[item.id] = { context: item.context, reasoning: item.reasoning, reasoningLevels: item.reasoningLevels, reasoningMapping: item.reasoningMapping, inputTypes: item.inputTypes };
     }
   }
   return map;
@@ -127,6 +129,8 @@ export function resolveCapability(model: string, provider: ProviderId | (string 
     referenceContext: base.referenceContext,
     thinking,
     reasoning,
-    vision: base.vision,
+    // 用户在高级配置里显式勾选过输入类型时以勾选为准（含显式去掉 image），
+    // 否则回落内置静态表——未知模型不猜、只靠用户配置或静态表。
+    vision: override?.inputTypes ? override.inputTypes.includes('image') : base.vision,
   };
 }

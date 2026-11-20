@@ -1,15 +1,24 @@
-//! Strict allowlist for read-only commands in Code mode.
+//! Command classification for Code mode (ZCode 「自主模式」/ guarded semantics):
+//! commands run without asking unless a danger rule hits.
 //!
-//! This is an **allow** list, not a deny list: a command runs without approval
-//! only when its program, its subcommand and every flag are listed here.
-//! Everything else falls back to the normal per-call approval — the previous
-//! keyword blacklist was removed precisely because it could not bound
-//! `cmd /C` (pipes, indirection, argument variants).
+//! Three tiers:
+//! - [`CommandPolicy::ReadOnly`]: a strict **allow** list — program, subcommand
+//!   and every flag must be listed. These execute **without a shell** as a
+//!   parsed argv, so quoting/expansion never happens.
+//! - [`CommandPolicy::Auto`]: nothing dangerous matched — run through the
+//!   platform shell without prompting (`python run_tests.py`, `npm test`…).
+//! - [`CommandPolicy::Dangerous`]: a segment matched the risk classifier —
+//!   suspend for approval.
 //!
-//! A command accepted here is executed **without a shell**, as a parsed argv,
-//! so shell quoting/expansion never happens. The parser is still conservative
-//! about metacharacters: they are rejected outright so a future change that
-//! reintroduces a shell cannot turn an accepted command into a compound one.
+//! The risk classifier is **best-effort**, not a security boundary: a blacklist
+//! cannot bound `cmd /C` (indirection, argument variants), so nested executors
+//! (shells, `-c`/`-e` inline code, `xargs`, `for`…) always ask — that is the
+//! largest bounded backstop. Everything else errs toward the user's habit of
+//! rarely being interrupted.
+//!
+//! The read-only parser is still conservative about metacharacters: they are
+//! rejected outright so a future change that reintroduces a shell cannot turn
+//! an accepted command into a compound one.
 
 /// Same ceiling as the exec adapter: longer strings are never parsed.
 const MAX_COMMAND_CHARS: usize = 4096;
@@ -26,54 +35,83 @@ const SHELL_METACHARS: &[char] = &[
 pub enum CommandPolicy {
     /// Parsed and allowlisted: run directly (no shell) with these arguments.
     ReadOnly { program: String, args: Vec<String> },
-    /// Everything else: suspend for approval and run through the platform shell.
-    NeedsApproval,
+    /// 自主放行：没有命中危险规则——走平台 shell 执行，无需审批。
+    Auto,
+    /// 命中危险规则：挂起等待审批，批准后走平台 shell 执行。
+    Dangerous,
 }
 
 /// Classify one `run_command` string.
 pub fn parse(command: &str) -> CommandPolicy {
     if command.len() > MAX_COMMAND_CHARS {
-        return CommandPolicy::NeedsApproval;
+        return CommandPolicy::Dangerous;
     }
-    let Some(tokens) = tokenize(command) else {
-        return CommandPolicy::NeedsApproval;
-    };
-    let Some(program) = program_name(&tokens[0]) else {
-        return CommandPolicy::NeedsApproval;
-    };
-    let args = &tokens[1..];
-    let safe = match program.as_str() {
-        "git" => git_args(args),
-        "rg" => args_match(args, RG_FLAGS, true) && positionals_are_relative(args),
-        "fd" => args_match(args, FD_FLAGS, true) && positionals_are_relative(args),
-        "grep" => args_match(args, GREP_FLAGS, true) && positionals_are_relative(args),
-        "cat" => args_match(args, CAT_FLAGS, true) && positionals_are_relative(args),
-        "head" | "tail" => args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args),
-        "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
-        "more" => positionals_are_relative(args) && args.iter().all(|arg| !arg.starts_with('-')),
-        "ls" => args_match(args, LS_FLAGS, true) && positionals_are_relative(args),
-        "tree" => args_match(args, TREE_FLAGS, true) && positionals_are_relative(args),
-        "pwd" | "ver" | "hostname" | "whoami" => args.is_empty(),
-        "echo" => true,
-        "which" | "where" => where_args(args),
-        // Version probes only: `npm -v` is safe, `npm <anything-else>` is not.
-        "node" | "npm" | "python" | "python3" | "pip" | "pip3" | "cargo" | "rustc"
-        | "go" | "dotnet" | "java" | "javac" | "php" | "ruby" | "deno" | "bun"
-        | "pnpm" | "yarn" | "cmake" | "tsc" | "sqlite3" => {
-            matches!(args, [arg] if matches!(arg.as_str(), "-v" | "-V" | "--version" | "version"))
+    if let Some(tokens) = tokenize(command) {
+        if let Some(program) = program_name(&tokens[0]) {
+            let args = &tokens[1..];
+            let safe = match program.as_str() {
+                "git" => git_args(args),
+                "rg" => args_match(args, RG_FLAGS, true) && positionals_are_relative(args),
+                "fd" => args_match(args, FD_FLAGS, true) && positionals_are_relative(args),
+                "grep" => args_match(args, GREP_FLAGS, true) && positionals_are_relative(args),
+                "cat" => args_match(args, CAT_FLAGS, true) && positionals_are_relative(args),
+                "head" | "tail" => {
+                    args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args)
+                }
+                "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
+                "more" => {
+                    positionals_are_relative(args) && args.iter().all(|arg| !arg.starts_with('-'))
+                }
+                "ls" => args_match(args, LS_FLAGS, true) && positionals_are_relative(args),
+                "tree" => args_match(args, TREE_FLAGS, true) && positionals_are_relative(args),
+                "pwd" | "ver" | "hostname" | "whoami" => args.is_empty(),
+                "echo" => true,
+                "which" | "where" => where_args(args),
+                // Version probes only.
+                "node" | "npm" | "python" | "python3" | "pip" | "pip3" | "cargo" | "rustc"
+                | "go" | "dotnet" | "java" | "javac" | "php" | "ruby" | "deno" | "bun"
+                | "pnpm" | "yarn" | "cmake" | "tsc" | "sqlite3" => {
+                    matches!(args, [arg] if matches!(arg.as_str(), "-v" | "-V" | "--version" | "version"))
+                }
+                _ => false,
+            };
+            if safe {
+                return CommandPolicy::ReadOnly { program, args: args.to_vec() };
+            }
         }
-        _ => false,
-    };
-    if safe {
-        CommandPolicy::ReadOnly { program, args: args.to_vec() }
+    }
+    if is_dangerous(command) {
+        CommandPolicy::Dangerous
     } else {
-        CommandPolicy::NeedsApproval
+        CommandPolicy::Auto
     }
 }
 
-/// Convenience wrapper for the mode gate and the audit trail.
+/// Read-only allowlist check — also selects the no-shell exec path and the
+/// audit label. Mode gating uses [`is_dangerous`] instead.
 pub fn is_read_only_safe(command: &str) -> bool {
     matches!(parse(command), CommandPolicy::ReadOnly { .. })
+}
+
+/// 自主模式（ZCode guarded）的风险分类：命令不命中危险规则即放行。
+/// 对**原始命令串**做段级分析——复合命令的每一段独立判定。
+pub fn is_dangerous(command: &str) -> bool {
+    if command.len() > MAX_COMMAND_CHARS {
+        return true;
+    }
+    // `$(...)` / 反引号命令替换可在任意参数里藏一整条命令。
+    if command.contains("$(") || command.contains('`') {
+        return true;
+    }
+    let mut saw_segment = false;
+    for segment in segments(command) {
+        saw_segment = true;
+        if segment_is_dangerous(&segment) {
+            return true;
+        }
+    }
+    // 空命令（只有分隔符/空白）：无法分类 = 按有风险处理。
+    !saw_segment
 }
 
 /// Split on spaces, honouring single/double quotes, and refuse anything a
@@ -142,6 +180,377 @@ fn program_name(token: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+// ====================== 自主模式风险分类 ======================
+//
+// 对原始命令串按未加引号的 shell 分隔符切段（`&&` `||` `;` `|` `&` `<` `>`
+// `^` 换行），逐段判定。`>`/`<` 同样切开：下一段就是重定向目标，越界目标
+// 会被通用路径检查拦下（`echo x > ../f`）。
+
+fn segments(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) => {
+                current.push(ch);
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '&' | '|' | ';' | '<' | '>' | '^' | '\n' | '\r' => {
+                    // 折叠成双的分隔符：`&&` `||` `>>` `2>&1` 的后半。
+                    if matches!(chars.peek(), Some('&') | Some('|') | Some('>')) {
+                        chars.next();
+                    }
+                    if !current.trim().is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// 段内分词：与 [`tokenize`] 不同，引号内的元字符按字面保留（它们只对
+/// shell 有意义，shell 拿到的本就是整段原文）。引号不配对/控制字符返回
+/// None —— 调用方按"无法分类 = 有风险"处理。
+fn lex(segment: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    for ch in segment.chars() {
+        if ch.is_control() {
+            return None;
+        }
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                    started = true;
+                } else if ch.is_whitespace() {
+                    if started {
+                        tokens.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                } else {
+                    current.push(ch);
+                    started = true;
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else { return false };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 包装命令前缀：`time rm -rf x` 的真实程序是 `rm`。
+const BENIGN_PREFIXES: &[&str] = &[
+    "time", "nice", "nohup", "ionice", "stdbuf", "chrt", "taskset", "timeout",
+    "caffeinate", "arch",
+];
+
+/// 嵌套执行器：载荷无法用程序名分类，一律询问（黑名单式分类的最大兜底）。
+const NESTED_EXECUTORS: &[&str] = &[
+    "cmd", "powershell", "pwsh", "sh", "bash", "zsh", "csh", "tcsh", "fish",
+    "ksh", "dash", "wsl", "eval", "exec", "call", "source", "command",
+    "builtin", "coproc", "for", "forfiles", "xargs", "watch", "env", "expect",
+    "start", "invoke-expression", "iex", "screen", "tmux",
+];
+
+/// 内联代码载荷标志：`python -c`、`node -e`、`php -r`、`deno eval` 等。
+const INTERPRETERS: &[&str] = &[
+    "python", "python3", "py", "node", "deno", "bun", "ruby", "perl", "php",
+    "lua", "julia", "rscript", "osascript", "tclsh", "groovy",
+];
+
+fn inline_code(program: &str, args: &[String]) -> bool {
+    INTERPRETERS.contains(&program)
+        && args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-c" | "-e" | "-r" | "-E" | "eval" | "--eval" | "-eval"
+                    | "-command" | "-encodedcommand" | "-enc" | "-ec"
+            )
+        })
+}
+
+/// 程序名命中即危险（无需看参数）。
+const DANGEROUS_PROGRAMS: &[&str] = &[
+    // 删除/破坏
+    "rm", "del", "erase", "rd", "rmdir", "unlink", "shred", "srm", "wipe",
+    "sfill", "sdelete", "eraser", "eraserd",
+    // 磁盘/文件系统/引导
+    "format", "mkfs", "fdisk", "sfdisk", "parted", "gdisk", "diskpart",
+    "diskraid", "dd", "dcfldd", "mount", "umount", "mountvol", "subst",
+    "fsutil", "label", "convert", "chkdsk", "chkntfs", "defrag", "compact",
+    "cipher", "manage-bde", "diskshadow", "vssadmin", "wbadmin", "esentutl",
+    "expand", "mklink", "junction",
+    // 系统/服务/注册表/计划任务
+    "shutdown", "reboot", "logoff", "poweroff", "halt", "init", "telinit",
+    "systemctl", "service", "sc", "schtasks", "at", "crontab", "launchctl",
+    "reg", "regedit", "regini", "regsvr32", "setx", "bcdedit", "bootcfg",
+    "dism", "sfc", "pkgmgr", "sysprep", "reagentc", "winrm", "winrs",
+    "slmgr", "installutil", "pnputil", "devcon", "dpinst", "verifier",
+    "mofcomp", "nltest", "dsquery", "dsadd", "dsmod", "dsrm", "takeown",
+    "icacls", "cacls", "attrib", "powercfg", "route", "ip", "ifconfig",
+    "iwconfig", "nmcli", "iptables", "nft", "pfctl", "firewall-cmd", "netsh",
+    "net", "net1", "rasdial", "rasphone", "wevtutil", "lodctr", "unlodctr",
+    // 提权/远程执行
+    "runas", "sudo", "su", "doas", "gsudo", "psexec", "psservice", "wmiexec",
+    "smbexec", "atexec", "pass", // `pass` 密码库导出；`psexec` 系列见上
+    // 进程终止
+    "taskkill", "tskill", "pkill", "kill", "killall", "skill", "snice",
+    "fuser", "wmic",
+    // 网络外发/远程
+    "ssh", "scp", "sftp", "ssh-copy-id", "sshfs", "mosh", "ftp", "tftp",
+    "lftp", "ncftp", "telnet", "rlogin", "rsh", "rexec", "nc", "ncat",
+    "netcat", "socat", "curl", "wget", "aria2c", "axel", "http", "https",
+    "xh", "httpie", "rsync", "rclone", "syncthing", "restic", "borg",
+    "duplicity", "s3cmd", "gsutil", "azcopy", "mc", "aws", "az", "gcloud",
+    "oci", "vault", "consul", "proxychains", "torsocks", "tor", "nmap",
+    "masscan", "hping3", "zmap", "tcpdump", "tshark", "dumpcap", "wireshark",
+    "certutil", "bitsadmin", "gh", "glab",
+    // 执行载体/LOLBins
+    "mshta", "rundll32", "msiexec", "wscript", "cscript", "infdefaultinstall",
+    "cmstp", "odbcconf", "msxsl", "dnx", "rcsi", "csi", "vshadow",
+    // 容器/基础设施
+    "docker", "docker-compose", "podman", "nerdctl", "buildah", "kubectl",
+    "helm", "terraform", "ansible", "ansible-playbook", "vagrant", "packer",
+    "minikube", "k3s", "k9s", "kind", "skaffold", "kompose",
+    // OS 级包管理（写系统目录）
+    "apt", "apt-get", "aptitude", "yum", "dnf", "pacman", "zypper", "apk",
+    "brew", "choco", "winget", "scoop", "port", "snap", "flatpak", "emerge",
+    "nix", "pipx",
+    // 服务端数据库 CLI（sqlite3 走文件改写规则）
+    "mysql", "mysqldump", "psql", "pg_dump", "mongo", "mongosh", "redis-cli",
+    "sqlcmd", "sqlplus", "influx", "cqlsh", "clickhouse-client", "dolt",
+    // 环境/凭据面（dump env 会把凭据带进模型上下文）
+    "set", "printenv",
+    // 版本库直连远端/破坏性操作（git 走子命令细化）
+    "svnadmin", "svnsync",
+    // 发布/上传
+    "twine", "flit",
+];
+
+/// 就地写文件的程序：参数只要落到工作区外（绝对路径/盘符/`..`/`~`/`%VAR%`
+/// 未展开变量）即判危险；仅相对路径时放行（等价于 write_file 的自治度）。
+const FILE_MUTATORS: &[&str] = &[
+    "cp", "copy", "mv", "move", "ren", "rename", "xcopy", "robocopy", "tar",
+    "unzip", "zip", "7z", "rar", "unrar", "gzip", "gunzip", "bzip2", "bunzip2",
+    "xz", "unxz", "zstd", "jar", "ar", "sed", "awk", "gawk", "mawk", "nawk",
+    "tee", "patch", "truncate", "install", "ln", "link", "sqlite3", "ffmpeg",
+    "magick", "gs", "qpdf", "pdftk", "iconv", "recode", "fmt", "csplit",
+    "split", "shuf", "sort", "uniq", "tac", "rev",
+];
+
+/// 解释器之外、参数里能藏命令的程序。
+fn arg_embeds_command(program: &str, args: &[String]) -> bool {
+    match program {
+        "find" => args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-exec" | "-execdir" | "-delete" | "-ok" | "-okdir"
+                    | "-fls" | "-fprint" | "-fprintf"
+            )
+        }),
+        "fd" => args
+            .iter()
+            .any(|a| matches!(a.as_str(), "-x" | "--exec" | "-X" | "--exec-batch")),
+        "rg" => args
+            .iter()
+            .any(|a| a == "--pre" || a == "--pre-glob" || a.starts_with("--pre=")),
+        "awk" | "gawk" | "mawk" | "nawk" => args.iter().any(|a| a.contains("system(")),
+        "perl" => args.iter().any(|a| a.contains("system(") || a.contains("exec(")),
+        _ => false,
+    }
+}
+
+/// 绝对路径/盘符/`..`/`~`/未展开变量 —— 工作区外目标。
+fn outside_workspace(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with('\\')
+        || token.starts_with('~')
+        || token.starts_with('%')
+        || token.starts_with('$')
+        || token.contains(':')
+        || token.split(['/', '\\']).any(|part| part == "..")
+}
+
+fn segment_is_dangerous(segment: &str) -> bool {
+    let Some(mut tokens) = lex(segment) else { return true };
+    // 去掉前导环境赋值与良性包装（`FOO=1 x`、`time make test`）。
+    while let Some(first) = tokens.first() {
+        let lower = first.to_ascii_lowercase();
+        if is_env_assignment(&lower) || BENIGN_PREFIXES.contains(&lower.as_str()) {
+            tokens.remove(0);
+        } else {
+            break;
+        }
+    }
+    let Some(program_token) = tokens.first() else { return false };
+    // 段首出现子 shell/分组括号：`(rm -rf /)` —— 按嵌套执行处理。
+    if program_token.starts_with('(') || program_token.starts_with('{') {
+        return true;
+    }
+    let Some(program) = program_name(program_token) else {
+        // 非裸程序名：路径形态（脚本调用或重定向目标）。工作区相对路径
+        // （`./x`、`tools\x`、`logs/out.txt`）与工作区本身同级信任；越界
+        // （绝对/盘符/`..`/`~`/变量引用）判危险。
+        return outside_workspace(program_token);
+    };
+    let args = &tokens[1..];
+    let program = program.as_str();
+    NESTED_EXECUTORS.contains(&program)
+        || inline_code(program, args)
+        || arg_embeds_command(program, args)
+        || subcommand_dangerous(program, args)
+        || (DANGEROUS_PROGRAMS.contains(&program) && !dangerous_program_exempt(program, args))
+        || (FILE_MUTATORS.contains(&program)
+            && args.iter().any(|arg| {
+                // 带值 flag（`7z -o../x`）也要查：含 `..`/盘符即越界。
+                outside_workspace(arg) || arg.contains("..") || arg.contains(':')
+            }))
+}
+
+/// `reg query` 是唯一读操作；其余危险程序不看参数。
+fn dangerous_program_exempt(program: &str, args: &[String]) -> bool {
+    program == "reg" && args.first().is_some_and(|a| a == "query")
+}
+
+fn git_dangerous(args: &[String]) -> bool {
+    let Some(sub) = args.first() else { return false };
+    if sub.starts_with('-') {
+        // 全局选项（`-c x=y`、`--exec-path`）可执行/改写 git 行为。
+        return true;
+    }
+    let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+    match sub.as_str() {
+        // 外发或不可逆改写
+        "push" | "rebase" | "filter-branch" | "filter-repo" | "update-ref"
+        | "clean" | "svn" | "send-email" | "imap-send" | "daemon" | "rm" => true,
+        "gc" => rest.iter().any(|a| a.starts_with("--prune")),
+        "reflog" => true,
+        "reset" => rest.iter().any(|a| matches!(*a, "--hard" | "--merge" | "--keep")),
+        // 丢弃工作区改动：`checkout .`、`checkout -- f`、`restore f`
+        "checkout" | "switch" => rest
+            .iter()
+            .any(|a| matches!(*a, "." | "--" | "--discard-changes" | "-f" | "--force" | "-m" | "--merge")),
+        "restore" => {
+            // `restore --staged` 只回退 index；带路径的工作区 restore 才丢弃改动。
+            if rest
+                .iter()
+                .any(|a| matches!(*a, "." | "--" | "--discard-changes" | "-f" | "--force" | "-m" | "--merge"))
+            {
+                true
+            } else if rest.iter().any(|a| matches!(*a, "--staged" | "-S")) {
+                rest.iter().any(|a| matches!(*a, "--worktree" | "-W"))
+            } else {
+                rest.iter().any(|a| !a.starts_with('-'))
+            }
+        }
+        "branch" | "tag" => rest
+            .iter()
+            .any(|a| matches!(*a, "-d" | "-D" | "--delete" | "-f" | "--force")),
+        "stash" => rest.iter().any(|a| matches!(*a, "drop" | "clear")),
+        "worktree" => rest
+            .first()
+            .is_some_and(|a| matches!(*a, "remove" | "prune")),
+        _ => false,
+    }
+}
+
+fn subcommand_dangerous(program: &str, args: &[String]) -> bool {
+    let first = args.first().map(String::as_str).unwrap_or("");
+    let second = args.get(1).map(String::as_str);
+    match program {
+        "git" => git_dangerous(args),
+        "npm" | "pnpm" | "yarn" | "bun" | "corepack" => {
+            first == "publish"
+                || args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "-g" | "--global" | "global" | "deploy"))
+        }
+        "npx" | "bunx" | "uvx" => first == "publish",
+        "cargo" => matches!(first, "publish" | "install"),
+        "go" => first == "install",
+        "gem" => matches!(first, "install" | "push" | "uninstall" | "cleanup"),
+        "composer" => first == "global",
+        "poetry" => first == "publish",
+        "uv" => {
+            first == "publish"
+                || (first == "tool" && matches!(second, Some("install" | "uninstall")))
+        }
+        "dotnet" => {
+            (first == "nuget" && matches!(second, Some("push" | "delete")))
+                || (first == "tool" && matches!(second, Some("install" | "uninstall" | "update")))
+        }
+        "mvn" | "mvnw" | "gradle" | "gradlew" | "sbt" | "lein" => args
+            .iter()
+            .any(|a| matches!(a.as_str(), "deploy" | "publish" | "uploadArchives" | "release")),
+        "dart" | "flutter" => args.iter().any(|a| a == "publish"),
+        "conda" | "mamba" | "micromamba" => {
+            matches!(first, "install" | "remove" | "uninstall" | "clean" | "env")
+        }
+        "svn" => matches!(
+            first,
+            "commit" | "ci" | "import" | "copy" | "cp" | "move" | "mv" | "mkdir" | "delete"
+                | "del" | "remove" | "rm" | "merge" | "revert" | "resolve" | "patch" | "changelist"
+                | "checkout" | "co" | "switch" | "cleanup"
+        ),
+        "hg" => matches!(
+            first,
+            "push" | "commit" | "merge" | "rebase" | "strip" | "graft" | "shelve" | "import"
+                | "export" | "tag" | "bookmark" | "revert" | "purge" | "clean"
+        ),
+        "p4" | "bzr" => matches!(
+            first,
+            "submit" | "delete" | "shelve" | "revert" | "edit" | "move" | "integrate" | "push"
+                | "send" | "commit" | "uncommit"
+        ),
+        "cd" | "chdir" | "pushd" => args.iter().any(|a| outside_workspace(a)),
+        _ => false,
+    }
 }
 
 struct FlagSpec {
@@ -688,5 +1097,221 @@ mod tests {
             assert!(!safe(command), "{command:?}");
         }
         assert!(!safe(&format!("git status {}", "x".repeat(5000))));
+    }
+
+    // ==================== 自主模式风险分类 ====================
+
+    fn dangerous(command: &str) -> bool {
+        is_dangerous(command)
+    }
+
+    #[test]
+    fn everyday_dev_commands_are_auto() {
+        for command in [
+            "python run_tests.py",
+            "python3 -m pytest tests",
+            "npm test",
+            "npm install",
+            "npm run build",
+            "pnpm build",
+            "yarn lint",
+            "cargo test",
+            "cargo build --release",
+            "go test ./...",
+            "dotnet build",
+            "mvn package",
+            "make test",
+            "tsc --noEmit",
+            "eslint src",
+            "git status",
+            "git add .",
+            "git commit -m x",
+            "git log --oneline -n 5",
+            "git merge feature",
+            "git checkout -b new-branch",
+            "git stash",
+            "git stash pop",
+            "dir",
+            "ls -la src",
+            "mkdir out",
+            "cd src && npm test",
+            "type Cargo.toml",
+            "python -V",
+            "echo hello",
+            r"tools\build.bat",
+            "./scripts/check.sh",
+        ] {
+            assert!(!dangerous(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn destructive_and_remote_commands_are_dangerous() {
+        for command in [
+            "rm -rf x",
+            "rm file.txt",
+            "del out.txt",
+            "rmdir /s /q dir",
+            "rd dir",
+            "format c:",
+            "shutdown /s",
+            "taskkill /pid 1",
+            "kill -9 1",
+            "sc delete svc",
+            "schtasks /delete /tn t",
+            "reg add HKLM\\x",
+            "reg delete HKCU\\x",
+            "netsh advfirewall set allprofiles state off",
+            "icacls x /grant y",
+            "takeown /f x",
+            "curl https://x",
+            "wget http://x",
+            "ssh host",
+            "scp a b",
+            "nc -l 80",
+            "docker ps",
+            "kubectl delete pod x",
+            "terraform apply",
+            "npm publish",
+            "npm install -g x",
+            "pnpm add -g y",
+            "yarn global add z",
+            "cargo publish",
+            "cargo install ripgrep",
+            "go install tool@latest",
+            "pipx install x",
+            "apt install x",
+            "brew install x",
+            "winget install x",
+            "choco install x",
+            "git push",
+            "git push origin main",
+            "git reset --hard",
+            "git clean -fd",
+            "git checkout .",
+            "git checkout -- file",
+            "git restore a.txt",
+            "git branch -D old",
+            "git tag -d v1",
+            "git stash drop",
+            "git stash clear",
+            "git rebase main",
+            "git filter-branch --all",
+            "git rm a.txt",
+            "git reflog expire --expire=now --all",
+            "git -c core.pager=rm diff",
+            "dotnet nuget push x.nupkg",
+            "dotnet tool install -g x",
+            "mvn deploy",
+            "gradle publish",
+            "find . -exec rm {} ;",
+            "find . -delete",
+            "fd -x rm",
+            "rg --pre cat x",
+            "svn commit",
+            "svn checkout url",
+            "hg push",
+            "sudo ls",
+            "runas /user:x cmd",
+            "env VAR=1",
+            "wmic process list",
+            "mysql -u root",
+            "psql -c x",
+            "redis-cli flushall",
+            "printenv",
+            "gh release create",
+        ] {
+            assert!(dangerous(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn composition_and_executors_are_dangerous() {
+        for command in [
+            "git status && del x",
+            "echo ok; rm -rf x",
+            "ls | rm",
+            "cmd /C dir",
+            "cmd.exe /c echo hi",
+            "powershell -enc AAAA",
+            "pwsh -Command ls",
+            "bash -c ls",
+            "sh -c 'echo hi'",
+            "wsl ls",
+            "python -c \"print(1)\"",
+            "python3 -c x",
+            "node -e \"1\"",
+            "node --eval x",
+            "ruby -e x",
+            "perl -e 'system(1)'",
+            "php -r 'echo 1;'",
+            "eval ls",
+            "exec ls",
+            "xargs rm",
+            "forfiles /m *.x /c x",
+            "env ls",
+            "source ~/.bashrc",
+            "git status $(rm -rf .)",
+            "git status `rm -rf .`",
+            "(rm -rf x)",
+            "echo x > ../outside.txt",
+            "echo x > /etc/x",
+            "echo x > C:\\Windows\\x",
+            "cat a.txt | tee /tmp/x",
+            "cp a ../b",
+            "mv a C:/x",
+            "tar xf a.tar -C /",
+            "7z x a.zip -o../out",
+            "sed -i x ../f",
+            "cd .. && npm test",
+            "cd ../x",
+            "awk 'system(\"x\")' f",
+            "$TOOLS/evil",
+        ] {
+            assert!(dangerous(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn auto_but_safe_compositions_pass() {
+        for command in [
+            "git status && npm test",
+            "cargo build && cargo test",
+            "ls src | more",
+            "echo done > build.log",
+            "echo ok > out/result.txt",
+            "time make test",
+            "FOO=1 npm test",
+            "cp a.txt backup/",
+            "mv src old-src",
+            "mkdir -p out && echo done",
+            "git checkout main",
+            "git restore --staged a",
+            "git diff > changes.diff",
+        ] {
+            assert!(!dangerous(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn unclassifiable_and_empty_inputs_are_dangerous() {
+        for command in ["", "   ", "&&", "|", ";", "git status \"unterminated"] {
+            assert!(dangerous(command), "{command:?}");
+        }
+        assert!(dangerous(&format!("npm test {}", "x".repeat(5000))));
+    }
+
+    #[test]
+    fn parse_tiers_split_readonly_auto_dangerous() {
+        assert_eq!(
+            parse("git status"),
+            CommandPolicy::ReadOnly { program: "git".into(), args: vec!["status".into()] }
+        );
+        assert_eq!(parse("npm test"), CommandPolicy::Auto);
+        assert_eq!(parse("dir"), CommandPolicy::Auto);
+        assert_eq!(parse("python run_tests.py"), CommandPolicy::Auto);
+        assert_eq!(parse("git push"), CommandPolicy::Dangerous);
+        assert_eq!(parse("rm -rf x"), CommandPolicy::Dangerous);
+        assert_eq!(parse("cmd /C dir"), CommandPolicy::Dangerous);
     }
 }

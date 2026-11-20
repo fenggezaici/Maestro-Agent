@@ -46,9 +46,11 @@ export default function ApprovalRulesDialog({ runId, open, onOpenChange }: {
           : rules.length === 0 ? <p>当前会话还没有「始终允许」规则。</p>
           : rules.map((rule) => <div className="approval-rule-row" key={`${rule.tool}:${rule.pattern}:${rule.prefix}`}>
             <div>
-              <strong>{rule.tool}</strong>
-              <code>{rule.prefix ? `${rule.pattern} *` : rule.pattern}</code>
-              <em>{rule.prefix ? '前缀：同前缀的其他命令也会免审' : '精确匹配'}</em>
+              <strong>{rule.tool === '*' ? '本会话全部放行' : rule.tool}</strong>
+              <code>{rule.tool === '*' ? '所有需要审批的调用' : rule.prefix ? `${rule.pattern} *` : rule.pattern}</code>
+              <em>{rule.tool === '*'
+                ? '仅本会话、不持久化；切到「计划」模式仍然拒绝'
+                : rule.prefix ? '前缀：同前缀的其他命令也会免审' : '精确匹配'}</em>
             </div>
             <button type="button" className="button-ghost" aria-label={`撤销规则 ${rule.tool} ${rule.pattern}`} onClick={() => revoke(rule)}>
               <Trash2 size={12} />撤销

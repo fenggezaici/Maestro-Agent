@@ -59,7 +59,7 @@ export default function AgentsSettings({ preview }: { preview: boolean }) {
     : `保存到${SOURCE_LABEL[draft.agent.source ?? 'global']}作用域，名称不可修改。`;
 
   return <div className="agents-settings">
-    <div className="agents-toolbar"><label className="agents-search"><Search size={13} /><input aria-label="搜索子智能体" placeholder="搜索子智能体…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="agents-count">子智能体 {visible.length}</span><button type="button" className="button-ghost" onClick={() => setDraft({ agent: { name: '', description: '', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, hidden: false, color: '#8B5CF6', source: 'global' }, scope: 'global', isNew: true })}><Plus size={12} />新建</button></div>
+    <div className="agents-toolbar"><label className="agents-search"><Search size={13} /><input aria-label="搜索子智能体" placeholder="搜索子智能体…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="agents-count">子智能体 {visible.length}</span><button type="button" className="button-ghost" onClick={() => setDraft({ agent: { name: '', description: '', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, toolBudget: 100, hidden: false, color: '#8B5CF6', source: 'global' }, scope: 'global', isNew: true })}><Plus size={12} />新建</button></div>
     {error && <p role="alert" className="settings-form-error">{error}</p>}
     {draft && <div className="agent-editor">
       <label>名称<input value={draft.agent.name} disabled={!draft.isNew} onChange={(event) => patch({ name: event.target.value })} placeholder="reviewer" /></label>
@@ -67,6 +67,7 @@ export default function AgentsSettings({ preview }: { preview: boolean }) {
       <label>分类<input value={draft.agent.category ?? ''} onChange={(event) => patch({ category: event.target.value })} /></label>
       <label>模型（留空继承默认）<input value={draft.agent.model ?? ''} onChange={(event) => patch({ model: event.target.value || null })} /></label>
       <label>轮次上限<input type="number" value={draft.agent.steps ?? 8} onChange={(event) => patch({ steps: Number(event.target.value) || 8 })} /></label>
+      <label>工具预算（次）<input type="number" min={1} max={500} value={draft.agent.toolBudget ?? 100} onChange={(event) => patch({ toolBudget: Math.min(500, Math.max(1, Number(event.target.value) || 100)) })} /></label>
       <label>作用域<select value={draft.scope} disabled={!draft.isNew} onChange={(event) => setDraft({ ...draft, scope: event.target.value as Draft['scope'] })}><option value="global">全局 ~/.maestro/agents</option><option value="project" disabled={!hasWorkspace}>项目 &lt;workspace&gt;/.maestro/agents</option></select></label>
       <div className="agent-editor-wide agent-tools"><span>只读工具</span>{READ_ONLY_TOOLS.map((tool) => <label key={tool}><input type="checkbox" checked={draft.agent.tools.includes(tool)} onChange={() => toggleTool(tool)} />{tool}</label>)}<small>全不勾选时使用全部只读工具</small></div>
       <label className="agent-editor-wide">Prompt<textarea rows={5} value={draft.agent.prompt} onChange={(event) => patch({ prompt: event.target.value })} /></label>
@@ -75,7 +76,7 @@ export default function AgentsSettings({ preview }: { preview: boolean }) {
     </div>}
     <div className="agents-list">{visible.map((agent) => <div className="agent-card" key={`${agent.source ?? 'global'}:${agent.name}`}>
       <span className="agent-icon" style={{ color: agent.color ?? undefined }}><Bot size={15} /></span>
-      <div><strong>{agent.name}</strong><span className="agent-source" data-source={agent.source ?? 'global'}>{SOURCE_LABEL[agent.source ?? 'global']}</span><p>{agent.description || '（无描述）'}</p><small>{agent.tools.length} 个工具 · {agent.model ?? '继承默认'} · {agent.steps ?? 8} 轮</small></div>
+      <div><strong>{agent.name}</strong><span className="agent-source" data-source={agent.source ?? 'global'}>{SOURCE_LABEL[agent.source ?? 'global']}</span><p>{agent.description || '（无描述）'}</p><small>{agent.tools.length} 个工具 · {agent.model ?? '继承默认'} · {agent.steps ?? 8} 轮 · {agent.toolBudget ?? 100} 次预算</small></div>
       <button type="button" className="button-ghost" onClick={() => setDraft({ agent, scope: agent.source === 'project' ? 'project' : 'global', isNew: false })}>编辑</button>
       <button type="button" className="icon-button" aria-label={`删除 ${agent.name}`} disabled={agent.source === 'builtin'} title={agent.source === 'builtin' ? '内置子智能体不可删除；可编辑为覆盖版本' : undefined} onClick={() => setDeleting(agent)}><Trash2 size={13} /></button>
     </div>)}</div>

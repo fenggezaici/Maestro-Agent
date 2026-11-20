@@ -31,6 +31,10 @@ pub struct AgentDefinition {
     pub tools: Vec<String>,
     #[serde(default)]
     pub steps: Option<u32>,
+    /// Tool-call budget per subagent run; `None` falls back to
+    /// `DEFAULT_SUBAGENT_TOOL_BUDGET` in the child loop.
+    #[serde(default)]
+    pub tool_budget: Option<u32>,
     #[serde(default)]
     pub hidden: bool,
     #[serde(default)]
@@ -41,6 +45,11 @@ pub struct AgentDefinition {
 
 fn default_mode() -> String { "subagent".into() }
 
+/// Default tool-call budget when a definition does not set `tool_budget`.
+pub const DEFAULT_SUBAGENT_TOOL_BUDGET: u32 = 100;
+/// Upper bound applied to a configured budget to catch absurd values.
+pub const MAX_SUBAGENT_TOOL_BUDGET: u32 = 500;
+
 impl AgentDefinition {
     pub fn builtin(name: &str) -> Option<Self> {
         match name {
@@ -50,7 +59,7 @@ impl AgentDefinition {
                 category: Some("研究".into()), mode: "subagent".into(), model: None,
                 prompt: "你是只读代码调研子智能体。只使用提供的只读工具并行查找证据，不写文件、不执行命令；输出结论、证据路径和风险。".into(),
                 tools: vec!["read_file".into(), "list_dir".into(), "load_skill".into()],
-                steps: Some(8), hidden: false, color: Some("#8B5CF6".into()), source: AgentSource::Builtin,
+                steps: Some(8), tool_budget: None, hidden: false, color: Some("#8B5CF6".into()), source: AgentSource::Builtin,
             }),
             "general" => Some(Self {
                 name: "general".into(),
@@ -58,7 +67,7 @@ impl AgentDefinition {
                 category: Some("研究".into()), mode: "subagent".into(), model: None,
                 prompt: "你是只读分析子智能体。只使用提供的只读工具分析，不写文件、不执行命令；输出结论、证据路径和风险。".into(),
                 tools: vec!["read_file".into(), "list_dir".into(), "load_skill".into()],
-                steps: Some(8), hidden: false, color: Some("#22D3EE".into()), source: AgentSource::Builtin,
+                steps: Some(8), tool_budget: None, hidden: false, color: Some("#22D3EE".into()), source: AgentSource::Builtin,
             }),
             _ => None,
         }

@@ -148,17 +148,29 @@ export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpe
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
               <DropdownMenu.Content className="dropdown-content approval-menu" align="start" sideOffset={4}>
-                <DropdownMenu.Item className="dropdown-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'exact')}>
-                  始终允许（仅此调用）<code className="approval-menu-pattern">{rulePattern(call, 'exact')}</code>
+                <DropdownMenu.Item className="dropdown-item approval-menu-item" onSelect={() => onResolveApproval(call.runId, 'allow_batch')}>
+                  <span className="approval-menu-title">本批全部允许</span>
+                  <span className="approval-menu-hint">同一回合的后续调用不再询问</span>
                 </DropdownMenu.Item>
-                {call.tool === 'run_command' && <DropdownMenu.Item className="dropdown-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'prefix')}>
-                  始终允许（命令前缀）<code className="approval-menu-pattern">{rulePattern(call, 'prefix')}</code>
+                <DropdownMenu.Item className="dropdown-item approval-menu-item" onSelect={() => onResolveApproval(call.runId, 'allow_session')}>
+                  <span className="approval-menu-title">本会话全部放行</span>
+                  <span className="approval-menu-hint">会话内不再询问，可在授权规则撤销</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator className="dropdown-separator" />
+                <DropdownMenu.Item className="dropdown-item approval-menu-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'exact')}>
+                  <span className="approval-menu-title">始终允许（仅此调用）</span>
+                  <code className="approval-menu-pattern">{rulePattern(call, 'exact')}</code>
+                </DropdownMenu.Item>
+                {call.tool === 'run_command' && <DropdownMenu.Item className="dropdown-item approval-menu-item" onSelect={() => onResolveApproval(call.runId, 'allow_always', 'prefix')}>
+                  <span className="approval-menu-title">始终允许（命令前缀）</span>
+                  <code className="approval-menu-pattern">{rulePattern(call, 'prefix')}</code>
                 </DropdownMenu.Item>}
                 <DropdownMenu.Item className="dropdown-item" onSelect={() => setRulesOpen(true)}>
                   <ShieldCheck size={12} />授权规则…
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator className="dropdown-separator" />
                 <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => onResolveApproval(call.runId, 'deny')}>直接拒绝</DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => onResolveApproval(call.runId, 'deny_batch')}>本批全部拒绝</DropdownMenu.Item>
                 <DropdownMenu.Item className="dropdown-item dropdown-item-danger" onSelect={() => setDenyOpen((value) => !value)}>拒绝并反馈…</DropdownMenu.Item>
               </DropdownMenu.Content>
             </DropdownMenu.Portal>

@@ -45,7 +45,21 @@ describe('AgentsSettings', () => {
 
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
       scope: 'global',
-      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', source: 'global' }),
+      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', toolBudget: 100, source: 'global' }),
+    }));
+  });
+
+  it('saves an edited tool budget', async () => {
+    render(<AgentsSettings preview={false} />);
+    await screen.findByText('explore');
+    fireEvent.click(screen.getByRole('button', { name: '新建' }));
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'scout' } });
+    fireEvent.change(screen.getByLabelText('工具预算（次）'), { target: { value: '250' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
+      scope: 'global',
+      agent: expect.objectContaining({ name: 'scout', toolBudget: 250 }),
     }));
   });
 

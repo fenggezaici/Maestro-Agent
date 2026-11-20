@@ -6,7 +6,7 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{
-    ActivityDay, ActivitySnapshot, AppResult, ContextCompaction, RunChangeSummary, RunFileChange, Mode, PlanCard,
+    ActivityDay, ActivitySnapshot, AppResult, ContextCompaction, ModelTrendDay, ModelUsage, RunChangeSummary, RunFileChange, Mode, PlanCard,
     RunMessage,
     PlanDecision, PlanDraft, PlanStatus, ProjectView, RunMetrics, RunStatus, RunView, SessionDetail,
     SessionView, SubagentStatus, SubagentView, ToolCallView,
@@ -1126,11 +1126,16 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub async fn record_file_change(&self, run_id: i64, session_id: i64, path: String, added: i64, removed: i64, before: String, after: String) -> AppResult<()> {
         self.call(move |connection| {
-            connection.execute(
+            let rows = connection.execute(
                 "INSERT INTO run_file_changes (run_id, session_id, project_id, path, added, removed, before, after)
                  SELECT ?1, ?2, s.project_id, ?3, ?4, ?5, ?6, ?7 FROM sessions s WHERE s.id = ?2",
                 params![run_id, session_id, path, added, removed, before, after],
             ).map_err(db_error)?;
+            // INSERT ... SELECT 在 session 缺失时插入 0 行且不算错误——
+            // 显式校验，改动记录不能再静默丢失。
+            if rows == 0 {
+                return Err(format!("record_file_change: session {session_id} missing"));
+            }
             Ok(())
         }).await
     }
@@ -1178,20 +1183,33 @@ impl Database {
 
     pub async fn activity_snapshot(&self, project_id: Option<i64>) -> AppResult<ActivitySnapshot> {
         self.call(move |connection| {
+            // 日界按本地时区切（此前 UTC 会让 +8 零点后的改动记到前一天）。
+            // project_id = -1 表示「不在项目中工作」视图：只统计 project_id
+            // 为 NULL 的行，与项目视图互补、不重复也不漏。
+            // token 口径按 provider 分：OpenAI 的 prompt_tokens 已含 cached、
+            // completion 含 reasoning → input+output 即全量；Anthropic 的
+            // input_tokens 不含 cache_read/cache_write → 必须加上，否则开了
+            // cache_control 后低估 95%+。
             let mut statement = connection.prepare(
                 "WITH RECURSIVE dates(d) AS (
-                    SELECT date('now','-179 days')
-                    UNION ALL SELECT date(d,'+1 day') FROM dates WHERE d < date('now')
+                    SELECT date('now','localtime','-363 days')
+                    UNION ALL SELECT date(d,'+1 day') FROM dates WHERE d < date('now','localtime')
                  )
                  SELECT d,
                    COALESCE((SELECT SUM(f.added + f.removed) FROM run_file_changes f
-                     WHERE (?1 IS NULL OR f.project_id = ?1) AND date(f.created_at,'unixepoch') = d), 0),
-                   COALESCE((SELECT SUM(COALESCE(m.input_tokens,0) + COALESCE(m.output_tokens,0))
+                     WHERE (?1 IS NULL OR (?1 = -1 AND f.project_id IS NULL) OR f.project_id = ?1)
+                       AND date(f.created_at,'unixepoch','localtime') = d), 0),
+                   COALESCE((SELECT SUM(COALESCE(m.input_tokens,0) + COALESCE(m.output_tokens,0)
+                       + CASE WHEN m.provider = 'anthropic'
+                           THEN COALESCE(m.cache_hit_tokens,0) + COALESCE(m.cache_write_tokens,0)
+                           ELSE 0 END)
                      FROM run_metrics m JOIN runs r ON r.id = m.run_id JOIN sessions s ON s.id = m.session_id
-                     WHERE (?1 IS NULL OR s.project_id = ?1) AND date(r.created_at,'unixepoch') = d), 0),
+                     WHERE (?1 IS NULL OR (?1 = -1 AND s.project_id IS NULL) OR s.project_id = ?1)
+                       AND date(r.created_at,'unixepoch','localtime') = d), 0),
                    COALESCE((SELECT COUNT(*) FROM plan_cards p JOIN sessions s ON s.id = p.session_id
-                     WHERE (?1 IS NULL OR s.project_id = ?1) AND p.status = 'approved'
-                       AND p.decided_at IS NOT NULL AND date(p.decided_at,'unixepoch') = d), 0)
+                     WHERE (?1 IS NULL OR (?1 = -1 AND s.project_id IS NULL) OR s.project_id = ?1)
+                       AND p.status = 'approved'
+                       AND p.decided_at IS NOT NULL AND date(p.decided_at,'unixepoch','localtime') = d), 0)
                  FROM dates",
             ).map_err(db_error)?;
             let rows = statement.query_map([project_id], |row| {
@@ -1213,10 +1231,43 @@ impl Database {
             let total_tokens = days.iter().map(|day| day.tokens).sum();
             let approved_plans = days.iter().map(|day| day.plans).sum();
             let today_lines = days.last().map(|day| day.lines).unwrap_or(0);
+            let peak_tokens = days.iter().map(|day| day.tokens).max().unwrap_or(0);
             let trend = days.iter().rev().take(30).rev().cloned().collect();
+            let token_expr = "COALESCE(m.input_tokens,0) + COALESCE(m.output_tokens,0)
+                + CASE WHEN m.provider = 'anthropic'
+                    THEN COALESCE(m.cache_hit_tokens,0) + COALESCE(m.cache_write_tokens,0)
+                    ELSE 0 END";
+            let model_scope = "(?1 IS NULL OR (?1 = -1 AND s.project_id IS NULL) OR s.project_id = ?1)";
+            let models = connection.prepare(&format!(
+                "SELECT COALESCE(NULLIF(m.model,''),'(unknown)'), SUM({token_expr}), COUNT(*)
+                 FROM run_metrics m JOIN sessions s ON s.id = m.session_id
+                 WHERE {model_scope}
+                 GROUP BY 1 ORDER BY 2 DESC",
+            )).map_err(db_error)?.query_map([project_id], |row| {
+                Ok(ModelUsage { model: row.get(0)?, tokens: row.get::<_, Option<i64>>(1)?.unwrap_or(0), runs: row.get(2)? })
+            }).map_err(db_error)?.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+            let model_trend = connection.prepare(&format!(
+                "SELECT date(r.created_at,'unixepoch','localtime'), COALESCE(NULLIF(m.model,''),'(unknown)'), SUM({token_expr})
+                 FROM run_metrics m JOIN runs r ON r.id = m.run_id JOIN sessions s ON s.id = m.session_id
+                 WHERE {model_scope}
+                   AND date(r.created_at,'unixepoch','localtime') >= date('now','localtime','-29 days')
+                 GROUP BY 1, 2 ORDER BY 1",
+            )).map_err(db_error)?.query_map([project_id], |row| {
+                let date: String = row.get(0)?;
+                Ok(ModelTrendDay {
+                    short_date: date.get(5..).unwrap_or(&date).to_string(),
+                    date,
+                    model: row.get(1)?,
+                    tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                })
+            }).map_err(db_error)?.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+            let longest_run_ms = connection.prepare(&format!(
+                "SELECT COALESCE(MAX(m.elapsed_ms),0) FROM run_metrics m JOIN sessions s ON s.id = m.session_id WHERE {model_scope}",
+            )).map_err(db_error)?.query_row([project_id], |row| row.get(0)).map_err(db_error)?;
             Ok(ActivitySnapshot {
                 source: "live", start, end, total_lines, approved_plans, total_tokens,
-                cost: None, today_lines, days, trend,
+                peak_tokens, longest_run_ms,
+                cost: None, today_lines, days, trend, models, model_trend,
             })
         }).await
     }
@@ -2726,6 +2777,73 @@ mod tests {
             .unwrap();
         assert_eq!(database.run_change_summary(1).await.unwrap().state, "reverted");
         assert_eq!(database.run_changes(1).await.unwrap()[0].before, "old");
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_snapshot_tokens_and_null_project_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("activity.sqlite3")).await.unwrap();
+        database
+            .call(|connection| {
+                connection
+                    .execute_batch(
+                        // 迁移已占用默认 project id=1，种子用独立 id；sessions.project_id
+                        // 是 NOT NULL（无项目 = 默认项目 1），NULL 只能出现在
+                        // run_file_changes 遗留行上——-1 哨兵是为它们兜底。
+                        "INSERT INTO projects(id,name,path) VALUES(7,'p','/p');
+                         INSERT INTO sessions(id,title,project_id) VALUES(1,'s1',7),(2,'s2',7);
+                         INSERT INTO runs(id,prompt,mode,status,session_id) VALUES
+                           (1,'a','code','completed',1),(2,'b','code','completed',1),(3,'c','code','completed',2);
+                         INSERT INTO run_metrics(run_id,session_id,provider,model,input_tokens,output_tokens,elapsed_ms,cache_hit_tokens,cache_write_tokens) VALUES
+                           (1,1,'anthropic','claude',100,50,1,900,200),
+                           (2,1,'openai','gpt',100,50,1,900,200),
+                           (3,2,'anthropic','claude',10,5,1,90,20);
+                         INSERT INTO run_file_changes(run_id,session_id,project_id,path,added,removed,before,after) VALUES
+                           (1,1,7,'a.ts',10,5,'x','y'),
+                           (3,2,NULL,'orphan.ts',7,3,'p','q');",
+                    )
+                    .map_err(db_error)
+            })
+            .await
+            .unwrap();
+
+        let project = database.activity_snapshot(Some(7)).await.unwrap();
+        // Anthropic：input+output+cache_read+cache_write = 1250；
+        // OpenAI：cache 字段是 prompt_tokens 的子集 → 只计 input+output = 150。
+        assert_eq!(project.today_lines, 15);
+        assert_eq!(project.total_tokens, 1525);
+        assert_eq!(project.peak_tokens, 1525);
+        assert_eq!(project.longest_run_ms, 1);
+        // 按模型聚合沿用 provider 口径：claude=run1+run3，gpt=run2。
+        assert_eq!(
+            project.models.iter().map(|m| (m.model.as_str(), m.tokens, m.runs)).collect::<Vec<_>>(),
+            vec![("claude", 1375, 2), ("gpt", 150, 1)],
+        );
+        assert_eq!(project.model_trend.len(), 2);
+        assert!(project.model_trend.iter().all(|day| day.tokens > 0));
+
+        // -1 = 孤儿行兜底视图：project_id IS NULL 的遗留行仍能可见。
+        let detached = database.activity_snapshot(Some(-1)).await.unwrap();
+        assert_eq!(detached.today_lines, 10);
+        assert_eq!(detached.total_tokens, 0);
+
+        // NULL 参数保持全量兼容（审计/总计用，UI 不再走这条路）。
+        let everything = database.activity_snapshot(None).await.unwrap();
+        assert_eq!(everything.today_lines, 25);
+        assert_eq!(everything.total_tokens, 1525);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_file_change_rejects_a_missing_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("changes.sqlite3")).await.unwrap();
+        // INSERT ... SELECT 对缺失 session 静默插 0 行——必须显式报错。
+        assert!(database
+            .record_file_change(1, 999, "a.ts".into(), 1, 0, "x".into(), "y".into())
+            .await
+            .is_err());
         database.shutdown().await.unwrap();
     }
 }

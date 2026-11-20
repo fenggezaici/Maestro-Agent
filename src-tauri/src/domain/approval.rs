@@ -7,6 +7,23 @@ pub enum ApprovalDecision {
     AllowOnce,
     AllowAlways,
     Deny,
+    /// 批准当前调用，本批后续挂起调用自动放行（批内有效，不外泄）。
+    AllowBatch,
+    /// 拒绝当前调用，本批后续挂起调用自动按同一理由拒绝。
+    DenyBatch,
+    /// 批准当前调用，本会话后续所有 RequireApproval 调用免审
+    /// （ZCode "full access" 对应物；纯内存、可撤销，不解除 Plan 的拒绝）。
+    AllowSession,
+}
+
+impl ApprovalDecision {
+    /// 该决策对当前挂起调用本身意味着什么。
+    pub fn is_allow(self) -> bool {
+        matches!(
+            self,
+            Self::AllowOnce | Self::AllowAlways | Self::AllowBatch | Self::AllowSession
+        )
+    }
 }
 
 /// How wide an "always allow" rule may be. `Exact` is the default: the rule

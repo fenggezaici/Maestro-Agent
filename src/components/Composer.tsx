@@ -1,6 +1,6 @@
 /// Dumb composer: prompt input, attachments, mode/project pickers and the
 /// send/stop controls. Pure props in, callbacks out — no IPC, no stores.
-import { useEffect, useImperativeHandle, useRef, useState, type ChangeEvent, type Dispatch, type FormEvent, type Ref, type RefObject, type SetStateAction } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState, type ChangeEvent, type ClipboardEvent, type Dispatch, type DragEvent, type FormEvent, type Ref, type RefObject, type SetStateAction } from 'react';
 import * as Popover from '@radix-ui/react-popover';
 import { ArrowDown, ArrowUp, Check, ChevronDown, Code2, FileEdit, FolderGit2, Grip, ListChecks, Paperclip, Search, ShieldAlert, ShieldCheck, Square, SquareTerminal, X, Zap } from 'lucide-react';
 import type { PendingApprovalView } from '../lib/conversation';
@@ -17,6 +17,7 @@ import SessionStats, { sessionUsage } from './SessionStats';
 import ContextRing from './ContextRing';
 import SlashPanel from './SlashPanel';
 import { buildSlashGroups, skillDirective, slashQuery, type SlashAction, type SlashItem } from '../slashCommands';
+import { attachmentKind, attachmentName, IMAGE_INLINE_LIMIT, MAX_ATTACHMENTS, MAX_FILE_SIZE, TEXT_INLINE_LIMIT } from '../lib/attachments';
 
 const AGENT_STATUS_LABEL: Record<'approval' | 'tool' | 'thinking' | 'working', string> = {
   approval: '等待批准', tool: '执行工具中', thinking: '思考中', working: '工作中',
@@ -105,21 +106,68 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
     onAttachmentsChange((current) => current.filter((item) => item.id !== id));
   }
 
-  function selectFiles(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? []);
+  // Shared ingestion for picker, clipboard paste and drag-drop — the latter
+  // two bypass the input's accept list so the type filter must live here.
+  function addFiles(incoming: File[]) {
     const added: LocalAttachment[] = [];
-    for (const file of files.slice(0, Math.max(0, 6 - attachments.length))) {
-      if (file.size > 20 * 1024 * 1024) { onError('附件超过 20 MiB 上限'); continue; }
+    let rejected = 0;
+    for (const file of incoming.slice(0, Math.max(0, MAX_ATTACHMENTS - attachments.length))) {
+      if (file.size > MAX_FILE_SIZE) { onError('附件超过 20 MiB 上限'); continue; }
+      const type = attachmentKind(file);
+      if (!type) { rejected += 1; continue; }
       const url = URL.createObjectURL(file); attachmentUrls.current.add(url);
-      const type: LocalAttachment['type'] = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'text';
-      const entry: LocalAttachment = { id: crypto.randomUUID(), name: file.name, type, url };
-      if (type === 'image' && file.size <= 3 * 1024 * 1024) void new Promise<string | undefined>((resolve) => {
+      const entry: LocalAttachment = { id: crypto.randomUUID(), name: attachmentName(file), type, url };
+      if (type === 'image' && file.size <= IMAGE_INLINE_LIMIT) void new Promise<string | undefined>((resolve) => {
         const reader = new FileReader(); reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : undefined); reader.onerror = () => resolve(undefined); reader.readAsDataURL(file);
       }).then((dataUrl) => { if (dataUrl) onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, dataUrl } : item)); });
-      else if (type === 'text' && file.size <= 64 * 1024) void file.text().then((text) => onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, text } : item))).catch(() => undefined);
+      else if (type === 'text' && file.size <= TEXT_INLINE_LIMIT) void file.text().then((text) => onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, text } : item))).catch(() => undefined);
       added.push(entry);
     }
-    onAttachmentsChange((current) => [...current, ...added]); event.target.value = '';
+    if (rejected) onError(`已忽略 ${rejected} 个不支持的附件类型`);
+    if (added.length) onAttachmentsChange((current) => [...current, ...added]);
+  }
+
+  function selectFiles(event: ChangeEvent<HTMLInputElement>) {
+    addFiles(Array.from(event.target.files ?? []));
+    event.target.value = '';
+  }
+
+  // ZCode-style clipboard ingest: only `kind: 'file'` items are intercepted —
+  // ordinary text paste keeps its default behavior untouched.
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const item of items) {
+      if (item.kind !== 'file') continue;
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+    if (files.length) { event.preventDefault(); addFiles(files); }
+  }
+
+  // Drag feedback counter — dragenter/dragleave fire per child, so a ref count
+  // beats toggling state on every event (keeps the hint from flickering).
+  const dropDepth = useRef(0);
+  const [dropActive, setDropActive] = useState(false);
+  const hasFiles = (event: { dataTransfer?: DataTransfer | null }) => event.dataTransfer?.types?.includes('Files') ?? false;
+  function handleDragEnter(event: DragEvent<HTMLDivElement>) {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dropDepth.current += 1;
+    setDropActive(true);
+  }
+  function handleDragLeave(event: DragEvent<HTMLDivElement>) {
+    if (!hasFiles(event)) return;
+    dropDepth.current = Math.max(0, dropDepth.current - 1);
+    if (dropDepth.current === 0) setDropActive(false);
+  }
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dropDepth.current = 0;
+    setDropActive(false);
+    if (event.dataTransfer?.files?.length) addFiles(Array.from(event.dataTransfer.files));
   }
 
   const currentRun = runs.at(-1);
@@ -164,7 +212,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
     promptInput.current?.focus();
   }
 
-  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className="composer-inner">{architectureWarning && <div className="composer-architecture-warning" role="alert"><ShieldAlert size={14} /><span><strong>架构规则拦截：</strong>{architectureWarning}</span></div>}{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={(event) => {
+  return <div className="composer-area"><button type="button" className={`scroll-bottom-fab ${atBottom ? '' : 'visible'}`} aria-label="回到底部" onClick={onScrollBottom}><ArrowDown size={16} /></button><div className={`composer-inner${dropActive ? ' drop-active' : ''}`} onDragEnter={handleDragEnter} onDragOver={(event) => { if (hasFiles(event)) event.preventDefault(); }} onDragLeave={handleDragLeave} onDrop={handleDrop}>{dropActive && <div className="composer-drop-hint" aria-hidden="true">松开以添加附件</div>}{architectureWarning && <div className="composer-architecture-warning" role="alert"><ShieldAlert size={14} /><span><strong>架构规则拦截：</strong>{architectureWarning}</span></div>}{status && <span className="agent-status-pill" role="status" aria-live="polite" title="总耗时（含工具执行、审批与网络等待）"><Grip size={13} /><span>{AGENT_STATUS_LABEL[status]} {formatStatusElapsed(statusElapsed)}</span></span>}<form onSubmit={(event) => {
       const accepted = onSubmit(event, draft);
       if (typeof accepted === 'boolean') { if (accepted) setDraft(''); return; }
       void accepted.then((ok) => { if (ok) setDraft(''); });
@@ -178,7 +226,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
       setDraft(value);
       if (slash && value === '/') slash.onRefresh();
     }} placeholder="描述你的任务… 输入 / 打开命令；Enter 发送，Shift+Enter 换行"
-      disabled={blocked} onKeyDown={(event) => {
+      disabled={blocked} onPaste={handlePaste} onKeyDown={(event) => {
         if (slashState && !event.nativeEvent.isComposing) {
           if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             event.preventDefault();
@@ -200,7 +248,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
 
       <Choice label="由 Rust 强制执行" value={mode} disabled={!preview && (blocked || running)} onChange={(value) => onSetMode(value as Mode)} options={[
         { value: 'plan', label: <span className="choice-item-stack"><span className="choice-item-main"><ListChecks size={13} />计划</span><span className="choice-item-desc">只读分析，不修改文件</span></span> },
-        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件直接执行；只读命令免审，其余需批准</span></span> },
+        { value: 'code', label: <span className="choice-item-stack"><span className="choice-item-main"><Code2 size={13} />代码</span><span className="choice-item-desc">写文件与日常命令直接执行；有风险时询问</span></span> },
         { value: 'confirm', label: <span className="choice-item-stack"><span className="choice-item-main"><ShieldCheck size={13} />确认</span><span className="choice-item-desc">每个工具/命令都需确认，批准后执行</span></span> },
         { value: 'auto', label: <span className="choice-item-stack"><span className="choice-item-main"><Zap size={13} />自动</span><span className="choice-item-desc">已开放工具直接执行（含写入/命令）</span></span> },
       ]} />

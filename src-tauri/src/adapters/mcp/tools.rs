@@ -92,7 +92,12 @@ pub fn tool_result_text(result: &Value) -> String {
         })
         .filter(|joined| !joined.is_empty())
         .unwrap_or_else(|| serde_json::to_string(result).unwrap_or_default());
-    text.chars().take(MAX_TOOL_RESULT_BYTES).collect()
+    if text.chars().count() <= MAX_TOOL_RESULT_BYTES {
+        return text;
+    }
+    let mut out: String = text.chars().take(MAX_TOOL_RESULT_BYTES).collect();
+    out.push_str("…（工具结果已截断）");
+    out
 }
 
 #[cfg(test)]

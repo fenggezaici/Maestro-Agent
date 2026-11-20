@@ -290,7 +290,7 @@ pub fn read_file_lines(
     offset: Option<u64>,
     limit: Option<u64>,
 ) -> AppResult<String> {
-    let text = read_file(root, rel)?;
+    let text = read_file_full(root, rel)?;
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let start = offset.unwrap_or(1).max(1) as usize;
@@ -315,8 +315,25 @@ pub fn read_file_lines(
     Ok(out)
 }
 
-/// `read_file` tool body: bounded UTF-8 text.
+/// `read_file` tool body: bounded UTF-8 text. 模型侧读——截断时附提示，
+/// 模型知道内容不完整而改用 offset/limit 分段。
 pub fn read_file(root: &Path, rel: &str) -> AppResult<String> {
+    let text = read_file_full(root, rel)?;
+    if text.chars().count() <= MAX_TEXT_CHARS {
+        return Ok(text);
+    }
+    let total = text.chars().count();
+    let mut out: String = text.chars().take(MAX_TEXT_CHARS).collect();
+    out.push_str(&format!(
+        "…（文件共 {total} 字符，仅显示前 {MAX_TEXT_CHARS} 字符，请用 offset/limit 或 grep 分段读取）"
+    ));
+    Ok(out)
+}
+
+/// 内部完整读：与 `read_file` 相同的安全检查（sensitive path、工作区边界、
+/// 256KB 硬上限、UTF-8），但**不做** 64KB 截断。补丁基准、撤销快照、
+/// 审批预览等必须拿到真实全文——否则会把截断内容写回磁盘丢数据。
+pub fn read_file_full(root: &Path, rel: &str) -> AppResult<String> {
     if is_sensitive_path(rel) {
         return Err(sensitive_denied());
     }
@@ -326,8 +343,7 @@ pub fn read_file(root: &Path, rel: &str) -> AppResult<String> {
         return Err("文件超过 256KB 限制".into());
     }
     let bytes = std::fs::read(&file).map_err(|_| "文件不可读".to_string())?;
-    let text = String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本文件".to_string())?;
-    Ok(text.chars().take(MAX_TEXT_CHARS).collect())
+    String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本文件".to_string())
 }
 
 /// Resolve a workspace-relative write target. The parent directory must
@@ -407,7 +423,7 @@ pub fn write_file(root: &Path, rel: &str, content: &str) -> AppResult<WriteRepor
     }
     let file = scoped_write_path(root, rel)?;
     let before = if file.is_file() {
-        read_file(root, rel).unwrap_or_default()
+        read_file_full(root, rel).unwrap_or_default()
     } else {
         String::new()
     };
@@ -458,7 +474,7 @@ pub fn apply_patch_multi(root: &Path, rel: &str, hunks: &[(&str, &str)]) -> AppR
             after: after.to_string(),
         });
     }
-    let original = read_file(root, rel)?;
+    let original = read_file_full(root, rel)?;
     let mut updated = original.clone();
     for (index, (before, after)) in hunks.iter().enumerate() {
         let matches = updated.matches(before).count();
@@ -534,5 +550,57 @@ mod tests {
         assert!(read_file(root, "a.txt").is_ok());
         assert!(read_file(root, "../a.txt").is_err());
         assert!(list_dir(root, "..").is_err());
+    }
+
+    #[test]
+    fn apply_patch_on_a_large_file_preserves_the_tail() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        // ~100KB 文件：头部一小段 + 远超 64KB 的尾部。
+        let tail = "t".repeat(80_000);
+        std::fs::write(root.join("big.txt"), format!("HEADER\n{tail}\nFOOTER")).unwrap();
+        let report = apply_patch(root, "big.txt", "HEADER\n", "PATCHED\n").unwrap();
+        assert!(report.after.ends_with(&format!("{tail}\nFOOTER")));
+        let on_disk = std::fs::read_to_string(root.join("big.txt")).unwrap();
+        assert!(on_disk.ends_with("FOOTER"));
+        assert_eq!(on_disk.len(), report.after.len());
+    }
+
+    #[test]
+    fn write_file_before_snapshot_keeps_the_full_large_file() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        let content = "x".repeat(100_000);
+        std::fs::write(root.join("big.txt"), &content).unwrap();
+        let report = write_file(root, "big.txt", "new").unwrap();
+        assert_eq!(report.before, content);
+    }
+
+    #[test]
+    fn read_file_lines_reports_the_true_line_count() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        // 构造总行数超过 64KB 渲染上限的文件：每行 ~60 字符 × 1400 行 ≈ 84KB。
+        let text: String = (1..=1400)
+            .map(|n| format!("line-{n}-{}\n", "v".repeat(50)))
+            .collect();
+        std::fs::write(root.join("many.txt"), &text).unwrap();
+        let out = read_file_lines(root, "many.txt", None, None).unwrap();
+        assert!(out.contains("共 1400 行"), "{out}");
+        // offset 续读能看到尾部行。
+        let tail = read_file_lines(root, "many.txt", Some(1400), Some(1)).unwrap();
+        assert!(tail.contains("1400\tline-1400"), "{tail}");
+    }
+
+    #[test]
+    fn read_file_marks_truncated_content() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        std::fs::write(root.join("big.txt"), "x".repeat(100_000)).unwrap();
+        let out = read_file(root, "big.txt").unwrap();
+        assert!(out.contains("仅显示前"), "{out}");
+        assert!(out.contains("offset"), "{out}");
+        // read_file_full 返回完整内容。
+        assert_eq!(read_file_full(root, "big.txt").unwrap().len(), 100_000);
     }
 }

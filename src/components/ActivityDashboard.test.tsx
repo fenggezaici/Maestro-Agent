@@ -11,7 +11,7 @@ it('renders the aggregate metrics for the project and navigates back', () => {
   render(<Tooltip.Provider><ActivityDashboard data={data} projectName="CheckInReminder" onBack={onBack} /></Tooltip.Provider>);
 
   expect(screen.getByText(/CheckInReminder/)).toBeInTheDocument();
-  for (const label of ['Total Lines', 'Plans Approved', 'Tokens Used']) {
+  for (const label of ['Total lines changed', 'Total tokens', 'Peak tokens (day)', 'Longest run', 'Current streak', 'Longest streak']) {
     expect(screen.getByText(label)).toBeInTheDocument();
   }
   fireEvent.click(screen.getByRole('button', { name: /返回|Back/i }));

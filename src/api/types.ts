@@ -84,7 +84,15 @@ export interface UserQuestion {
 }
 export interface QuestionAnswer { questionId: string; selected: string[]; custom?: string | null }
 
-export type ApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
+/// `allow_batch`/`deny_batch` 对同一模型回合的后续挂起调用一次性生效；
+/// `allow_session` 本会话全部放行（内存态，可在授权规则面板撤销）。
+export type ApprovalDecision =
+  | 'allow_once'
+  | 'allow_always'
+  | 'deny'
+  | 'allow_batch'
+  | 'deny_batch'
+  | 'allow_session';
 export type CommandScope = 'prefix' | 'exact';
 
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'cancelled';

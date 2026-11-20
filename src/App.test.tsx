@@ -36,8 +36,8 @@ beforeEach(() => {
     switch (command) {
       case 'get_snapshot': return structuredClone(snapshot);
       case 'activity_snapshot': {
-        const days = Array.from({ length: 180 }, (_, index) => ({ date: `2026-01-${String((index % 28) + 1).padStart(2, '0')}`, shortDate: '01-01', lines: 0, tokens: 0, plans: 0, level: 0 }));
-        return { source: 'live', start: days[0].date, end: days.at(-1)!.date, totalLines: 0, approvedPlans: 0, totalTokens: 0, cost: null, todayLines: 0, days, trend: days.slice(-30) };
+        const days = Array.from({ length: 364 }, (_, index) => ({ date: `2026-01-${String((index % 28) + 1).padStart(2, '0')}`, shortDate: '01-01', lines: 0, tokens: 0, plans: 0, level: 0 }));
+        return { source: 'live', start: days[0].date, end: days.at(-1)!.date, totalLines: 0, approvedPlans: 0, totalTokens: 0, peakTokens: 0, longestRunMs: 0, cost: null, todayLines: 0, days, trend: days.slice(-30), models: [], modelTrend: [] };
       }
       case 'run_change_summary': return { files: 2, additions: 3, deletions: 1, state: 'applied' };
       case 'run_changes': return [
@@ -323,11 +323,11 @@ describe('desktop IPC interface', () => {
     const callCount = mocks.invoke.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: '活动' }));
     await screen.findByRole('region', { name: 'Activity Dashboard' }, { timeout: 8000 });
-    expect(screen.getByLabelText('Total Lines')).toHaveTextContent('0');
+    expect(screen.getByLabelText('累计修改行数')).toHaveTextContent('0');
     expect(screen.getByText('Rust 内核已就绪')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(mocks.invoke.mock.calls.length).toBe(callCount + 1);
-    expect(mocks.invoke).toHaveBeenCalledWith('activity_snapshot', expect.objectContaining({ project_id: 1 }));
+    expect(mocks.invoke).toHaveBeenCalledWith('activity_snapshot', expect.objectContaining({ project_id: null }));
     fireEvent.click(screen.getByRole('button', { name: '返回对话' }));
     expect(screen.getByLabelText('发送消息')).toHaveValue('keep this draft');
   });

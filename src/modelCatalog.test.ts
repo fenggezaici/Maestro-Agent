@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { catalogLookup, capabilityOverrides, loadCatalog, readCatalog, resolveCapability, saveCapabilityOverride } from './modelCatalog';
+import { saveProviderModels } from './providerModels';
 
 const catalog = [
   { id: 'deepseek-chat', context: 128000, reasoning: false },
@@ -48,5 +49,33 @@ describe('resolveCapability', () => {
     const models = await loadCatalog();
     expect(models.length).toBeGreaterThan(0);
     expect(readCatalog()[0].id).toBe('deepseek-chat');
+  });
+});
+
+describe('resolveCapability vision', () => {
+  // 高级配置「输入类型」芯片是唯一让未知模型放行图片的通道——此前该字段
+  // 根本没进 override map，勾选 image 后仍被 vision 门禁拦截。
+  it('honors user inputTypes for models the static table does not know', () => {
+    saveProviderModels('deepseek', [{ id: 'DeepSeek-V4.1-Flash-1017', enabled: true, inputTypes: ['text', 'image'] }]);
+    expect(capabilityOverrides('deepseek')['DeepSeek-V4.1-Flash-1017'].inputTypes).toEqual(['text', 'image']);
+    expect(resolveCapability('DeepSeek-V4.1-Flash-1017', 'deepseek').vision).toBe(true);
+  });
+
+  it('explicit inputTypes without image disables vision even for table models', () => {
+    saveProviderModels('openai', [{ id: 'gpt-5', enabled: true, inputTypes: ['text'] }]);
+    // gpt-5 静态表 vision=true，但用户显式声明只有 text → 以用户为准。
+    expect(resolveCapability('gpt-5', 'openai').vision).toBe(false);
+  });
+
+  it('falls back to the static table when the row has no inputTypes', () => {
+    expect(resolveCapability('deepseek-chat', 'deepseek').vision).toBe(false);
+    saveProviderModels('deepseek', [{ id: 'deepseek-chat', enabled: true, context: 64000 }]);
+    expect(resolveCapability('deepseek-chat', 'deepseek').vision).toBe(false);
+    expect(resolveCapability('gpt-5.2', 'openai').vision).toBe(true);
+  });
+
+  it('video/pdf without image does not lift the vision gate', () => {
+    saveProviderModels('deepseek', [{ id: 'DeepSeek-V4.1-Flash-1017', enabled: true, inputTypes: ['text', 'video', 'pdf'] }]);
+    expect(resolveCapability('DeepSeek-V4.1-Flash-1017', 'deepseek').vision).toBe(false);
   });
 });

@@ -7,7 +7,7 @@ const BUILTIN_NAMES: [&str; 2] = ["explore", "general"];
 fn fallback(name: &str, source: AgentSource) -> AgentDefinition {
     AgentDefinition {
         name: name.into(), description: String::new(), category: None, mode: "subagent".into(),
-        model: None, prompt: String::new(), tools: Vec::new(), steps: None, hidden: false, color: None, source,
+        model: None, prompt: String::new(), tools: Vec::new(), steps: None, tool_budget: None, hidden: false, color: None, source,
     }
 }
 
@@ -28,6 +28,7 @@ fn parse(content: &str, fallback_name: &str, source: AgentSource) -> AgentDefini
                     "model" => if !value.is_empty() { agent.model = Some(value.into()) },
                     "tools" => agent.tools = value.split(',').map(|item| item.trim().to_string()).filter(|item| !item.is_empty()).collect(),
                     "steps" => agent.steps = value.parse().ok(),
+                    "tool_budget" => agent.tool_budget = value.parse().ok(),
                     "hidden" => agent.hidden = value == "true",
                     "color" => agent.color = Some(value.into()),
                     _ => {}
@@ -106,9 +107,10 @@ pub fn save(maestro: &Path, workspace: Option<&Path>, scope: &str, agent: &Agent
     let dir = if scope == "project" { project_dir(workspace.ok_or("未选择工作区")?) } else { global_dir(maestro) };
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let tools = agent.tools.join(", ");
-    let content = format!("---\nname: {}\ndescription: {}\ncategory: {}\nmode: {}\nmodel: {}\ntools: {}\nsteps: {}\nhidden: {}\ncolor: {}\n---\n\n{}\n",
+    let content = format!("---\nname: {}\ndescription: {}\ncategory: {}\nmode: {}\nmodel: {}\ntools: {}\nsteps: {}\ntool_budget: {}\nhidden: {}\ncolor: {}\n---\n\n{}\n",
         agent.name, agent.description, agent.category.clone().unwrap_or_default(), agent.mode,
         agent.model.clone().unwrap_or_default(), tools, agent.steps.map(|v| v.to_string()).unwrap_or_default(),
+        agent.tool_budget.map(|v| v.to_string()).unwrap_or_default(),
         agent.hidden, agent.color.clone().unwrap_or_default(), agent.prompt);
     fs::write(dir.join(format!("{}.md", agent.name)), content).map_err(|error| error.to_string())
 }
@@ -129,7 +131,7 @@ mod tests {
             name: name.into(), description: description.into(), category: Some("研究".into()),
             mode: "subagent".into(), model: None, prompt: "调研".into(),
             tools: vec!["read_file".into(), "list_dir".into()], steps: Some(4),
-            hidden: false, color: None, source,
+            tool_budget: None, hidden: false, color: None, source,
         }
     }
 
@@ -138,7 +140,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = global_dir(root.path());
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("reviewer.md"), "---\nname: reviewer\ndescription: 代码评审\ncategory: 质量\nmode: subagent\nmodel: gpt-x\ntools: read_file, list_dir\nsteps: 6\nhidden: true\ncolor: #fff\n---\n\n只读评审。\n").unwrap();
+        fs::write(dir.join("reviewer.md"), "---\nname: reviewer\ndescription: 代码评审\ncategory: 质量\nmode: subagent\nmodel: gpt-x\ntools: read_file, list_dir\nsteps: 6\ntool_budget: 60\nhidden: true\ncolor: #fff\n---\n\n只读评审。\n").unwrap();
 
         let agents = list(root.path(), None, "global");
         assert_eq!(agents.len(), 1);
@@ -149,6 +151,7 @@ mod tests {
         assert_eq!(parsed.model.as_deref(), Some("gpt-x"));
         assert_eq!(parsed.tools, vec!["read_file", "list_dir"]);
         assert_eq!(parsed.steps, Some(6));
+        assert_eq!(parsed.tool_budget, Some(60));
         assert!(parsed.hidden);
         assert_eq!(parsed.prompt, "只读评审。");
         assert_eq!(parsed.source, AgentSource::Global);
@@ -183,6 +186,21 @@ mod tests {
         assert_eq!(agents[0].name, "reviewer");
         assert_eq!(agents[0].source, AgentSource::Global);
         assert_eq!(agents[0].tools, vec!["read_file", "list_dir"]);
+    }
+
+    #[test]
+    fn tool_budget_roundtrips_and_defaults_to_none() {
+        let root = tempfile::tempdir().unwrap();
+        let mut budgeted = agent("budgeted", "x", AgentSource::Global);
+        budgeted.tool_budget = Some(150);
+        save(root.path(), None, "global", &budgeted).unwrap();
+        let text = fs::read_to_string(global_dir(root.path()).join("budgeted.md")).unwrap();
+        assert!(text.contains("tool_budget: 150"));
+
+        save(root.path(), None, "global", &agent("plain", "x", AgentSource::Global)).unwrap();
+        let agents = list(root.path(), None, "global");
+        assert_eq!(agents.iter().find(|item| item.name == "budgeted").unwrap().tool_budget, Some(150));
+        assert_eq!(agents.iter().find(|item| item.name == "plain").unwrap().tool_budget, None);
     }
 
     #[test]

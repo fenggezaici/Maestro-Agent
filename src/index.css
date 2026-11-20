@@ -238,9 +238,11 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .dashboard-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 20px; }
 .dashboard-title h3 { margin-top: 8px; font-size: clamp(21px, 3cqi, 29px); letter-spacing: -.8px; font-weight: 550; }
 .dashboard-title p:last-child { margin-top: 9px; color: #898989; font-size: 10px; line-height: 1.8; }
+.activity-scope-trigger { display: inline-flex; align-items: center; gap: 3px; color: inherit; font: inherit; line-height: inherit; padding: 0; border-radius: 4px; }
+.activity-scope-trigger:hover { color: #ccc; }
 .mock-badge { display: inline-flex; flex-shrink: 0; align-items: center; height: 18px; padding: 2px 6px; border-radius: 5px; background: #ffffff06; color: #96929f; font-size: 8px; font-weight: 400; }
 .dashboard-disclaimer { margin-top: 17px; color: #777; font-size: 9px; line-height: 1.8; }
-.dashboard-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 23px 0 18px; }
+.dashboard-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 23px 0 18px; }
 .metric-card { min-width: 0; border-radius: 10px; padding: 15px 13px; background: #222; }
 .metric-heading { display: flex; align-items: center; justify-content: space-between; color: #9f97ac; }
 .metric-card > p { margin-top: 14px; font-size: 9px; color: #9c9c9c; }
@@ -268,6 +270,20 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .heatmap-caption { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; color: #737373; font-size: 8px; line-height: 1.6; }
 .heatmap-caption > span:last-child { display: inline-flex; align-items: center; gap: 4px; }
 .heatmap-caption i { width: 9px; height: 9px; border-radius: 2px; }
+.segmented-control { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid #ffffff10; border-radius: 7px; background: #ffffff05; }
+.segmented-control button { padding: 3px 9px; border-radius: 5px; color: #8a8a8a; font-size: 9px; }
+.segmented-control button:hover { color: #ccc; }
+.segmented-control button.active { background: #ffffff12; color: #e8e8e8; }
+.trend-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; color: #8a8a8a; font-size: 9px; }
+.trend-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.trend-legend i, .model-legend i, .tooltip-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+.tooltip-dot { margin-right: 5px; }
+.model-usage { display: flex; align-items: center; gap: 26px; padding: 18px 4px 8px; }
+.model-pie { width: 220px; height: 220px; flex-shrink: 0; }
+.model-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.model-legend li { display: flex; align-items: center; gap: 8px; font-size: 10px; }
+.model-legend-name { color: #c8c8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-legend-value { margin-left: auto; color: #7d7d7d; font-size: 9px; white-space: nowrap; }
 .trend-chart { width: 100%; min-width: 0; height: 205px; margin-top: 18px; }
 .trend-caption { color: #707070; font-size: 8px; margin-top: 12px; line-height: 1.7; }
 @container (min-width: 540px) { .dashboard-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
@@ -790,6 +806,11 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .tool-call-delta { cursor: pointer; }
 .tool-call-summary:hover .tool-call-delta em { text-decoration: underline; }
 .composer-inner { position: relative; }
+/* 拖入文件时的投放反馈：虚线描边 + 居中提示，z-index 高于 SlashPanel。 */
+.composer-inner.drop-active { outline: 2px dashed #8b5cf6aa; outline-offset: 6px; border-radius: 8px; background: #8b5cf60d; }
+.composer-drop-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #141419cc; border-radius: 8px; color: #c4b5fd; font-size: 12px; letter-spacing: .04em; pointer-events: none; z-index: 30; }
+[data-theme="light"] .composer-inner.drop-active { background: #8b5cf612; }
+[data-theme="light"] .composer-drop-hint { background: #ffffffd9; color: #7c3aed; }
 .agent-status-pill { position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: #1f1f24e6; border: 1px solid #ffffff10; font-size: 10px; color: #9c93ad; animation: status-pulse 2s ease-in-out infinite; z-index: 4; }
 .agent-status-pill > svg { flex-shrink: 0; }
 @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }

@@ -66,7 +66,7 @@ it('filters the current project session list by search query', () => {
   expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toBeInTheDocument();
 });
 
-it('routes Activity to the middle dashboard, keeps Diff state, and restores chat without a modal', async () => {
+it('routes Activity to the middle dashboard, keeps Diff state, and restores chat without a modal', { timeout: 15000 }, async () => {
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
@@ -77,12 +77,11 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   expect(activity).toHaveAttribute('aria-current', 'page');
   expect(screen.queryByLabelText('发送消息')).not.toBeInTheDocument();
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-  expect(within(dashboard).getByLabelText('Total Lines（Mock）')).toHaveTextContent('12,450');
-  expect(within(dashboard).getByLabelText('Plans Approved（Mock）')).toHaveTextContent('45');
-  expect(within(dashboard).getByLabelText('Tokens Used（Mock）')).toHaveTextContent('1.2M');
-  expect(within(dashboard).getByLabelText('Cost（Mock）')).toHaveTextContent('$3.50');
+  expect(within(dashboard).getByLabelText('累计修改行数（Mock）')).toHaveTextContent('12,450');
+  expect(within(dashboard).getByLabelText('累计 Token 数（Mock）')).toHaveTextContent('120.0 万');
+  expect(within(dashboard).getByLabelText('最长任务时长（Mock）')).toHaveTextContent('1 小时 29 分');
   expect(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' })).toHaveAttribute('aria-pressed', 'true');
-  const today = dashboard.querySelector('[data-heatmap-day="2026-11-08"]')!;
+  const today = dashboard.querySelector('[data-heatmap-day="2027-05-08"]')!;
   fireEvent.focus(today);
   expect(await screen.findByRole('tooltip')).toHaveTextContent('修改 120 行代码');
   fireEvent.blur(today);

@@ -315,16 +315,24 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const currentProject = projects.find((project) => project.sessions.some((item) => item.id === c.selectedSessionId)) ?? projects[0] ?? { id: 'local', name: 'Maestro-Agent', sessions: [] };
   const [liveDashboard, setLiveDashboard] = useState<DashboardData | null>(null);
   const [activityError, setActivityError] = useState<string | null>(null);
+  // Activity 默认全局口径（与 ZCode 用量统计一致：跨所有项目）；
+  // 此前静默跟随当前会话所属项目，其他项目的改动在该视图下不可见。
+  const [activityScope, setActivityScope] = useState<'all' | number>('all');
+  const activityScopes = useMemo(() => [
+    // 'all' 的显示名在 ActivityDashboard 内按语言取 t.actScopeAll（此组件在 I18nProvider 外层）。
+    { id: 'all' as const, name: '' },
+    ...projects.filter((project) => Number.isFinite(Number(project.id))).map((project) => ({ id: Number(project.id), name: project.name })),
+  ], [projects]);
   useEffect(() => {
     if (preview || navigation !== 'activity') return;
     let cancelled = false;
-    const numeric = Number(currentProject.id);
     setActivityError(null);
-    void activitySnapshotApi(Number.isFinite(numeric) ? numeric : undefined)
+    setLiveDashboard(null);
+    void activitySnapshotApi(activityScope === 'all' ? undefined : activityScope)
       .then((snapshot) => { if (!cancelled) setLiveDashboard(snapshot); })
       .catch((reason) => { if (!cancelled) setActivityError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { cancelled = true; };
-  }, [preview, navigation, currentProject.id]);
+  }, [preview, navigation, activityScope]);
   const panelReviewFilesRef = useRef(panelReviewFiles);
   useEffect(() => { panelReviewFilesRef.current = panelReviewFiles; }, [panelReviewFiles]);
   const summaryRunRef = useRef<number | null>(null);
@@ -562,6 +570,9 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 
 \`\`\`${item.name}
 ${item.text}\`\`\``).join('');
+    // >3MiB 的图片没有 dataUrl 不会随消息发送——之前静默丢失且卡片误标已发送。
+    const unsentImages = sentAttachments.filter((item) => item.type === 'image' && !item.dataUrl).length;
+    if (unsentImages) setToastError(`${unsentImages} 张图片超过 3 MiB，仅作本地预览不会发送`);
     if (images.length && !preview) {
       const vision = resolveCapability(capability.model, capability.provider).vision;
       if (!vision) { setToastError('当前模型不支持视觉输入，请先移除图片附件'); return false; }
@@ -713,7 +724,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
         {c.error && <div className="error-message">{c.error}</div>}
         {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
-          <ActivityDashboard data={dashboardData} projectName={currentProject.name} onBack={() => setNavigation('agents')} loading={!preview && !liveDashboard && !activityError} error={activityError} />
+          <ActivityDashboard data={dashboardData} projectName={activityScopes.find((scope) => scope.id === activityScope)?.name ?? '全部项目'} scopes={activityScopes} scope={activityScope} onScopeChange={setActivityScope} onBack={() => setNavigation('agents')} loading={!preview && !liveDashboard && !activityError} error={activityError} />
         </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} />
           : navigation === 'sandbox' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading sandbox…</div>}><ArchitectureSandbox preview={preview} extensions={extensions} trace={c.architectureTrace ?? null} /></Suspense> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>

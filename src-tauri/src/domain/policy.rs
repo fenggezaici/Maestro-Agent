@@ -23,11 +23,12 @@ pub enum ToolGate {
 /// caller (ToolRouter) via the server's own readOnlyHint annotation.
 pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     Ok(match tool {
+        // task_stop 只能终止本进程拉起的后台任务，归为只读类（Plan 下也无可停任务）。
         "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file"
-        | "glob_files" | "grep_files" | "task_output"
+        | "glob_files" | "grep_files" | "task_output" | "task_stop"
         | "update_plan" | "spawn_subagent" | "ask_user" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
-        "run_command" | "task_stop" => ToolEffect::ProcessExecution,
+        "run_command" => ToolEffect::ProcessExecution,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
         _ => return Err(format!("Unknown or unregistered tool: {tool}")),
     })
@@ -35,9 +36,8 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
 
 /// Mode gate applied to a resolved effect; shared by named and MCP tools.
 /// - Plan: read-only only.
-/// - Code: reads and workspace writes execute; every command suspends.
-///   A keyword blacklist cannot bound `cmd /C` (pipes, indirect invocation,
-///   argument variants), so the only safe default is to ask.
+/// - Code (自主模式): reads and workspace writes execute; commands run unless
+///   the risk classifier flags them dangerous (`command_policy::is_dangerous`).
 /// - Confirm: every tool call suspends for per-call confirmation.
 /// - Auto/Execute: everything allowed.
 pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
@@ -55,13 +55,14 @@ pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
     }
 }
 
-/// Mode gate that also consults the read-only command allowlist. Only Code
-/// mode gains the exemption: Plan still denies every side effect, Confirm still
-/// asks for everything, Auto already allows everything.
+/// Mode gate that also consults the command risk classifier. Only Code mode
+/// gains the exemption: commands not flagged dangerous run without asking
+/// (ZCode 自主模式); Plan still denies every side effect, Confirm still asks
+/// for everything, Auto already allows everything.
 pub fn gate_call(mode: Mode, effect: ToolEffect, command: Option<&str>) -> ToolGate {
     if mode == Mode::Code
         && effect == ToolEffect::ProcessExecution
-        && command.is_some_and(command_policy::is_read_only_safe)
+        && command.is_some_and(|cmd| !command_policy::is_dangerous(cmd))
     {
         return ToolGate::Allow;
     }
@@ -112,8 +113,6 @@ mod tests {
 
     #[test]
     fn code_mode_gate_requires_approval_for_commands() {
-        // Every command shape reaches the approval gate: a keyword blacklist
-        // cannot cover pipes, indirect invocation or argument variants.
         assert_eq!(authorize(Mode::Code, "write_file").unwrap(), ToolEffect::WorkspaceWrite);
         assert_eq!(authorize(Mode::Code, "read_file").unwrap(), ToolEffect::ReadOnly);
         assert_eq!(gate(Mode::Code, ToolEffect::WorkspaceWrite), ToolGate::Allow);
@@ -124,18 +123,41 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_auto_runs_only_allowlisted_read_commands() {
+    fn code_mode_asks_only_for_dangerous_commands() {
         use ToolGate::*;
-        assert_eq!(gate_call(Mode::Code, ToolEffect::ProcessExecution, Some("git status")), Allow);
-        assert_eq!(gate_call(Mode::Code, ToolEffect::ProcessExecution, Some("rg TODO")), Allow);
-        assert_eq!(gate_call(Mode::Code, ToolEffect::ProcessExecution, Some("where cmd")), Allow);
+        // 自主模式：非危险命令直接放行，危险命令才挂起。
         for command in [
-            "git commit -m x",
-            "git checkout .",
-            "git diff --output=x",
+            "git status",
+            "rg TODO",
+            "where cmd",
+            "npm test",
             "npm install",
+            "python run_tests.py",
+            "pnpm build",
+            "cargo test",
+            "git add .",
+            "git commit -m x",
+            "dir",
+            "git diff --output=x",
+        ] {
+            assert_eq!(
+                gate_call(Mode::Code, ToolEffect::ProcessExecution, Some(command)),
+                Allow,
+                "{command}"
+            );
+        }
+        for command in [
+            "git push",
+            "git checkout .",
+            "npm publish",
+            "del x",
+            "rm -rf x",
             "python -c \"print(1)\"",
             "git status && del x",
+            "cargo publish",
+            "docker ps",
+            "curl https://x",
+            "cmd /C dir",
         ] {
             assert_eq!(
                 gate_call(Mode::Code, ToolEffect::ProcessExecution, Some(command)),
@@ -147,7 +169,7 @@ mod tests {
         // The exemption is Code-only.
         assert_eq!(gate_call(Mode::Confirm, ToolEffect::ProcessExecution, Some("git status")), RequireApproval);
         assert_eq!(gate_call(Mode::Plan, ToolEffect::ProcessExecution, Some("git status")), Deny);
-        assert_eq!(gate_call(Mode::Auto, ToolEffect::ProcessExecution, Some("git commit -m x")), Allow);
+        assert_eq!(gate_call(Mode::Auto, ToolEffect::ProcessExecution, Some("git push")), Allow);
         // Non-command effects keep their existing matrix.
         assert_eq!(gate_call(Mode::Code, ToolEffect::WorkspaceWrite, Some("git status")), Allow);
         assert_eq!(gate_call(Mode::Plan, ToolEffect::WorkspaceWrite, Some("git status")), Deny);

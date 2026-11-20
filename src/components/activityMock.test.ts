@@ -1,27 +1,43 @@
-import { expect, it } from 'vitest';
-import { createMockDashboard, heatmapWeeks } from './activityMock';
+import { describe, expect, it } from 'vitest';
+import { activityStreaks, aggregateHeatmap, type DashboardDay } from './activityMock';
 
-it('provides a deterministic six-month dataset with consistent KPIs and thirty trend days', () => {
-  const data = createMockDashboard({ id: 'maestro', today: { changedLines: 120, completedPlans: 3 } });
-  expect(data.source).toBe('mock');
-  expect(data.start).toBe('2026-05-09');
-  expect(data.end).toBe('2026-11-08');
-  expect(data.days.length).toBeGreaterThan(180);
-  expect(data.trend).toHaveLength(30);
-  expect(data.days.reduce((sum, day) => sum + day.lines, 0)).toBe(data.totalLines);
-  expect(data.days.reduce((sum, day) => sum + day.tokens, 0)).toBe(data.totalTokens);
-  expect(data.days.reduce((sum, day) => sum + day.plans, 0)).toBe(data.approvedPlans);
-  expect(data.days.at(-1)).toMatchObject({ lines: 120, plans: 3 });
-  const weeks = heatmapWeeks(data.days);
-  expect(weeks.every((week) => week.length === 7)).toBe(true);
-  expect(weeks.flat().filter(Boolean)).toEqual(data.days);
-  expect(createMockDashboard({ id: 'maestro', today: { changedLines: 120, completedPlans: 3 } })).toEqual(data);
+const day = (date: string, lines: number, tokens = 0): DashboardDay =>
+  ({ date, shortDate: date.slice(5), lines, tokens, plans: 0, level: 0 });
+
+describe('activityStreaks', () => {
+  it('counts current streak from today and the longest streak overall', () => {
+    const days = [
+      day('2026-11-10', 5), day('2026-11-11', 5), day('2026-11-12', 5),
+      day('2026-11-13', 0), day('2026-11-14', 0),
+      day('2026-11-15', 3), day('2026-11-16', 0, 800),
+    ];
+    expect(activityStreaks(days)).toEqual({ current: 2, longest: 3 });
+  });
+
+  it('returns zero current streak when today is inactive', () => {
+    const days = [day('2026-11-10', 5), day('2026-11-11', 0)];
+    expect(activityStreaks(days)).toEqual({ current: 0, longest: 1 });
+  });
 });
 
-it('uses explicit mock defaults in a live workspace without session-derived metrics', () => {
-  const data = createMockDashboard({ id: 'local' });
-  expect(data.source).toBe('mock');
-  expect(data.totalLines).toBe(12450);
-  expect(data.totalTokens).toBe(1200000);
-  expect(data.todayLines).toBe(120);
+describe('aggregateHeatmap', () => {
+  // days 必须连续密集（与后端输出一致）：11-16(一)..11-21 为周0，11-22(日)..11-24 为周1。
+  const days = [
+    ...Array.from({ length: 6 }, (_, i) => day(`2026-11-${16 + i}`, 10)),
+    ...Array.from({ length: 3 }, (_, i) => day(`2026-11-${22 + i}`, 30)),
+  ];
+
+  it('daily returns days unchanged', () => {
+    expect(aggregateHeatmap(days, 'daily').map((d) => d.lines)).toEqual(days.map((d) => d.lines));
+  });
+
+  it('cumulative accumulates lines from the window start', () => {
+    const result = aggregateHeatmap(days, 'cumulative');
+    expect(result[0].lines).toBe(10);
+    expect(result.at(-1)!.lines).toBe(150);
+  });
+
+  it('weekly sums each calendar week into every cell', () => {
+    expect(aggregateHeatmap(days, 'weekly').map((d) => d.lines)).toEqual([60, 60, 60, 60, 60, 60, 90, 90, 90]);
+  });
 });

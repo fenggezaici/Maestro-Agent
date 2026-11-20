@@ -12,6 +12,7 @@ export interface AgentDefinition {
   prompt: string;
   tools: string[];
   steps?: number | null;
+  toolBudget?: number | null;
   hidden: boolean;
   color?: string | null;
   source?: AgentSource;
