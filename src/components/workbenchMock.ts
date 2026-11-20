@@ -34,9 +34,11 @@ export function changeMockExtension(items: MockExtension[], id: string, action: 
 import { useState } from 'react';
 import type { ExtensionsController } from '../hooks/useExtensions';
 import type { McpServerView, PluginView, RecommendedItem, SkillView } from '../api/extensions';
+import type { AgentDefinition } from '../api/agents';
+import type { KnownExtensions } from '../lib/architectureGraph';
 
-/// 架构沙盘 Preview 物料区：不触 IPC 的固定 fixture（含运行中 MCP 工具）。
-export function sandboxFixtureExtensions(): { skills: SkillView[]; servers: McpServerView[]; plugins: PluginView[] } {
+/// 架构沙盘 Preview 物料区：不触 IPC 的固定 fixture（含运行中 MCP 工具与子智能体）。
+export function sandboxFixtureExtensions(): KnownExtensions {
   return {
     skills: [
       { name: 'ui-guidelines', description: 'UI 组件与设计规范', source: 'global', path: '~/.maestro/skills/ui-guidelines/SKILL.md' },
@@ -52,6 +54,10 @@ export function sandboxFixtureExtensions(): { skills: SkillView[]; servers: McpS
     plugins: [
       { name: 'acceptance-checklist', description: '验收清单（项目级清单示例）', kind: 'skill', target: 'plan-review', tool: null, condition: 'required', params: {}, source: 'project', path: '<workspace>/.maestro/plugins/acceptance-checklist.json', error: null },
     ],
+    agents: [
+      { name: 'explore', description: '只读代码调研：并行查找文件、证据路径与风险', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], hidden: false, source: 'builtin' },
+      { name: 'general', description: '只读分析总结：整理多来源信息并给出结论', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], hidden: false, source: 'builtin' },
+    ] satisfies AgentDefinition[],
   };
 }
 

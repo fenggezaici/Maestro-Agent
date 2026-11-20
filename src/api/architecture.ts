@@ -49,11 +49,13 @@ export interface GraphNodeData {
   result?: ActionResult;
   message?: string;
   extension?: ExtensionData;
+  /** 仅 subagent 节点：绑定的子智能体类型名（AgentDefinition.name）。 */
+  agent?: string;
 }
 
 export interface GraphNode {
   id: string;
-  type: 'trigger' | 'requirement' | 'restriction' | 'action' | 'extension';
+  type: 'trigger' | 'requirement' | 'restriction' | 'action' | 'extension' | 'subagent';
   position: GraphPosition;
   data: GraphNodeData;
 }

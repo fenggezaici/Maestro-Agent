@@ -18,12 +18,13 @@ pub mod subagent;
 pub mod user_question;
 
 pub use architecture::{
-    armed_obligations, effective_after_set, evaluate as evaluate_architecture, optional_extensions,
-    parse_graph, path_matches, required_extensions, trigger_ancestors, validate_graph, ActionResult,
-    ArmedObligation, ArchitectureGraph, ExtensionData, ExtensionKind, ExtensionRequirement,
-    ExtensionSnapshot, GateMode, GateTiming, GraphDecision, GraphEdge, GraphNode, GraphNodeData,
-    GraphPosition, HistoryEntry, PendingCall, ResolvedPlugin, SatisfyScope, TraceStatus, TraceStep,
-    TriggerAction, GRAPH_VERSION, RULES_FILE_NAME,
+    armed_obligations, describe_obligation, effective_after_set, evaluate as evaluate_architecture,
+    optional_extensions, parse_graph, path_matches, required_extensions, subagent_bindings,
+    trigger_ancestors, validate_graph, ActionResult, ArmedObligation, ArchitectureGraph,
+    BoundExtension, ExtensionData, ExtensionKind, ExtensionRequirement, ExtensionSnapshot, GateMode,
+    GateTiming, GraphDecision, GraphEdge, GraphNode, GraphNodeData, GraphPosition, HistoryEntry,
+    NodeKind, PendingCall, ResolvedPlugin, SatisfyScope, TraceStatus, TraceStep, TriggerAction,
+    GRAPH_VERSION, RULES_FILE_NAME,
 };
 pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
@@ -33,8 +34,8 @@ pub use extension::{
     SkillView, WorkspaceTrustStatus,
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
-pub use activity::{ActivityDay, ActivitySnapshot};
-pub use agent::{AgentDefinition, AgentSource};
+pub use activity::{ActivityDay, ActivitySnapshot, ModelTrendDay, ModelUsage};
+pub use agent::{AgentDefinition, AgentSource, DEFAULT_SUBAGENT_TOOL_BUDGET, MAX_SUBAGENT_TOOL_BUDGET};
 pub use change::{
     line_change_counts, merge_file_changes, RevertIssue, RevertPreview, RevertResult,
     RunChangeSummary, RunFileChange,

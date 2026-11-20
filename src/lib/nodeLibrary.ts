@@ -3,6 +3,7 @@
 /// 每一项只是「节点类型 + 预置 data」的工厂描述，真正建节点仍走 architectureGraph 的工厂。
 import { fuzzyScore } from '../commandCenter';
 import type { ExtensionData, GraphNodeData } from '../api/architecture';
+import type { AgentDefinition } from '../api/agents';
 import { SANDBOX_TEMPLATES, type KnownExtensions, type NodeKind } from './architectureGraph';
 
 export type LibraryNodeKind = NodeKind | 'template';
@@ -283,6 +284,34 @@ export function classifyUsage(name: string, text = ''): string {
   return best;
 }
 
+// ---- 智能体节点库（动态来自 agents 数据源） --------------------------------------
+// 子智能体是「装配终点」：Extension --pass--> Subagent(agent) 声明该类型子智能体的
+// 能力授权；required 绑定在子循环内强制真实调用（Skill 预注入≠已调用）。
+
+function agentItems(agents: AgentDefinition[]): LibraryItem[] {
+  return agents
+    .filter((agent) => agent.mode === 'subagent' && !agent.hidden)
+    .map((agent) => item({
+      id: `agent:${agent.name}`,
+      title: `🤖 ${agent.name}`,
+      subtitle: agent.description || '装配终点：入边扩展作为该子智能体的能力授权',
+      keywords: `agent 子智能体 subagent 装配 ${agent.name} ${agent.description ?? ''} ${agent.category ?? ''}`,
+      badge: agent.source === 'project' ? '项目' : agent.source === 'global' ? '全局' : '内置',
+      category: ['智能体', agent.category?.trim() || '子智能体'],
+      nodeKind: 'subagent',
+      seed: { agent: agent.name },
+      detail: {
+        description: agent.description || undefined,
+        meta: [
+          ['来源', agent.source === 'project' ? '项目 .maestro/agents' : agent.source === 'global' ? '全局 ~/.maestro/agents' : '内置'],
+          ['模型', agent.model || '跟随会话'],
+          ['工具预算', agent.toolBudget != null ? String(agent.toolBudget) : '默认'],
+        ],
+        usage: '装配终点：扩展节点用「通过」出口连入本节点——spawn_subagent 派发该类型时子循环获得这些能力；必选条目强制真实调用后才能收尾，可选条目只注入建议。',
+      },
+    }));
+}
+
 // ---- 扩展节点库（动态来自已安装扩展） -------------------------------------------
 
 function extensionItems(known: KnownExtensions): LibraryItem[] {
@@ -420,7 +449,7 @@ export function detailForExtension(ext: Pick<ExtensionData, 'kind' | 'target' | 
 }
 
 export function buildLibraryItems(known: KnownExtensions): LibraryItem[] {
-  const items = [...coreItems(), ...extensionItems(known), ...templateItems()];
+  const items = [...coreItems(), ...agentItems(known.agents ?? []), ...extensionItems(known), ...templateItems()];
   // 重建映射：扩展清单随扫描结果变化，旧 key 全部废弃。
   extensionHints.clear();
   for (const entry of items) {

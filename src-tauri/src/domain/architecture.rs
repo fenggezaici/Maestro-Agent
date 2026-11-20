@@ -82,6 +82,8 @@ pub struct GraphNodeData {
     pub message: Option<String>,
     // Extension
     pub extension: Option<ExtensionData>,
+    // Subagent 装配节点：绑定的子智能体类型名（如 explore/reviewer）。
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,6 +105,9 @@ pub enum NodeKind {
     Restriction,
     Action,
     Extension,
+    /// 装配节点（不参与调用求值）：Extension → Subagent 入边声明
+    /// 「该类型子智能体获得这些扩展授权」，spawn_subagent 时生效。
+    Subagent,
 }
 
 impl NodeKind {
@@ -113,6 +118,7 @@ impl NodeKind {
             "restriction" => Self::Restriction,
             "action" => Self::Action,
             "extension" => Self::Extension,
+            "subagent" => Self::Subagent,
             _ => return None,
         })
     }
@@ -403,8 +409,21 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
         if source_kind == NodeKind::Action {
             return Err(format!("Action 节点 {} 不能有出边", source.id));
         }
+        // 装配终点：子智能体节点只消费扩展入边，自身不向图求值输出。
+        if source_kind == NodeKind::Subagent {
+            return Err(format!("Subagent 节点 {} 不能有出边", source.id));
+        }
         if target_kind == NodeKind::Trigger {
             return Err(format!("Trigger 节点 {} 不能作为目标", target.id));
+        }
+        if target_kind == NodeKind::Subagent {
+            if source_kind != NodeKind::Extension {
+                return Err(format!("Subagent 节点 {} 只接受扩展节点入边", target.id));
+            }
+            // 装配连线仅表达「授予」，fail 出口在此无意义（未满足在子循环内处理）。
+            if edge.source_handle.as_deref().is_some_and(|handle| handle != "pass") {
+                return Err(format!("扩展 → Subagent 装配边只能使用 pass 出口（边 {}）", edge.id));
+            }
         }
         if let Some(handle) = edge.target_handle.as_deref() {
             if handle != "in" {
@@ -438,7 +457,7 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
                     return Err(format!("可选扩展节点 {} 不允许 fail 出边", source.id));
                 }
             }
-            NodeKind::Action => unreachable!(),
+            NodeKind::Action | NodeKind::Subagent => unreachable!(),
         }
     }
     // DAG：Kahn 拓扑，剩环即拒。
@@ -514,6 +533,20 @@ fn validate_node_data(kind: NodeKind, node: &GraphNode, effective_after: bool) -
         NodeKind::Action => {
             if data.result.is_none() {
                 return Err(format!("Action {} 缺少 result（block/warn/remind）", node.id));
+            }
+        }
+        NodeKind::Subagent => {
+            // 与 adapters::agents::save 同款命名字符集，保证绑定名可命中磁盘定义。
+            let name = data
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("Subagent {} 缺少 agent 类型名", node.id))?;
+            if name.chars().count() > 64
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(format!("Subagent {} 的 agent 名必须为字母/数字/-/_", node.id));
             }
         }
         NodeKind::Extension => {
@@ -1080,6 +1113,10 @@ impl<'a> Eval<'a> {
                 let warn = result == ActionResult::Warn;
                 (true, warn, message, trace)
             }
+            NodeKind::Subagent => {
+                // 装配终点：求值透明——连线只声明授权，不拦截、不产生 trace 步骤。
+                (false, false, None, trace)
+            }
             NodeKind::Requirement | NodeKind::Restriction | NodeKind::Extension => {
                 let (passed, status, default_message) = self.check(node);
                 trace.push(TraceStep { node_id: id.into(), status });
@@ -1183,7 +1220,8 @@ fn default_extension_message(ext: &ExtensionData) -> String {
 }
 
 /// 事后义务的验收调用描述（Run 末追问与缺省拦截文案共用）。
-fn describe_obligation(node: &GraphNode) -> String {
+/// 关卡/扩展义务的统一描述（拦截文案、欠账清单、契约装配段共用同一口径）。
+pub fn describe_obligation(node: &GraphNode) -> String {
     let data = &node.data;
     match NodeKind::parse(&node.node_type) {
         Some(NodeKind::Requirement) => {
@@ -1215,6 +1253,77 @@ fn describe_obligation(node: &GraphNode) -> String {
 
 fn default_after_message(node: &GraphNode) -> String {
     format!("验收未完成前不能进行其他操作：请先{}", describe_obligation(node))
+}
+
+// ---- 子智能体装配（Extension → Subagent 绑定查询，不参与求值） -------------------
+
+/// 一条装配绑定：扩展节点（插件已按清单展开）授权给子智能体的能力。
+#[derive(Debug, Clone)]
+pub struct BoundExtension {
+    pub kind: ExtensionKind,
+    /// 解析后的目标：Skill 名或 MCP Server 名。
+    pub target: String,
+    /// MCP 具体工具名；缺省表示该 Server 任意工具。
+    pub tool: Option<String>,
+    pub required: bool,
+    pub params: BTreeMap<String, String>,
+    /// 插件无法解析时的告警（清单未安装/损坏）——装配缺失不静默授权。
+    pub missing: Option<String>,
+}
+
+/// 图中绑给 `agent` 类型子智能体的全部扩展：Extension → Subagent(name=agent)
+/// 入边集合（merge 输入语义）。插件按 `plugins` 清单展开为底层 Skill/MCP；
+/// 同一目标去重，required 优先于 optional。
+pub fn subagent_bindings(
+    graph: &ArchitectureGraph,
+    agent: &str,
+    plugins: &BTreeMap<String, ResolvedPlugin>,
+) -> Vec<BoundExtension> {
+    let subagent_ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            NodeKind::parse(&node.node_type) == Some(NodeKind::Subagent)
+                && node.data.agent.as_deref().map(str::trim) == Some(agent)
+        })
+        .map(|node| node.id.as_str())
+        .collect();
+    if subagent_ids.is_empty() {
+        return Vec::new();
+    }
+    let by_id: HashMap<&str, &GraphNode> =
+        graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let mut out: Vec<BoundExtension> = Vec::new();
+    for edge in &graph.edges {
+        if !subagent_ids.contains(edge.target.as_str()) {
+            continue;
+        }
+        let Some(source) = by_id.get(edge.source.as_str()) else { continue };
+        if NodeKind::parse(&source.node_type) != Some(NodeKind::Extension) {
+            continue;
+        }
+        let Some(ext) = source.data.extension.as_ref() else { continue };
+        let target = ext.target.as_deref().unwrap_or_default();
+        let required = ext.is_required();
+        let resolved = match ext.kind.unwrap_or(ExtensionKind::Skill) {
+            ExtensionKind::Plugin => match plugins.get(target) {
+                Some(plugin) => Some((plugin.kind, plugin.target.clone(), plugin.tool.clone().or(ext.tool.clone()), None)),
+                None => Some((ExtensionKind::Plugin, target.to_string(), None, Some(format!("插件 {target} 未安装或清单损坏")))),
+            },
+            kind => Some((kind, target.to_string(), ext.tool.clone(), None)),
+        };
+        let Some((kind, target, tool, missing)) = resolved else { continue };
+        // 去重键不含 required：同名绑定合并为更严格的 required。
+        let key = (kind, target.clone(), tool.clone());
+        if let Some(existing) = out.iter_mut().find(|item| {
+            item.kind == key.0 && item.target == key.1 && item.tool == key.2
+        }) {
+            existing.required |= required;
+            continue;
+        }
+        out.push(BoundExtension { kind: key.0, target: key.1, tool: key.2, required, params: ext.params.clone(), missing });
+    }
+    out
 }
 
 /// 多分支阻断消息合并：>1 条编号清单（cap 5 + 等 N 项），单条原样。
@@ -2416,5 +2525,125 @@ mod tests {
         assert!(merged.contains("5. 第5项") && merged.contains("等 6 项") && !merged.contains("第6项"));
         assert_eq!(merge_messages(&["独苗".into()]), "独苗");
         assert_eq!(merge_messages(&[]), "");
+    }
+
+    fn subagent_node(id: &str, agent: &str) -> serde_json::Value {
+        node(id, "subagent", json!({ "agent": agent }))
+    }
+
+    #[test]
+    fn subagent_node_validates_agent_and_edges() {
+        // 缺 agent 名 → 拒
+        let bad = graph(vec![node("s", "subagent", json!({}))], vec![]);
+        assert!(validate_graph(&bad).is_err());
+        // 非扩展入边（trigger → subagent）→ 拒
+        let bad_in = graph(
+            vec![node("t", "trigger", json!({"action":"any"})), subagent_node("s", "explore")],
+            vec![edge("e1", "t", "s", Some("out"))],
+        );
+        assert!(validate_graph(&bad_in).is_err());
+        // subagent 出边 → 拒
+        let bad_out = graph(
+            vec![subagent_node("s", "explore"), node("a", "action", json!({"result":"block"}))],
+            vec![edge("e1", "s", "a", Some("pass"))],
+        );
+        assert!(validate_graph(&bad_out).is_err());
+        // fail 出口接 subagent → 拒
+        let bad_fail = graph(
+            vec![skill_ext("x", "ui-guidelines", "required"), subagent_node("s", "explore")],
+            vec![edge("e1", "x", "s", Some("fail"))],
+        );
+        assert!(validate_graph(&bad_fail).is_err());
+        // 合法：extension --pass--> subagent
+        let ok = graph(
+            vec![skill_ext("x", "ui-guidelines", "required"), subagent_node("s", "explore")],
+            vec![edge("e1", "x", "s", Some("pass"))],
+        );
+        assert!(validate_graph(&ok).is_ok());
+    }
+
+    #[test]
+    fn subagent_bindings_collects_and_dedupes() {
+        let g = graph(
+            vec![
+                skill_ext("x1", "ui-guidelines", "required"),
+                skill_ext("x2", "ui-guidelines", "optional"), // 同名 optional → required 胜出
+                skill_ext("x3", "plan-review", "optional"),
+                node("m", "extension", json!({"extension":{"kind":"mcp","name":"pg","target":"pg","requirement":"required"}})),
+                subagent_node("s", "explore"),
+                subagent_node("other", "general"),
+            ],
+            vec![
+                edge("e1", "x1", "s", Some("pass")),
+                edge("e2", "x2", "s", None), // 缺省出口按 pass 计
+                edge("e3", "x3", "s", Some("pass")),
+                edge("e4", "m", "s", Some("pass")),
+                edge("e5", "x3", "other", Some("pass")),
+            ],
+        );
+        let bindings = subagent_bindings(&g, "explore", &BTreeMap::new());
+        assert_eq!(bindings.len(), 3);
+        let ui = bindings.iter().find(|b| b.target == "ui-guidelines").unwrap();
+        assert!(ui.required, "同名 optional 绑定应合并为 required");
+        assert!(bindings.iter().any(|b| !b.required && b.target == "plan-review"));
+        assert!(bindings.iter().any(|b| b.kind == ExtensionKind::Mcp && b.target == "pg"));
+        // 其它类型的绑定互不影响
+        assert_eq!(subagent_bindings(&g, "general", &BTreeMap::new()).len(), 1);
+        assert!(subagent_bindings(&g, "nobody", &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn subagent_bindings_expands_plugins() {
+        let g = graph(
+            vec![
+                node("p", "extension", json!({"extension":{"kind":"plugin","name":"bundle","target":"bundle","requirement":"required"}})),
+                node("q", "extension", json!({"extension":{"kind":"plugin","name":"ghost","target":"ghost","requirement":"required"}})),
+                subagent_node("s", "explore"),
+            ],
+            vec![
+                edge("e1", "p", "s", Some("pass")),
+                edge("e2", "q", "s", Some("pass")),
+            ],
+        );
+        let plugins: BTreeMap<String, ResolvedPlugin> = [(
+            "bundle".to_string(),
+            ResolvedPlugin { kind: ExtensionKind::Mcp, target: "pg".into(), tool: Some("query".into()) },
+        )].into_iter().collect();
+        let bindings = subagent_bindings(&g, "explore", &plugins);
+        assert_eq!(bindings.len(), 2);
+        let mcp = bindings.iter().find(|b| b.kind == ExtensionKind::Mcp).unwrap();
+        assert_eq!((mcp.target.as_str(), mcp.tool.as_deref()), ("pg", Some("query")));
+        let missing = bindings.iter().find(|b| b.kind == ExtensionKind::Plugin).unwrap();
+        assert!(missing.missing.is_some());
+    }
+
+    #[test]
+    fn subagent_nodes_do_not_affect_eval() {
+        // 装配节点不参与求值：触发链与无装配图的判定一致。
+        let g = graph(
+            vec![
+                node("t", "trigger", json!({"action":"modify","targetDir":"src"})),
+                skill_ext("x", "ui-guidelines", "required"),
+                subagent_node("s", "explore"),
+            ],
+            vec![
+                edge("e1", "t", "x", Some("out")),
+                edge("e2", "x", "s", Some("pass")),
+            ],
+        );
+        let snap = snapshot();
+        // Skill 未调用 → fail 无 Action → 默认拦截文案。
+        let hit = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert!(hit.blocked);
+        // Skill 已调用 → pass 无子节点 → 放行（装配边不产生拦截）。
+        let pass = evaluate(
+            &g,
+            &write_call("src/a.ts", "x"),
+            &[history("load_skill", "ui-guidelines", 1)],
+            1,
+            &snap,
+            "",
+        );
+        assert!(!pass.blocked);
     }
 }

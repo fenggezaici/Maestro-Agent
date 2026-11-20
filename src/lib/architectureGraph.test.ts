@@ -219,3 +219,54 @@ describe('autoActionMessage（空文案自动派生预览）', () => {
     expect(autoActionMessage(undefined)).toBe('该操作被架构规则拦截。');
   });
 });
+
+describe('subagent 装配节点', () => {
+  const agent = () => createNode('subagent', at, { agent: 'explore' });
+  const ext = (requirement: 'required' | 'optional' = 'required') =>
+    createExtensionNode(at, { kind: 'skill', name: 'ui-guidelines', target: 'ui-guidelines', requirement });
+
+  it('Extension --pass--> Subagent 合法；多个扩展可 merge 进同一节点', () => {
+    const s = agent();
+    const a = ext(), b = ext();
+    const nodes = [s, a, b];
+    expect(isConnectionAllowed(nodes, [], { source: a.id, target: s.id, sourceHandle: 'pass' }).ok).toBe(true);
+    const edges: SandboxEdge[] = [{ id: 'e1', source: a.id, target: s.id, sourceHandle: 'pass', targetHandle: 'in' }];
+    expect(isConnectionAllowed(nodes, edges, { source: b.id, target: s.id, sourceHandle: 'pass' }).ok).toBe(true);
+    // 缺省出口（无 sourceHandle）按 pass 计。
+    expect(isConnectionAllowed(nodes, edges, { source: b.id, target: s.id }).ok).toBe(true);
+  });
+
+  it('拒绝非扩展入边、fail 装配边与 subagent 出边', () => {
+    const s = agent();
+    const trigger = createNode('trigger', at, { action: 'any' });
+    const skill = ext();
+    const nodes = [s, trigger, skill];
+    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: s.id, sourceHandle: 'out' }).ok).toBe(false);
+    expect(isConnectionAllowed(nodes, [], { source: skill.id, target: s.id, sourceHandle: 'fail' }).ok).toBe(false);
+    const action = createNode('action', at, { result: 'block' });
+    expect(isConnectionAllowed([s, action], [], { source: s.id, target: action.id, sourceHandle: 'pass' }).ok).toBe(false);
+  });
+
+  it('validateDraft：缺 agent/非法字符报错，未定义 agent 报警告', () => {
+    const missing = createNode('subagent', at, { agent: '  ' });
+    const badName = createNode('subagent', at, { agent: '不是合法名!' });
+    const ghost = agent();
+    const { errors, warnings } = validateDraft([missing, badName, ghost], [], {
+      ...SEED, agents: [{ name: 'general', mode: 'subagent', description: '', prompt: '', tools: [], hidden: false, source: 'builtin' }],
+    });
+    expect(errors.some((e) => e.includes('缺少 agent'))).toBe(true);
+    expect(errors.some((e) => e.includes('字母/数字/-/_'))).toBe(true);
+    expect(warnings.some((w) => w.includes('explore 未定义'))).toBe(true);
+  });
+
+  it('serialize 保留 agent 字段；nodeSummary 显示装配终点', () => {
+    const s = agent();
+    const graph = serializeGraph([s], []);
+    expect(graph.nodes[0].type).toBe('subagent');
+    expect(graph.nodes[0].data.agent).toBe('explore');
+    expect(nodeSummary(s)).toContain('type=explore');
+    const back = deserializeGraph(graph);
+    expect(back.nodes[0].data.nodeType).toBe('subagent');
+    expect(back.nodes[0].data.agent).toBe('explore');
+  });
+});

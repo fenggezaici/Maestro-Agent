@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{atomic::{AtomicU64, Ordering}, Arc},
 };
@@ -50,9 +50,18 @@ struct Control {
     /// one can exist (the agent loop is serial); dropping the responder
     /// without answering counts as rejection.
     pending: Option<PendingApproval>,
+    /// 本批剩余挂起调用的批量决定（allow_batch/deny_batch 写入）。在
+    /// `execute_tool_calls_scoped` 入口清空——决定不外泄到下一批。
+    bulk_decision: Option<BulkDecision>,
     /// `ask_user` suspension; separate from approvals so neither overwrites
     /// the other. Dropping the responder counts as cancellation.
     pending_question: Option<PendingQuestion>,
+}
+
+#[derive(Clone)]
+struct BulkDecision {
+    approved: bool,
+    feedback: Option<String>,
 }
 
 struct PendingApproval {
@@ -115,6 +124,24 @@ struct MetricsAccumulator {
     dirty: bool,
 }
 
+/// `list_approval_rules` 中会话全部放行合成行的 tool 字段。
+const SESSION_GRANT_TOOL: &str = "*";
+
+/// Why a call ran without a prompt — ordered strongest evidence first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditKind {
+    /// 历史 "always allow" 规则命中。
+    RuleApproved,
+    /// 本会话「全部放行」生效中。
+    SessionGranted,
+    /// 只读白名单直接执行（无 shell）。
+    ReadOnlyAllowlist,
+    /// 自主模式：未命中危险规则。
+    Autonomous,
+    /// 其余工具（MCP 只读、扩展工具等）。
+    Extension,
+}
+
 fn sum_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (None, None) => None,
@@ -161,6 +188,9 @@ pub struct Kernel {
     write_net: StdMutex<HashMap<i64, HashMap<String, (String, String)>>>,
     /// Session-scoped "always allow" rules; cleared when the app exits.
     approval_rules: StdMutex<HashMap<i64, Vec<ApprovalRule>>>,
+    /// 会话级「全部放行」（ZCode full access 对应物）：纯内存不落库，
+    /// 应用退出即失效；只能在非 Plan 模式下豁免 RequireApproval。
+    full_access_sessions: StdMutex<HashSet<i64>>,
     /// Provider API keys at rest (DPAPI on Windows); the webview never persists them.
     credentials: CredentialStore,
 }
@@ -194,6 +224,7 @@ impl Kernel {
             metrics_acc: StdMutex::new(HashMap::new()),
             write_net: StdMutex::new(HashMap::new()),
             approval_rules: StdMutex::new(HashMap::new()),
+            full_access_sessions: StdMutex::new(HashSet::new()),
             credentials,
         });
         // 全局架构规则不依赖工作区，启动即装载（项目规则随 set_workspace_root 生效）。
@@ -456,6 +487,7 @@ impl Kernel {
                 finishing: false,
                 workspace_root: run_root,
                 pending: None,
+                bulk_decision: None,
                 pending_question: None,
             });
             state.cancelled_run = None;
@@ -1087,11 +1119,34 @@ impl Kernel {
         let (pending, new_rules) = {
             let mut state = self.state.lock().await;
             Self::active_run_locked(&state, run_id)?;
-            let pending = state
-                .control
-                .as_mut()
-                .and_then(|control| control.pending.take())
+            let control = state.control.as_mut().ok_or("没有等待批准的工具调用")?;
+            let pending = control
+                .pending
+                .take()
                 .ok_or("没有等待批准的工具调用")?;
+            // 批/会话级决定在当前挂起调用之外记账：批决定写入 control，
+            // 会话放行写入 Kernel 级内存集，二者都不需要额外等待。
+            match decision {
+                ApprovalDecision::AllowBatch => {
+                    control.bulk_decision = Some(BulkDecision {
+                        approved: true,
+                        feedback: feedback.clone(),
+                    });
+                }
+                ApprovalDecision::DenyBatch => {
+                    control.bulk_decision = Some(BulkDecision {
+                        approved: false,
+                        feedback: feedback.clone(),
+                    });
+                }
+                ApprovalDecision::AllowSession => {
+                    self.full_access_sessions
+                        .lock()
+                        .unwrap()
+                        .insert(pending.session_id);
+                }
+                _ => {}
+            }
             let mut new_rules = Vec::new();
             if decision == ApprovalDecision::AllowAlways {
                 let mut rules = self.approval_rules.lock().unwrap();
@@ -1287,20 +1342,40 @@ impl Kernel {
 
     /// Session-scoped rules currently in force, for display and revocation.
     /// Addressed by run id so the UI never has to trust a session it inferred.
+    /// 会话全部放行以 `tool == "*"` 的合成行出现（内存态，不入库）。
     pub async fn list_approval_rules(&self, run_id: i64) -> AppResult<Vec<ApprovalRule>> {
         let session_id = self.session_for_run(run_id).await?;
         self.ensure_rules_loaded(session_id).await;
-        Ok(self
+        let mut rules = self
             .approval_rules
             .lock()
             .unwrap()
             .get(&session_id)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if self.full_access_sessions.lock().unwrap().contains(&session_id) {
+            rules.insert(
+                0,
+                ApprovalRule {
+                    tool: SESSION_GRANT_TOOL.into(),
+                    pattern: "本会话全部放行".into(),
+                    prefix: false,
+                },
+            );
+        }
+        Ok(rules)
     }
 
     pub async fn revoke_approval_rule(&self, run_id: i64, rule: &ApprovalRule) -> AppResult<bool> {
         let session_id = self.session_for_run(run_id).await?;
+        // 会话全部放行是内存态而非持久规则，撤销走自己的存储。
+        if rule.tool == SESSION_GRANT_TOOL {
+            return Ok(self
+                .full_access_sessions
+                .lock()
+                .unwrap()
+                .remove(&session_id));
+        }
         self.ensure_rules_loaded(session_id).await;
         let removed = {
             let mut rules = self.approval_rules.lock().unwrap();
@@ -1408,16 +1483,22 @@ impl Kernel {
         }
         let (run, run_root, run_cancel) = {
             let _command = self.commands.lock().await;
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             match Self::active_run_locked(&state, run_id) {
-                Ok(run) => (
-                    run,
-                    state
-                        .control
-                        .as_ref()
-                        .and_then(|control| control.workspace_root.clone()),
-                    state.control.as_ref().map(|control| control.cancel.clone()),
-                ),
+                Ok(run) => {
+                    // 批边界：上一批的批量决定不外泄。
+                    if let Some(control) = state.control.as_mut() {
+                        control.bulk_decision = None;
+                    }
+                    (
+                        run,
+                        state
+                            .control
+                            .as_ref()
+                            .and_then(|control| control.workspace_root.clone()),
+                        state.control.as_ref().map(|control| control.cancel.clone()),
+                    )
+                }
                 Err(reason) => return calls.iter().map(|_| Err(reason.clone())).collect(),
             }
         };
@@ -1426,9 +1507,16 @@ impl Kernel {
         // batch knows which calls suspend. Each suspended call carries its own
         // approval candidate — decisions are resolved per call, never shared.
         let mut gates = Vec::with_capacity(calls.len());
-        let mut auto_approved = Vec::new();
-        let mut read_only_allowlisted = Vec::with_capacity(calls.len());
+        let mut audit_kinds: Vec<AuditKind> = Vec::with_capacity(calls.len());
         let mut any_suspended = false;
+        // 会话全部放行只在非 Plan 模式生效，且不能越过模式的绝对禁止
+        // （它豁免的是 RequireApproval，Plan 的 Deny 在此之前就已分流）。
+        let full_access = mode != Mode::Plan
+            && self
+                .full_access_sessions
+                .lock()
+                .unwrap()
+                .contains(&run.session_id);
         self.ensure_rules_loaded(run.session_id).await;
         // 架构沙盘：存在生效规则（或规则文件损坏）时载入本会话工具历史；
         // Requirement/Extension 满足度据此判定，跨 Run 持久化于 audit 表。
@@ -1446,13 +1534,19 @@ impl Kernel {
             self.emit_tool_scoped(run_id, subagent_id, tool, ToolPhase::Started, &target).await;
             let candidate = Self::approval_candidate(tool, arguments_json);
             let command = Self::command_arg(arguments_json);
-            read_only_allowlisted.push(
-                tool == "run_command"
-                    && command.as_deref().is_some_and(command_policy::is_read_only_safe),
-            );
-            // A historical "always allow" rule only waives an approval that the
-            // current mode would otherwise demand. It can never lift a mode's
-            // absolute denial (Plan), so the gate is resolved first.
+            audit_kinds.push(if tool == "run_command"
+                && command.as_deref().is_some_and(command_policy::is_read_only_safe)
+            {
+                AuditKind::ReadOnlyAllowlist
+            } else if tool == "run_command" {
+                AuditKind::Autonomous
+            } else {
+                AuditKind::Extension
+            });
+            // A historical "always allow" rule or a session grant only waives
+            // an approval that the current mode would otherwise demand. It can
+            // never lift a mode's absolute denial (Plan), so the gate is
+            // resolved first.
             let auto = self.is_auto_approved(run.session_id, &candidate);
             let mut gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
@@ -1466,8 +1560,12 @@ impl Kernel {
                         )
                         .await,
                     ),
-                    ToolGate::RequireApproval if auto => {
-                        auto_approved.push(index);
+                    ToolGate::RequireApproval if auto || full_access => {
+                        audit_kinds[index] = if auto {
+                            AuditKind::RuleApproved
+                        } else {
+                            AuditKind::SessionGranted
+                        };
                         Gate::Allow(effect)
                     }
                     ToolGate::RequireApproval => {
@@ -1567,6 +1665,52 @@ impl Kernel {
             match &mut gates[index] {
                 Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
                 Gate::Suspended(effect, candidate) => {
+                    // 本批已有批量决定：不再弹卡，直接套用（clone 而非 take —
+                    // 同一决定对批内所有后续挂起生效，批入口负责清空）。
+                    let bulk = {
+                        let state = self.state.lock().await;
+                        state
+                            .control
+                            .as_ref()
+                            .and_then(|control| control.bulk_decision.clone())
+                    };
+                    if let Some(bulk) = bulk {
+                        if !bulk.approved {
+                            let reason = bulk
+                                .feedback
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(|value| format!("用户拒绝了该操作：{value}"))
+                                .unwrap_or_else(|| "用户拒绝了该操作".into());
+                            results.push(self.block_tool_scoped(run_id, subagent_id, tool, reason).await);
+                            continue;
+                        }
+                        let target = ToolRouter::call_target(tool, arguments_json);
+                        let (blocked, reminder) = self
+                            .architecture_gate(run_id, run.session_id, subagent_id, tool, arguments_json, &target, *effect, &history, has_rules, run_root.as_deref(), run.prompt.as_str())
+                            .await;
+                        if let Some(blocked) = blocked {
+                            results.push(blocked);
+                            continue;
+                        }
+                        let mut result = self
+                            .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "batch approved", *effect)
+                            .await;
+                        if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                            text.push_str("\n\n");
+                            text.push_str(reminder);
+                        }
+                        if result.is_ok() {
+                            history.push(HistoryEntry {
+                                tool: tool.clone(),
+                                target: ToolRouter::history_target(tool, arguments_json),
+                                run_id,
+                            });
+                        }
+                        results.push(result);
+                        continue;
+                    }
                     // Snapshot the write target right before the card is
                     // shown, so an edit made while the user decides is
                     // detected instead of overwritten.
@@ -1628,10 +1772,7 @@ impl Kernel {
                     results.push(result);
                 }
                 Gate::Allow(effect) => {
-                    let audit = Self::audit_label(
-                        auto_approved.contains(&index),
-                        read_only_allowlisted.get(index).copied().unwrap_or(false),
-                    );
+                    let audit = Self::audit_label(audit_kinds[index]);
                     let target = ToolRouter::call_target(tool, arguments_json);
                     let (blocked, reminder) = self
                         .architecture_gate(run_id, run.session_id, subagent_id, tool, arguments_json, &target, *effect, &history, has_rules, run_root.as_deref(), run.prompt.as_str())
@@ -1737,6 +1878,15 @@ impl Kernel {
         self.router.architecture_brief(run_root).await
     }
 
+    /// 沙盘装配：该类型子智能体经 Extension → Subagent 绑定获得的扩展授权。
+    pub async fn subagent_grants(
+        &self,
+        run_root: Option<&std::path::Path>,
+        agent: &str,
+    ) -> Vec<crate::services::tool_router::SubagentGrant> {
+        self.router.subagent_grants(run_root, agent).await
+    }
+
     /// Run 末欠账查询：会话历史中仍挂着未验收的事后义务（optional 义务也计入——
     /// 它不拦调用但会追问）。非空时向画布发 pending trace 让节点亮琥珀色。
     pub async fn architecture_outstanding(
@@ -1822,10 +1972,13 @@ impl Kernel {
             return (false, None);
         }
         match rx.await {
-            Ok(ApprovalResponse { decision, feedback }) => match decision {
-                ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => (true, None),
-                ApprovalDecision::Deny => (false, feedback),
-            },
+            Ok(ApprovalResponse { decision, feedback }) => {
+                if decision.is_allow() {
+                    (true, None)
+                } else {
+                    (false, feedback)
+                }
+            }
             Err(_) => (false, None),
         }
     }
@@ -1843,15 +1996,13 @@ fn architecture_reason(decision: &GraphDecision) -> String {
     }
 }
 
-/// Why a call ran without a prompt. A historical rule and an explicit user
-/// decision are stronger evidence than the read-only allowlist.
-fn audit_label(auto_approved: bool, read_only_allowlisted: bool) -> &'static str {
-    if auto_approved {
-        "auto-approved"
-    } else if read_only_allowlisted {
-        "read-only allowlist"
-    } else {
-        "extension"
+fn audit_label(kind: AuditKind) -> &'static str {
+    match kind {
+        AuditKind::RuleApproved => "auto-approved",
+        AuditKind::SessionGranted => "session granted",
+        AuditKind::ReadOnlyAllowlist => "read-only allowlist",
+        AuditKind::Autonomous => "autonomous",
+        AuditKind::Extension => "extension",
     }
 }
 
@@ -2936,6 +3087,7 @@ mod tests {
             done,
             finishing: false,
             pending: None,
+            bulk_decision: None,
             pending_question: None,
             workspace_root: kernel.router.workspace_root().await,
         });
@@ -3593,9 +3745,11 @@ mod tests {
 
     #[test]
     fn audit_labels_prefer_the_strongest_reason() {
-        assert_eq!(Kernel::audit_label(true, false), "auto-approved");
-        assert_eq!(Kernel::audit_label(false, true), "read-only allowlist");
-        assert_eq!(Kernel::audit_label(false, false), "extension");
+        assert_eq!(Kernel::audit_label(AuditKind::RuleApproved), "auto-approved");
+        assert_eq!(Kernel::audit_label(AuditKind::SessionGranted), "session granted");
+        assert_eq!(Kernel::audit_label(AuditKind::ReadOnlyAllowlist), "read-only allowlist");
+        assert_eq!(Kernel::audit_label(AuditKind::Autonomous), "autonomous");
+        assert_eq!(Kernel::audit_label(AuditKind::Extension), "extension");
     }
 
     #[cfg(windows)]
@@ -3628,7 +3782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_mode_suspends_commands_outside_the_read_only_allowlist() {
+    async fn code_mode_suspends_dangerous_commands() {
         let (kernel, events) = test_kernel().await;
         let workspace = tempfile::tempdir().unwrap();
         kernel
@@ -3638,7 +3792,7 @@ mod tests {
         let worker = kernel.clone();
         let call = tokio::spawn(async move {
             worker
-                .execute_model_tool(id, "run_command", r#"{"command":"npm install"}"#)
+                .execute_model_tool(id, "run_command", r#"{"command":"git push"}"#)
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
@@ -3647,6 +3801,211 @@ mod tests {
             .await
             .unwrap();
         assert!(call.await.unwrap().is_err());
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    fn awaiting_count(events: &Arc<StdMutex<Vec<KernelEvent>>>) -> usize {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(&event.data, EventData::ToolCall { phase: ToolPhase::AwaitingApproval, .. })
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn allow_batch_approves_remaining_suspended_calls() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_tool_calls(
+                    id,
+                    &[
+                        ("run_command".into(), r#"{"command":"git push"}"#.into()),
+                        ("run_command".into(), r#"{"command":"git push --force"}"#.into()),
+                    ],
+                )
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowBatch, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        let results = call.await.unwrap();
+        assert_eq!(results.len(), 2);
+        // 一次弹卡解决整批：第二个调用不再等待，也没有第二张卡。
+        assert_eq!(awaiting_count(&events), 1);
+        kernel.finish(id, RunStatus::Completed, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deny_batch_rejects_remaining_suspended_calls() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_tool_calls(
+                    id,
+                    &[
+                        ("run_command".into(), r#"{"command":"git push"}"#.into()),
+                        ("run_command".into(), r#"{"command":"rm -rf build"}"#.into()),
+                    ],
+                )
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(
+                id,
+                ApprovalDecision::DenyBatch,
+                CommandScope::Exact,
+                Some("不要推送".into()),
+            )
+            .await
+            .unwrap();
+        let results = call.await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.is_err()));
+        assert!(results.iter().all(|result| {
+            result.as_ref().unwrap_err().to_string().contains("不要推送")
+        }));
+        assert_eq!(awaiting_count(&events), 1);
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_decision_does_not_leak_into_the_next_batch() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_tool_calls(
+                    id,
+                    &[
+                        ("run_command".into(), r#"{"command":"git push"}"#.into()),
+                        ("run_command".into(), r#"{"command":"git push --force"}"#.into()),
+                    ],
+                )
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowBatch, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        call.await.unwrap();
+        events.lock().unwrap().clear();
+        // 下一批的危险调用重新挂起——批量决定不外泄。
+        let worker = kernel.clone();
+        let next = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "run_command", r#"{"command":"git push"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::Deny, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(next.await.unwrap().is_err());
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allow_session_waives_future_approvals_until_revoked() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "run_command", r#"{"command":"git push"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowSession, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        call.await.unwrap();
+        // 合成行出现在授权规则列表，可撤销。
+        let rules = kernel.list_approval_rules(id).await.unwrap();
+        assert!(rules.iter().any(|rule| rule.tool == "*"));
+        events.lock().unwrap().clear();
+        // 后续危险调用（新批次）直接执行，无卡片。
+        let result = kernel
+            .execute_model_tool(id, "run_command", r#"{"command":"git push --force"}"#)
+            .await;
+        let _ = result;
+        assert_eq!(awaiting_count(&events), 0);
+        // 撤销后恢复风险询问。
+        let grant = ApprovalRule { tool: "*".into(), pattern: "本会话全部放行".into(), prefix: false };
+        assert!(kernel.revoke_approval_rule(id, &grant).await.unwrap());
+        assert!(kernel
+            .list_approval_rules(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|rule| rule.tool != "*"));
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_grant_never_lifts_a_plan_deny() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run_mode(&kernel, Mode::Code).await;
+        let worker = kernel.clone();
+        let call = tokio::spawn(async move {
+            worker
+                .execute_model_tool(id, "run_command", r#"{"command":"git push"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::AllowSession, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        call.await.unwrap();
+        // 同会话切到 Plan：绝对拒绝优先于会话放行。
+        let results = kernel
+            .execute_tool_calls_as(
+                id,
+                &[("run_command".into(), r#"{"command":"git status"}"#.into())],
+                Some(Mode::Plan),
+            )
+            .await;
+        assert!(results[0].is_err());
         kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }

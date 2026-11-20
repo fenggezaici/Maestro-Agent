@@ -59,6 +59,7 @@
 .palette-requirement { border-left: 2px solid #22d3ee; }
 .palette-restriction { border-left: 2px solid #fb7185; }
 .palette-action { border-left: 2px solid #ef4444; }
+.palette-subagent { border-left: 2px solid #f472b6; }
 .palette-template { border-left: 2px solid #c084fc; }
 .palette-card { position: relative; }
 .palette-card-add {
@@ -515,6 +516,7 @@
 .maestro-node.kind-restriction { border-top: 2px solid #fb7185; }
 .maestro-node.kind-action { border-top: 2px solid #ef4444; }
 .maestro-node.kind-extension { border-top: 2px solid #a78bfa; }
+.maestro-node.kind-subagent { border-top: 2px solid #f472b6; }
 
 .maestro-node-status {
   font-size: 9px;

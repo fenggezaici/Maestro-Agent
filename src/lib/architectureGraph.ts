@@ -5,6 +5,7 @@ import type {
   ArchitectureGraph, ExtensionData, ExtensionKind, GraphEdge, GraphNode,
   GraphNodeData, SatisfyScope, TriggerAction,
 } from '../api/architecture';
+import type { AgentDefinition } from '../api/agents';
 import type { ArchitectureTraceStep } from '../api/types';
 import type { McpServerView, PluginView, SkillView } from '../api/extensions';
 
@@ -42,6 +43,7 @@ export const NODE_LABELS: Record<NodeKind, string> = {
   restriction: '架构限制',
   action: '结果动作',
   extension: '扩展',
+  subagent: '子智能体',
 };
 
 export const ACTION_LABELS: Record<TriggerAction, string> = {
@@ -60,6 +62,7 @@ export function createNode(kind: NodeKind, position: { x: number; y: number }, s
   if (kind === 'extension' && !data.extension) {
     data.extension = { kind: 'skill', name: '', target: '', requirement: 'required', scope: 'session', params: {} };
   }
+  if (kind === 'subagent' && !data.agent) data.agent = 'explore';
   return { id: nextId(), type: 'maestro', position, data };
 }
 
@@ -102,6 +105,8 @@ export function nodeSummary(node: SandboxNode | GraphNode): string {
       const after = ((data as { effectiveAfter?: boolean }).effectiveAfter ?? ext.timing === 'after') ? '事后验收 · ' : '';
       return `${after}${label} · ${ext.requirement === 'optional' ? '可选' : '必选'}`;
     }
+    case 'subagent':
+      return `type=${data.agent?.trim() || '（未配置）'} · 装配终点`;
   }
 }
 
@@ -157,7 +162,8 @@ const handlesFor = (node: SandboxNode): string[] => {
     case 'restriction': return ['pass', 'fail'];
     case 'extension':
       return node.data.extension?.requirement === 'optional' ? ['pass'] : ['pass', 'fail'];
-    case 'action': return [];
+    case 'action':
+    case 'subagent': return [];
   }
 };
 
@@ -216,9 +222,15 @@ export function isConnectionAllowed(
   if (!source || !target) return { ok: false, reason: '节点不存在' };
   if (source.id === target.id) return { ok: false, reason: '不能连接自身' };
   if (source.data.nodeType === 'action') return { ok: false, reason: 'Action 是终点，不能作为起点' };
+  if (source.data.nodeType === 'subagent') return { ok: false, reason: 'Subagent 是装配终点，不能作为起点' };
   if (target.data.nodeType === 'trigger') return { ok: false, reason: 'Trigger 是起点，不能作为目标' };
+  if (target.data.nodeType === 'subagent' && source.data.nodeType !== 'extension') {
+    return { ok: false, reason: 'Subagent 只接受扩展节点入边' };
+  }
   if ((candidate.targetHandle ?? 'in') !== 'in') return { ok: false, reason: '目标仅接受入口 Handle' };
-  const handle = candidate.sourceHandle ?? 'out';
+  // 缺省出口按 source 类型取默认 Handle（与 Rust None 语义一致）：
+  // trigger→out，其余→pass。
+  const handle = candidate.sourceHandle ?? (source.data.nodeType === 'trigger' ? 'out' : 'pass');
   const allowed = handlesFor(source);
   if (!allowed.includes(handle)) {
     return {
@@ -228,7 +240,13 @@ export function isConnectionAllowed(
         : '该 Handle 不支持从此节点出发',
     };
   }
-  if (edges.some((edge) => edge.source === source.id && edge.target === target.id && (edge.sourceHandle ?? 'out') === handle)) {
+  // 装配连线仅表达「授予」：扩展 → Subagent 只允许 pass（缺省出口按 pass 计）。
+  if (target.data.nodeType === 'subagent' && handle === 'fail') {
+    return { ok: false, reason: '扩展 → Subagent 装配边只能使用 pass 出口' };
+  }
+  // 存储边的缺省出口同样按 source 类型归一化（trigger→out，其余→pass）再比较。
+  const defaultHandle = source.data.nodeType === 'trigger' ? 'out' : 'pass';
+  if (edges.some((edge) => edge.source === source.id && edge.target === target.id && (edge.sourceHandle ?? defaultHandle) === handle)) {
     return { ok: false, reason: '重复连线' };
   }
   if (wouldCreateCycle(nodes, edges, source.id, target.id)) {
@@ -253,6 +271,8 @@ export interface KnownExtensions {
   skills: SkillView[];
   servers: McpServerView[];
   plugins: PluginView[];
+  /** 可装配的子智能体（mode=subagent 且未隐藏）；未加载时缺省——校验不误报未定义。 */
+  agents?: AgentDefinition[];
 }
 
 export interface DraftValidation {
@@ -344,6 +364,18 @@ export function validateDraft(
         }
         if (data.scope === 'each') errors.push(`结果动作 ${node.id} 的 scope=每次 仅对前置要求/扩展有效`);
         break;
+      case 'subagent': {
+        const agent = data.agent?.trim() ?? '';
+        if (!agent) errors.push(`子智能体 ${node.id} 缺少 agent 类型名`);
+        else if (agent.length > 64 || !/^[A-Za-z0-9_-]+$/.test(agent)) {
+          errors.push(`子智能体 ${node.id} 的 agent 名必须为字母/数字/-/_`);
+        }
+        if (data.scope === 'each') errors.push(`子智能体 ${node.id} 的 scope=每次 仅对前置要求/扩展有效`);
+        if (agent && known?.agents && !known.agents.some((item) => item.name === agent && item.mode === 'subagent' && !item.hidden)) {
+          warnings.push(`子智能体 ${agent} 未定义或未启用（hidden/非 subagent 模式）：spawn_subagent 时将报错`);
+        }
+        break;
+      }
       case 'extension': {
         const ext = data.extension;
         if (!ext?.kind || !ext.target?.trim()) {
@@ -429,6 +461,7 @@ const stripEmpty = (data: GraphNodeData): GraphNodeData => {
   if (data.denyRule?.trim()) out.denyRule = data.denyRule.trim();
   if (data.result) out.result = data.result;
   if (data.message?.trim()) out.message = data.message.trim();
+  if (data.agent?.trim()) out.agent = data.agent.trim();
   if (data.extension?.kind && data.extension.target?.trim()) {
     const ext = data.extension;
     out.extension = {

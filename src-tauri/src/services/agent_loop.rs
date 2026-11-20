@@ -11,10 +11,11 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     adapters::llm::{ChatConfig, LlmProvider, StreamEvent, TurnOutcome},
     domain::{
-        AppResult, ChatMessage, ContextCompaction, Mode, RunMessage, RunMetrics, RunStatus, RunView, SessionDetail,
-        SubagentStatus, SubagentTokenKind, SubagentView, ToolCallView, ToolPhase, ToolSpec,
+        AppResult, ChatMessage, ContextCompaction, ExtensionKind, Mode, RunMessage, RunMetrics,
+        RunStatus, RunView, SessionDetail, SubagentStatus, SubagentTokenKind, SubagentView,
+        ToolCallView, ToolPhase, ToolSpec,
     },
-    services::kernel::Kernel,
+    services::{kernel::Kernel, tool_router::SubagentGrant},
 };
 
 /// Safety cap for one run; can be raised with MAESTRO_MAX_TOOL_ROUNDS.
@@ -22,6 +23,17 @@ fn max_tool_rounds() -> usize {
     std::env::var("MAESTRO_MAX_TOOL_ROUNDS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| *value >= 8).unwrap_or(64)
 }
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
+
+/// 工具结果回传模型的上限截断：必须带提示——静默截断会让模型误以为拿到
+/// 完整结果（与 exec 「省略 N 字节」、read_file 截断提示同一约定）。
+fn bounded_result_text(text: &str) -> String {
+    if text.chars().count() <= MAX_TOOL_RESULT_BYTES {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX_TOOL_RESULT_BYTES).collect();
+    out.push_str("…（工具结果已截断）");
+    out
+}
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 /// ZCode-style chunking: coalesce raw deltas before emitting to the UI.
 const STREAM_CHUNK_INTERVAL: Duration = Duration::from_millis(32);
@@ -40,10 +52,16 @@ const SUBAGENT_HINT: &str = "当任务需要同时分析多个独立文件/目�
 const DEFAULT_SUBAGENT_PROMPT: &str = "你是只读研究子智能体。只使用提供的只读工具分析，不写文件、不执行命令；完成后用简洁中文给出结论、证据路径和风险。";
 
 /// Efficiency budget: broad research otherwise reads every file until timeout.
-const SUBAGENT_BUDGET_HINT: &str = "效率要求：先列出最关键的文件清单，再批量读取；不要重复读取同一文件；最多使用 20 次工具调用；接近预算或时间上限时立即输出已有结论、证据路径与风险，不要继续尝试。";
+fn subagent_budget_hint(tool_budget: usize) -> String {
+    format!("效率要求：先列出最关键的文件清单，再批量读取；不要重复读取同一文件；最多使用 {tool_budget} 次工具调用；接近预算或时间上限时立即输出已有结论、证据路径与风险，不要继续尝试。")
+}
 
 /// A child that stops producing progress must not hold the parent turn forever.
-const SUBAGENT_TOOL_BUDGET: usize = 20;
+/// The default lives in `domain::DEFAULT_SUBAGENT_TOOL_BUDGET`; definitions may
+/// override it via `tool_budget`.
+fn subagent_tool_budget(definition: &crate::domain::AgentDefinition) -> usize {
+    definition.tool_budget.unwrap_or(crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET).clamp(1, crate::domain::MAX_SUBAGENT_TOOL_BUDGET) as usize
+}
 
 fn subagent_timeout() -> Duration {
     Duration::from_secs(
@@ -713,6 +731,101 @@ fn max_parallel_subagents() -> usize {
         .unwrap_or(2)
 }
 
+/// 装配契约段：拼进子系统提示——必选/可选条目 + 必选 Skill 正文预注入。
+/// 与父级 architecture_brief 同口径：正文已给，但工具调用仍必须真实发生。
+fn subagent_assembly_prompt(grants: &[SubagentGrant]) -> String {
+    if grants.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n【架构装配】架构沙盘为本子智能体装配了扩展能力。必选条目必须由你真实调用——未调用完前不要输出最终结论。\n",
+    );
+    for grant in grants {
+        let binding = &grant.binding;
+        if let Some(missing) = &binding.missing {
+            out.push_str(&format!("- {missing}：该能力当前不可用，照常继续。\n"));
+            continue;
+        }
+        let level = if binding.required { "必选" } else { "可选建议" };
+        let params = if binding.params.is_empty() {
+            String::new()
+        } else {
+            let pairs = binding
+                .params
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("，");
+            format!("（参数提示：{pairs}）")
+        };
+        match binding.kind {
+            ExtensionKind::Skill => out.push_str(&format!(
+                "- {level}：调用 load_skill {}（正文已在下方预注入，调用本身仍必须真实发生）。{params}\n",
+                binding.target
+            )),
+            ExtensionKind::Mcp => {
+                let part = binding
+                    .tool
+                    .as_deref()
+                    .map(|tool| format!("mcp__{}__{}", binding.target, tool))
+                    .unwrap_or_else(|| format!("MCP 服务 {} 的任意工具", binding.target));
+                out.push_str(&format!("- {level}：调用 {part}。{params}\n"));
+            }
+            ExtensionKind::Plugin => {}
+        }
+    }
+    for grant in grants {
+        if let (true, Some(body)) = (grant.binding.required, &grant.body) {
+            out.push_str(&format!(
+                "\n<skill_preload name=\"{}\">\n{body}\n</skill_preload>\n",
+                grant.binding.target
+            ));
+        }
+    }
+    out
+}
+
+/// 必选调用的显示名（提醒/违例行共用）。
+fn grant_label(grant: &SubagentGrant) -> String {
+    let binding = &grant.binding;
+    match binding.kind {
+        ExtensionKind::Skill => format!("load_skill {}", binding.target),
+        ExtensionKind::Mcp => binding
+            .tool
+            .as_deref()
+            .map(|tool| format!("mcp__{}__{}", binding.target, tool))
+            .unwrap_or_else(|| format!("MCP 服务 {} 的任意工具", binding.target)),
+        ExtensionKind::Plugin => format!("插件 {}", binding.target),
+    }
+}
+
+fn pending_grants_reminder(pending: &[SubagentGrant]) -> String {
+    format!(
+        "【架构装配】尚未完成的必选调用：{}。请先真实调用后再继续/收尾。",
+        pending.iter().map(grant_label).collect::<Vec<_>>().join("、")
+    )
+}
+
+/// 一次成功的子工具调用是否核销该必选绑定。
+fn grant_satisfied(grant: &SubagentGrant, name: &str, arguments_json: &str) -> bool {
+    let binding = &grant.binding;
+    match binding.kind {
+        ExtensionKind::Skill => {
+            name == "load_skill"
+                && serde_json::from_str::<serde_json::Value>(arguments_json)
+                    .ok()
+                    .and_then(|value| value.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(binding.target.as_str())
+        }
+        ExtensionKind::Mcp => match &binding.tool {
+            Some(tool) => name == format!("mcp__{}__{}", binding.target, tool),
+            None => name.starts_with(&format!("mcp__{}__", binding.target)),
+        },
+        ExtensionKind::Plugin => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     kernel: Arc<Kernel>,
@@ -752,14 +865,46 @@ async fn run_subagent(
         session: Some(child_session_id(config.session.as_deref(), &subagent_id)),
     };
     let provider = kernel.llm_provider(&child_config);
-    let allowed = definition.tools.clone();
     let run_root = kernel.run_workspace_root(run_id).await;
+    // 沙盘装配：Extension → Subagent 绑定给该类型子智能体授权扩展能力
+    // （Skill 预注入 + mcp__/load_skill 进白名单），required 在子循环内强制真实调用。
+    let grants = kernel.subagent_grants(run_root.as_deref(), &definition.name).await;
+    // 空白名单 = 全放行（既有语义）；装配只在非空白名单上扩权，不得误收窄。
+    let base_open = definition.tools.is_empty();
+    let mut allowed = definition.tools.clone();
+    for grant in &grants {
+        if grant.binding.missing.is_some() {
+            continue;
+        }
+        let entry = match grant.binding.kind {
+            ExtensionKind::Skill => "load_skill".to_string(),
+            // 无 tool 绑定 = 该 Server 任意工具：`mcp__server__` 前缀条目。
+            ExtensionKind::Mcp => match &grant.binding.tool {
+                Some(tool) => format!("mcp__{}__{}", grant.binding.target, tool),
+                None => format!("mcp__{}__", grant.binding.target),
+            },
+            ExtensionKind::Plugin => continue,
+        };
+        if !allowed.contains(&entry) {
+            allowed.push(entry);
+        }
+    }
+    // `mcp__server__` 结尾的条目是 server 级授权，按前缀匹配该 Server 全部工具。
+    let tool_allowed = |name: &str| {
+        allowed.iter().any(|entry| entry == name || (entry.ends_with("__") && name.starts_with(entry.as_str())))
+    };
     let tools: Vec<_> = kernel.agent_tools(Mode::Plan, run_root.as_deref()).await.into_iter()
-        .filter(|tool| tool.name != "spawn_subagent" && (allowed.is_empty() || allowed.iter().any(|name| name == &tool.name)))
+        .filter(|tool| tool.name != "spawn_subagent" && (base_open || tool_allowed(&tool.name)))
         .collect();
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+    let tool_budget = subagent_tool_budget(&definition);
     let system_prompt = format!("{}
-{SUBAGENT_BUDGET_HINT}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() });
+{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(tool_budget), subagent_assembly_prompt(&grants));
+    // 必选装配：子循环内逐轮强制，全部真实调用后才允许收尾。
+    let mut pending_grants: Vec<SubagentGrant> = grants
+        .into_iter()
+        .filter(|grant| grant.binding.required && grant.binding.missing.is_none())
+        .collect();
     let mut messages = vec![ChatMessage::text("system", system_prompt), ChatMessage::text("user", prompt.clone())];
 
     kernel.start_subagent(SubagentView {
@@ -813,8 +958,8 @@ async fn run_subagent(
         let mut tool_count = 0usize;
         let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
         for _ in 0..definition.steps.unwrap_or(8) {
-            if tool_count >= SUBAGENT_TOOL_BUDGET {
-                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{SUBAGENT_TOOL_BUDGET} 次），已返回部分结论")), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
+            if tool_count >= tool_budget {
+                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{tool_budget} 次），已返回部分结论")), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             if *cancel.borrow() {
                 return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
@@ -893,6 +1038,12 @@ async fn run_subagent(
                 }
             }
             if outcome.tool_calls.is_empty() {
+                // 必选装配未清：不收尾，附装配提醒续跑（步数上限兜底）——
+                // 与父级「正文已给但调用必须真实发生」同一口径。
+                if !pending_grants.is_empty() {
+                    messages.push(ChatMessage::text("user", pending_grants_reminder(&pending_grants)));
+                    continue;
+                }
                 return ChildOutcome { status: SubagentStatus::Completed, content: text, error: None, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             messages.push(ChatMessage {
@@ -920,13 +1071,17 @@ async fn run_subagent(
             if !runnable.is_empty() {
                 // Plan mode pins the gate to read-only regardless of the parent run's mode.
                 let executed = kernel.execute_subagent_tool_calls(run_id, &subagent_id, &runnable, Some(Mode::Plan)).await;
-                for (index, result) in runnable_indices.into_iter().zip(executed) {
+                for ((index, result), (call_name, call_args)) in runnable_indices.into_iter().zip(executed).zip(&runnable) {
+                    // 装配必选核销：仅成功调用算数（与会话历史判定同口径）。
+                    if result.is_ok() {
+                        pending_grants.retain(|grant| !grant_satisfied(grant, call_name, call_args));
+                    }
                     results[index] = Some(result);
                 }
             }
             for (call, result) in outcome.tool_calls.iter().zip(results) {
                 let (text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                    Ok(value) => (value.chars().take(MAX_TOOL_RESULT_BYTES).collect(), false),
+                    Ok(value) => (bounded_result_text(&value), false),
                     Err(error) => (format!("子智能体工具失败：{error}"), true),
                 };
                 messages.push(ChatMessage {
@@ -939,6 +1094,11 @@ async fn run_subagent(
                     thinking: None,
                     is_error,
                 });
+            }
+            // 必选装配逐轮跟进：只要还没真实调用完，每一轮都提醒——
+            // 直到核销或步数/预算耗尽（耗尽时在结果尾部标注违例）。
+            if !pending_grants.is_empty() {
+                messages.push(ChatMessage::text("user", pending_grants_reminder(&pending_grants)));
             }
         }
         elapsed_ms = started.elapsed().as_millis() as u64;
@@ -964,7 +1124,15 @@ async fn run_subagent(
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     let ChildOutcome { status, content, error, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count } = outcome;
     let header = format!("【子智能体 {}｜{}｜{} 次工具】", definition.name, status.label(), tool_count);
-    let summary = if content.trim().is_empty() { header.clone() } else { format!("{header}\n{}", content.trim()) };
+    let mut summary = if content.trim().is_empty() { header.clone() } else { format!("{header}\n{}", content.trim()) };
+    // 装配违例透传父模型：子任务已完成但沙盘必选扩展未被真实调用，
+    // 结论可信度存疑——由父模型决定补调或重派。
+    if !pending_grants.is_empty() {
+        summary.push_str(&format!(
+            "\n【装配违例】架构沙盘绑定的必选扩展未被真实调用：{}——如结论依赖这些能力，请补调后重派。",
+            pending_grants.iter().map(grant_label).collect::<Vec<_>>().join("、"),
+        ));
+    }
     let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens).await;
     if status == SubagentStatus::Cancelled {
         return Err("子智能体已取消".into());
@@ -1160,7 +1328,7 @@ pub(crate) async fn run(
                 };
                 messages.push(ChatMessage {
                     role: "tool".into(),
-                    content: text.chars().take(MAX_TOOL_RESULT_BYTES).collect(),
+                    content: bounded_result_text(&text),
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     tool_calls: None,
@@ -1658,5 +1826,17 @@ mod tests {
             child_session_id(Some("maestro-7"), "sa-7-2")
         );
         assert_eq!(child_session_id(None, "sa-7-1"), "maestro-sub-sa-7-1");
+    }
+
+    #[test]
+    fn subagent_tool_budget_defaults_and_clamps() {
+        let mut definition = crate::domain::AgentDefinition::builtin("explore").unwrap();
+        assert_eq!(subagent_tool_budget(&definition), crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET as usize);
+        definition.tool_budget = Some(0);
+        assert_eq!(subagent_tool_budget(&definition), 1);
+        definition.tool_budget = Some(9999);
+        assert_eq!(subagent_tool_budget(&definition), crate::domain::MAX_SUBAGENT_TOOL_BUDGET as usize);
+        definition.tool_budget = Some(60);
+        assert_eq!(subagent_tool_budget(&definition), 60);
     }
 }

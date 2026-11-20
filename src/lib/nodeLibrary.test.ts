@@ -106,6 +106,25 @@ describe('buildLibraryItems', () => {
     expect(detailForExtension({ kind: 'skill', target: '不存在' })).toBeUndefined();
     expect(detailForExtension(undefined)).toBeUndefined();
   });
+
+  it('agents 生成「智能体」分类条目：hidden/非 subagent 被过滤', () => {
+    const items = buildLibraryItems({
+      ...known(),
+      agents: [
+        { name: 'explore', description: '只读调研', category: '研究', mode: 'subagent', prompt: '', tools: [], hidden: false, source: 'builtin' },
+        { name: 'hidden-one', description: '', mode: 'subagent', prompt: '', tools: [], hidden: true, source: 'builtin' },
+        { name: 'main-mode', description: '', mode: 'main', prompt: '', tools: [], hidden: false, source: 'global' },
+      ],
+    });
+    const explore = byId(items, 'agent:explore');
+    expect(explore?.nodeKind).toBe('subagent');
+    expect(explore?.seed?.agent).toBe('explore');
+    expect(explore?.category).toEqual(['智能体', '研究']);
+    expect(explore?.badge).toBe('内置');
+    expect(explore?.detail?.usage).toContain('装配');
+    expect(byId(items, 'agent:hidden-one')).toBeUndefined();
+    expect(byId(items, 'agent:main-mode')).toBeUndefined();
+  });
 });
 
 describe('filterLibrary', () => {

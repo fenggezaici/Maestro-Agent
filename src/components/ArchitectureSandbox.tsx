@@ -10,10 +10,11 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
-  BookOpenCheck, ChevronDown, CircleAlert, FileCode2, Flag,
+  BookOpenCheck, Bot, ChevronDown, CircleAlert, FileCode2, Flag,
   Layers, ListChecks, Plus, Puzzle, Save, ShieldAlert, Sparkles, WandSparkles,
 } from 'lucide-react';
 import { architectureApi, type ArchitectureGraph, type ExtensionData, type ExtensionKind, type GateMode, type GateTiming, type GraphNodeData, type SatisfyScope, type TriggerAction } from '../api/architecture';
+import { listAgentsApi, type AgentDefinition } from '../api/agents';
 import type { ArchitectureTrace } from '../api/types';
 import type { ExtensionsController } from '../hooks/useExtensions';
 import {
@@ -46,6 +47,7 @@ const KIND_ICON: Record<NodeKind, typeof Flag> = {
   restriction: ShieldAlert,
   action: CircleAlert,
   extension: Puzzle,
+  subagent: Bot,
 };
 
 const STATUS_LABEL: Record<TraceStatus, string> = {
@@ -71,7 +73,8 @@ function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
     ? `${ext?.kind === 'skill' ? '📜' : ext?.kind === 'mcp' ? '🧩' : '🔌'} ${ext?.name || ext?.target || NODE_LABELS.extension}`
     : kind === 'trigger' ? `⚡ ${NODE_LABELS.trigger}`
     : kind === 'requirement' ? (isAfter ? '📋 事后要求' : `📋 ${NODE_LABELS.requirement}`)
-    : kind === 'restriction' ? `🚧 ${NODE_LABELS.restriction}` : `⛔ ${NODE_LABELS.action}`;
+    : kind === 'restriction' ? `🚧 ${NODE_LABELS.restriction}`
+    : kind === 'subagent' ? `🤖 ${String(data.agent ?? '') || NODE_LABELS.subagent}` : `⛔ ${NODE_LABELS.action}`;
   const Icon = KIND_ICON[kind];
   const hasTarget = kind !== 'trigger';
   const handles = kind === 'trigger' ? ['out'] : kind === 'action' ? [] : ['pass', 'fail'];
@@ -92,7 +95,7 @@ function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
       )}
       <div className="maestro-node-body">{summary}</div>
       {kind === 'trigger' && <Handle id="out" type="source" position={Position.Right} className="maestro-handle out" />}
-      {kind !== 'trigger' && kind !== 'action' && <>
+      {kind !== 'trigger' && kind !== 'action' && kind !== 'subagent' && <>
         <Handle id="pass" type="source" position={Position.Right} className="maestro-handle pass" style={{ top: '32%' }} />
         <span className="maestro-handle-tag tag-pass" style={{ top: '24%' }}>通过</span>
         {(kind !== 'extension' || ext?.requirement !== 'optional') && <>
@@ -428,6 +431,43 @@ function PropertyPanel({ node, known, effectiveAfter, upstream, onChange, onDele
         <ExtensionUsage ext={ext} />
       </>}
 
+      {data.nodeType === 'subagent' && <>
+        <Field label="子智能体类型">
+          <select className="prop-input" value={String(data.agent ?? '')} onChange={(e) => set({ agent: e.target.value || undefined })}>
+            <option value="">（手动输入）</option>
+            {(known.agents ?? []).map((agent) => (
+              <option key={agent.name} value={agent.name}>
+                {agent.name}（{agent.source === 'project' ? '项目' : agent.source === 'global' ? '全局' : '内置'}）
+              </option>
+            ))}
+          </select>
+          <input className="prop-input" value={String(data.agent ?? '')} placeholder="或手动输入类型名（如 explore）"
+            onChange={(e) => set({ agent: e.target.value })} />
+        </Field>
+        <p className="prop-note">
+          装配终点：扩展节点用「通过」出口连入本节点——spawn_subagent(type={String(data.agent ?? '') || '…'}) 派发时，
+          子循环获得这些扩展能力；必选条目强制真实调用后才能收尾，可选条目只注入建议。本节点不参与调用链求值。
+        </p>
+        {upstream && upstream.length > 0 && (
+          <div className="prop-detail">
+            <p className="prop-detail-title">已绑定扩展（{upstream.length}）</p>
+            <dl className="prop-detail-meta">
+              {upstream.map((src) => {
+                const srcExt = src.data.extension as ExtensionData | undefined;
+                return (
+                  <div key={src.id} className="prop-detail-meta-row">
+                    <dt>{srcExt?.kind === 'skill' ? 'Skill' : srcExt?.kind === 'mcp' ? 'MCP' : '插件'}</dt>
+                    <dd title={srcExt?.tool ? `${srcExt.target}/${srcExt.tool}` : srcExt?.target}>
+                      {srcExt?.name || srcExt?.target || src.id}{srcExt?.tool ? ` / ${srcExt.tool}` : ''} · {srcExt?.requirement === 'optional' ? '可选' : '必选'}
+                    </dd>
+                  </div>
+                );
+              })}
+            </dl>
+          </div>
+        )}
+      </>}
+
       <button type="button" className="prop-delete" onClick={() => onDelete(node.id)}>删除节点</button>
     </div>
   );
@@ -486,9 +526,21 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   const markDirty = useCallback(() => { dirtyRef.current = true; setDirty(true); }, []);
   const { screenToFlowPosition, fitView } = useReactFlow();
 
+  // 可装配子智能体清单：subagent 节点下拉与「未定义」告警共用；preview 走 fixture。
+  const [agents, setAgents] = useState<AgentDefinition[]>([]);
+  useEffect(() => {
+    if (preview) return;
+    let cancelled = false;
+    listAgentsApi('all')
+      .then((list) => { if (!cancelled) setAgents(list); })
+      .catch(() => { /* 清单不可达时下拉留空，仍可手动输入 */ });
+    return () => { cancelled = true; };
+  }, [preview]);
+
   const known: KnownExtensions = useMemo(() => preview ? sandboxFixtureExtensions() : {
     skills: extensions.skills, servers: extensions.servers, plugins: extensions.plugins,
-  }, [preview, extensions.skills, extensions.servers, extensions.plugins]);
+    agents,
+  }, [preview, extensions.skills, extensions.servers, extensions.plugins, agents]);
 
   // 节点库数据源：左侧分类树与 Tab 浮层共用。
   const libraryItems = useMemo(() => buildLibraryItems(known), [known]);

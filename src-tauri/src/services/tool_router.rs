@@ -37,6 +37,15 @@ pub enum WriteBaseline {
     Unverifiable,
 }
 
+/// 一条子智能体装配授权：domain::BoundExtension + 运行期富化（Skill 预注入正文）。
+/// spawn_subagent 用它扩子工具白名单、拼装配契约并追踪必选调用。
+#[derive(Debug, Clone)]
+pub struct SubagentGrant {
+    pub binding: crate::domain::BoundExtension,
+    /// required Skill 的预注入正文（可选 Skill 不预读，省 token）。
+    pub body: Option<String>,
+}
+
 /// What `execute` produces: bounded text for the model plus, for workspace
 /// writes, the before/after contents the UI diffs in the tool row.
 pub struct ToolOutcome {
@@ -159,7 +168,7 @@ impl ToolRouter {
                 ignored_files.push(RevertIssue { path: change.path, reason: "checkpoint_missing".into() });
                 continue;
             }
-            match fs::read_file(root, &change.path) {
+            match fs::read_file_full(root, &change.path) {
                 Err(_) => unsafe_files.push(RevertIssue { path: change.path, reason: "file_read_failed".into() }),
                 Ok(current) if current != change.after => unsafe_files.push(RevertIssue { path: change.path, reason: "external_modified".into() }),
                 Ok(_) => safe_files.push(change.path),
@@ -183,7 +192,7 @@ impl ToolRouter {
             let Some(change) = merged.iter().find(|change| &change.path == path) else { continue };
             // Re-check immediately before writing: the preview and this write are
             // not atomic, so an edit in between must win over our snapshot.
-            if fs::read_file(root, path).ok().as_deref() != Some(change.after.as_str()) {
+            if fs::read_file_full(root, path).ok().as_deref() != Some(change.after.as_str()) {
                 conflicts.push(path.clone());
                 continue;
             }
@@ -212,7 +221,7 @@ impl ToolRouter {
             return WriteBaseline::Unverifiable;
         };
         match fs::scoped_path(root, rel) {
-            Ok(path) if path.is_file() => match fs::read_file(root, rel) {
+            Ok(path) if path.is_file() => match fs::read_file_full(root, rel) {
                 Ok(content) => WriteBaseline::Content(content),
                 Err(_) => WriteBaseline::Unverifiable,
             },
@@ -238,7 +247,7 @@ impl ToolRouter {
         let rel = arguments.get("path").and_then(|value| value.as_str()).unwrap_or("");
         let root = root.ok_or_else(|| NO_WORKSPACE.to_string())?;
         let current = match fs::scoped_path(root, rel) {
-            Ok(path) if path.is_file() => fs::read_file(root, rel).ok(),
+            Ok(path) if path.is_file() => fs::read_file_full(root, rel).ok(),
             _ => None,
         };
         if current.as_deref() == expected {
@@ -332,6 +341,63 @@ impl ToolRouter {
         ExtensionSnapshot { skills, mcp_configured, mcp_tools, plugins }
     }
 
+    /// 沙盘装配：Extension → Subagent(name=agent) 绑定集合。spawn_subagent
+    /// 装配子循环时取——Skill 附预注入正文（≤8KB/个），插件缺失带 missing 告警。
+    pub async fn subagent_grants(
+        &self,
+        workspace_root: Option<&Path>,
+        agent: &str,
+    ) -> Vec<SubagentGrant> {
+        let (graph, error) = {
+            let state = self.architecture.lock().await;
+            (state.graph.clone(), state.error.clone())
+        };
+        if error.is_some() {
+            // 规则损坏时 fail-closed 由调用求值兜底；装配侧不额外授权。
+            return Vec::new();
+        }
+        let Some(graph) = graph else { return Vec::new() };
+        let trusted = self.trusted_project_root(workspace_root).await;
+        let maestro = self.extensions.maestro_dir();
+        let plugins = self
+            .extensions
+            .plugins
+            .manifests(maestro, trusted.as_deref())
+            .into_iter()
+            .map(|(name, manifest)| {
+                (
+                    name,
+                    ResolvedPlugin {
+                        kind: match manifest.kind {
+                            PluginKind::Skill => ExtensionKind::Skill,
+                            PluginKind::Mcp => ExtensionKind::Mcp,
+                        },
+                        target: manifest.target,
+                        tool: manifest.tool,
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let bindings = crate::domain::subagent_bindings(&graph, agent, &plugins);
+        bindings
+            .into_iter()
+            .take(8)
+            .map(|binding| {
+                // 必选 Skill 正文预注入（与 architecture_brief 同口径 ≤8KB）。
+                let body = if binding.kind == ExtensionKind::Skill && binding.required {
+                    self.extensions
+                        .skills
+                        .body(&binding.target, maestro, trusted.as_deref())
+                        .ok()
+                        .map(|text| text.chars().take(8192).collect::<String>())
+                } else {
+                    None
+                };
+                SubagentGrant { binding, body }
+            })
+            .collect()
+    }
+
     /// Restriction 的检查体：write_file 的新内容、apply_patch 的模拟结果、
     /// run_command 的命令文本；其余工具返回 None（Restriction 恒通过）。
     fn simulated_content(
@@ -347,7 +413,7 @@ impl ToolRouter {
             "apply_patch" => {
                 let rel = arguments.get("path")?.as_str()?;
                 let root = workspace_root?;
-                let original = fs::read_file(root, rel).ok();
+                let original = fs::read_file_full(root, rel).ok();
                 if let Some(edits) = arguments.get("edits").and_then(|v| v.as_array()) {
                     let mut current = original.clone().unwrap_or_default();
                     for edit in edits {
@@ -789,7 +855,13 @@ impl ToolRouter {
             "task_output" | "task_stop" => arg("task_id").unwrap_or("").to_string(),
             "run_command" => arg("command").unwrap_or("").to_string(),
             "load_skill" => arg("name").unwrap_or("").to_string(),
-            "spawn_subagent" => arg("description").unwrap_or("研究子任务").to_string(),
+            // `type/description`：Requirement 用 path_matches 按类型前缀命中
+            // （targetFile=explore 命中 explore/…），描述仅作可读尾注。
+            "spawn_subagent" => format!(
+                "{}/{}",
+                arg("subagent_type").unwrap_or("explore"),
+                arg("description").unwrap_or("研究子任务"),
+            ),
             "ask_user" => arguments
                 .get("questions")
                 .and_then(|value| value.as_array())
@@ -843,7 +915,7 @@ impl ToolRouter {
                 let (exists, old) = match root {
                     Some(root) => match fs::scoped_path(root, rel) {
                         Ok(path) if path.is_file() => {
-                            (true, fs::read_file(root, rel).unwrap_or_default())
+                            (true, fs::read_file_full(root, rel).unwrap_or_default())
                         }
                         _ => (false, String::new()),
                     },
@@ -1024,8 +1096,9 @@ impl ToolRouter {
                             )
                             .await?
                         }
-                        // Everything else keeps the shell path and needs approval.
-                        crate::domain::command_policy::CommandPolicy::NeedsApproval => {
+                        // 自主放行与已批准的危险命令都走 shell 路径。
+                        crate::domain::command_policy::CommandPolicy::Auto
+                        | crate::domain::command_policy::CommandPolicy::Dangerous => {
                             crate::adapters::exec::run_command_with_cancel(
                                 root,
                                 command,
@@ -1155,6 +1228,20 @@ impl ToolRouter {
                 .map(|data| describe_trigger(&data))
                 .collect::<Vec<_>>()
                 .join(" 或 ");
+            // 只挂子智能体装配（无 Trigger 祖先）的扩展不在父级契约里列
+            // 「必须先调用」——装配段会单独描述「派发时子循环内必须调用」。
+            let bound_to_subagent = graph.edges.iter().any(|edge| {
+                edge.source == node.id
+                    && edge.source_handle.as_deref().map_or(true, |h| h == "pass")
+                    && graph.nodes.iter().any(|target| {
+                        target.id == edge.target
+                            && crate::domain::NodeKind::parse(&target.node_type)
+                                == Some(crate::domain::NodeKind::Subagent)
+                    })
+            });
+            if ctx.is_empty() && bound_to_subagent {
+                continue;
+            }
             let prefix = if ctx.is_empty() {
                 String::new()
             } else if after {
@@ -1224,6 +1311,50 @@ impl ToolRouter {
         if !optional.is_empty() {
             lines.push(format!("- 可选扩展建议（不强制）：{}", optional.join("、")));
         }
+        // 子智能体装配段：Extension --pass--> Subagent(agent) 绑定——派发该类型时
+        // 由子循环强制真实调用（预注入≠已调用），父模型只负责派发与复查。
+        for node in &graph.nodes {
+            if crate::domain::NodeKind::parse(&node.node_type) != Some(crate::domain::NodeKind::Subagent) {
+                continue;
+            }
+            let agent = node.data.agent.as_deref().unwrap_or_default().trim();
+            if agent.is_empty() {
+                continue;
+            }
+            let mut required_list: Vec<String> = Vec::new();
+            let mut optional_list: Vec<String> = Vec::new();
+            for edge in &graph.edges {
+                if edge.target != node.id
+                    || edge.source_handle.as_deref().is_some_and(|h| h != "pass")
+                {
+                    continue;
+                }
+                let Some(source) = graph.nodes.iter().find(|n| n.id == edge.source) else { continue };
+                let Some(ext) = source.data.extension.as_ref() else { continue };
+                let label = crate::domain::describe_obligation(source);
+                if ext.is_required() {
+                    if !required_list.contains(&label) {
+                        required_list.push(label);
+                    }
+                } else if !optional_list.contains(&label) {
+                    optional_list.push(label);
+                }
+            }
+            if required_list.is_empty() && optional_list.is_empty() {
+                continue;
+            }
+            let mut line = format!("- 子智能体装配：spawn_subagent 派发 {agent} 时，其内部循环必须真实调用 ");
+            line.push_str(&if required_list.is_empty() {
+                "（无必选项）".to_string()
+            } else {
+                required_list.join("、")
+            });
+            if !optional_list.is_empty() {
+                line.push_str(&format!("；可选建议：{}", optional_list.join("、")));
+            }
+            line.push_str("。该要求在子智能体内部校验，不由你代调；收尾未完成会在结果中标注装配违例。");
+            lines.push(line);
+        }
         if required_extensions(&graph).is_empty() {
             lines.push("- 图中包含前置要求（Requirement）与禁止内容（Restriction）约束：命中触发器时按连线顺序校验。".into());
         } else {
@@ -1241,9 +1372,14 @@ impl ToolRouter {
             }
             match self.extensions.skills.body(&name, maestro, trusted.as_deref()) {
                 Ok(body) => {
+                    let body_text: String = body.chars().take(8192).collect();
+                    let notice = if body.chars().count() > 8192 {
+                        "…（技能正文已截断，完整内容请用 load_skill 读取）\n"
+                    } else {
+                        ""
+                    };
                     out.push_str(&format!(
-                        "\n<skill_preload name=\"{name}\">\n{}\n</skill_preload>\n",
-                        body.chars().take(8192).collect::<String>()
+                        "\n<skill_preload name=\"{name}\">\n{body_text}\n{notice}</skill_preload>\n"
                     ));
                 }
                 Err(_) => {
