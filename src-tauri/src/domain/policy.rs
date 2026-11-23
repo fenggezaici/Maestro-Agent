@@ -35,7 +35,8 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
 }
 
 /// Mode gate applied to a resolved effect; shared by named and MCP tools.
-/// - Plan: read-only only.
+/// - Plan: read-only only. Non-read-only commands/MCP stay `Deny` — only
+///   allowlisted read-only commands earn an approval path via `gate_call`.
 /// - Code (自主模式): reads and workspace writes execute; commands run unless
 ///   the risk classifier flags them dangerous (`command_policy::is_dangerous`).
 /// - Confirm: every tool call suspends for per-call confirmation.
@@ -55,11 +56,33 @@ pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
     }
 }
 
-/// Mode gate that also consults the command risk classifier. Only Code mode
-/// gains the exemption: commands not flagged dangerous run without asking
-/// (ZCode 自主模式); Plan still denies every side effect, Confirm still asks
-/// for everything, Auto already allows everything.
-pub fn gate_call(mode: Mode, effect: ToolEffect, command: Option<&str>) -> ToolGate {
+/// Whether the tool spec should be advertised to the model in `mode`. Denied
+/// tools are stripped — except Plan still advertises `run_command`: the spec
+/// cannot be argument-aware, and allowlisted read-only commands are callable
+/// there (each call suspends for approval). Everything else stays hidden.
+pub fn spec_visible(mode: Mode, tool: &str, effect: ToolEffect) -> bool {
+    match gate(mode, effect) {
+        ToolGate::Deny => {
+            mode == Mode::Plan && tool == "run_command" && effect == ToolEffect::ProcessExecution
+        }
+        _ => true,
+    }
+}
+
+/// Mode gate that also consults the command policy. `tool` disambiguates the
+/// `command` argument — MCP tools may carry their own `command` field.
+/// - Plan: only allowlisted read-only commands (`is_read_only_safe`, no
+///   `background`) suspend for approval; every other side effect stays Deny.
+/// - Code: commands not flagged dangerous run without asking (ZCode 自主模式).
+/// - Confirm still asks for everything, Auto already allows everything.
+pub fn gate_call(mode: Mode, tool: &str, effect: ToolEffect, command: Option<&str>) -> ToolGate {
+    if mode == Mode::Plan
+        && tool == "run_command"
+        && effect == ToolEffect::ProcessExecution
+        && command.is_some_and(command_policy::is_read_only_safe)
+    {
+        return ToolGate::RequireApproval;
+    }
     if mode == Mode::Code
         && effect == ToolEffect::ProcessExecution
         && command.is_some_and(|cmd| !command_policy::is_dangerous(cmd))
@@ -90,9 +113,54 @@ mod tests {
         for tool in ["read_session", "list_sessions", "load_skill", "list_dir", "read_file", "update_plan"] {
             assert_eq!(authorize(Mode::Plan, tool).unwrap(), ToolEffect::ReadOnly);
         }
+        // authorize 没有参数上下文：Plan 下副作用调用一律按 Deny 处理；
+        // 白名单只读命令的审批通道在 gate_call 一层按命令文本放行。
         for tool in ["apply_patch", "write_file", "run_command"] {
             assert!(authorize(Mode::Plan, tool).is_err());
         }
+    }
+
+    #[test]
+    fn plan_mode_asks_only_for_allowlisted_read_only_commands() {
+        use ToolGate::*;
+        // 白名单只读命令：挂起等批准，批准后走无 shell exec。
+        for command in ["git status", "rg TODO", "cat a.txt", "ls", "node -v", "where cargo"] {
+            assert_eq!(
+                gate_call(Mode::Plan, "run_command", ToolEffect::ProcessExecution, Some(command)),
+                RequireApproval,
+                "{command}"
+            );
+        }
+        // 非白名单命令（危险/写/任意 shell 组合）在 Plan 下仍是硬拒。
+        for command in ["npm install", "git push", "del x", "cargo test", "git status && del x", "unknown_tool"] {
+            assert_eq!(
+                gate_call(Mode::Plan, "run_command", ToolEffect::ProcessExecution, Some(command)),
+                Deny,
+                "{command}"
+            );
+        }
+        assert_eq!(gate_call(Mode::Plan, "run_command", ToolEffect::ProcessExecution, None), Deny);
+        // MCP 工具也可能自带 `command` 参数——按 tool 名消歧，不误判成可审批命令。
+        assert_eq!(
+            gate_call(Mode::Plan, "mcp__sh__run", ToolEffect::ProcessExecution, Some("git status")),
+            Deny
+        );
+        // 写操作与 readOnly 效果不受 run_command 分支影响。
+        assert_eq!(gate_call(Mode::Plan, "write_file", ToolEffect::WorkspaceWrite, Some("git status")), Deny);
+        assert_eq!(gate_call(Mode::Plan, "read_file", ToolEffect::ReadOnly, None), Allow);
+    }
+
+    #[test]
+    fn spec_visible_hides_denied_tools_but_keeps_plan_run_command() {
+        assert!(spec_visible(Mode::Plan, "read_file", ToolEffect::ReadOnly));
+        assert!(spec_visible(Mode::Plan, "run_command", ToolEffect::ProcessExecution));
+        assert!(!spec_visible(Mode::Plan, "write_file", ToolEffect::WorkspaceWrite));
+        assert!(!spec_visible(Mode::Plan, "apply_patch", ToolEffect::WorkspaceWrite));
+        assert!(!spec_visible(Mode::Plan, "mcp__sh__run", ToolEffect::ProcessExecution));
+        assert!(spec_visible(Mode::Plan, "mcp__wiki__search", ToolEffect::ReadOnly));
+        // 其它模式的可见性与 gate 结果一致。
+        assert!(spec_visible(Mode::Code, "run_command", ToolEffect::ProcessExecution));
+        assert!(spec_visible(Mode::Confirm, "write_file", ToolEffect::WorkspaceWrite));
     }
 
     #[test]
@@ -141,7 +209,7 @@ mod tests {
             "git diff --output=x",
         ] {
             assert_eq!(
-                gate_call(Mode::Code, ToolEffect::ProcessExecution, Some(command)),
+                gate_call(Mode::Code, "run_command", ToolEffect::ProcessExecution, Some(command)),
                 Allow,
                 "{command}"
             );
@@ -160,19 +228,19 @@ mod tests {
             "cmd /C dir",
         ] {
             assert_eq!(
-                gate_call(Mode::Code, ToolEffect::ProcessExecution, Some(command)),
+                gate_call(Mode::Code, "run_command", ToolEffect::ProcessExecution, Some(command)),
                 RequireApproval,
                 "{command}"
             );
         }
-        assert_eq!(gate_call(Mode::Code, ToolEffect::ProcessExecution, None), RequireApproval);
+        assert_eq!(gate_call(Mode::Code, "run_command", ToolEffect::ProcessExecution, None), RequireApproval);
         // The exemption is Code-only.
-        assert_eq!(gate_call(Mode::Confirm, ToolEffect::ProcessExecution, Some("git status")), RequireApproval);
-        assert_eq!(gate_call(Mode::Plan, ToolEffect::ProcessExecution, Some("git status")), Deny);
-        assert_eq!(gate_call(Mode::Auto, ToolEffect::ProcessExecution, Some("git push")), Allow);
+        assert_eq!(gate_call(Mode::Confirm, "run_command", ToolEffect::ProcessExecution, Some("git status")), RequireApproval);
+        assert_eq!(gate_call(Mode::Plan, "run_command", ToolEffect::ProcessExecution, Some("git push")), Deny);
+        assert_eq!(gate_call(Mode::Auto, "run_command", ToolEffect::ProcessExecution, Some("git push")), Allow);
         // Non-command effects keep their existing matrix.
-        assert_eq!(gate_call(Mode::Code, ToolEffect::WorkspaceWrite, Some("git status")), Allow);
-        assert_eq!(gate_call(Mode::Plan, ToolEffect::WorkspaceWrite, Some("git status")), Deny);
+        assert_eq!(gate_call(Mode::Code, "write_file", ToolEffect::WorkspaceWrite, Some("git status")), Allow);
+        assert_eq!(gate_call(Mode::Plan, "write_file", ToolEffect::WorkspaceWrite, Some("git status")), Deny);
     }
 
     #[test]

@@ -11,7 +11,7 @@ const at = { x: 0, y: 0 };
 const SEED = {
   skills: [{ name: 'ui-guidelines', description: '', source: 'global' as const, path: '' }],
   servers: [{
-    name: 'postgres', command: 'npx', args: [], env: {}, disabled: false, autoStart: false,
+    name: 'postgres', command: 'npx', args: [], transport: 'stdio' as const, url: null, headerKeys: [], timeoutMs: null, env: {}, disabled: false, autoStart: false,
     trust: false, running: true, toolCount: 1, error: null,
     tools: [{ name: 'query', description: '', inputSchema: {}, readOnly: true }],
   }],

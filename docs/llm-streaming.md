@@ -36,7 +36,7 @@ pnpm tauri dev
 `stream_chat` 的前端参数为 `messages`、`api_key`、`base_url`、`model`、`session_id`。
 `session_id` 绑定当前工作台会话；直接调用时可省略，由 Rust 创建新会话。命令返回接受后的 run ID。
 `messages` 只接受 user/assistant。Rust 从该会话的已完成记录重建可信上下文，最多 32 轮/128 KiB，并将当前消息只插入一次。
-Plan Mode 系统提示由 Rust 根据该轮不可变模式添加：“你处于只读计划模式”。Plan 下只读工具（`read_file`/`list_dir`/`glob_files`/`grep_files` 等）可执行，副作用工具在该轮从模型可见工具表中物理剥离且后端二次拒绝。
+Plan Mode 系统提示由 Rust 根据该轮不可变模式添加（"你处于计划模式"）。Plan 下只读工具（`read_file`/`list_dir`/`glob_files`/`grep_files` 等）可执行；`run_command` 保留在工具表中，但仅白名单只读命令可发起调用且每次挂起等用户逐项批准；写工具、非白名单命令与非只读 MCP 在该轮从模型可见工具表中物理剥离且后端二次拒绝。
 
 为避免多会话串流，聊天事件采用带关联信息的载荷，而不是无法关联的裸字符串：
 

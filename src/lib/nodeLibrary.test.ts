@@ -12,7 +12,7 @@ const skills: SkillView[] = [
 ];
 
 const server = (running: boolean): McpServerView => ({
-  name: 'postgres', command: 'pg', args: [], env: {}, disabled: false,
+  name: 'postgres', command: 'pg', args: [], transport: 'stdio', url: null, headerKeys: [], timeoutMs: null, env: {}, disabled: false,
   autoStart: true, trust: false, running, toolCount: running ? 2 : 0,
   tools: running ? [
     { name: 'query', description: 'SQL 查询', inputSchema: {}, readOnly: true },
@@ -54,17 +54,16 @@ describe('buildLibraryItems', () => {
     const rust = byId(items, 'ext:skill:global:rust-rules');
     expect(rust?.category).toEqual(['扩展', 'Skills', '其它']);
     expect(rust?.badge).toBe('全局');
-    // MCP：服务与工具挂 用途 → server 两级。
-    expect(byId(items, 'ext:mcp:postgres')?.category).toEqual(['扩展', 'MCP Servers', '其它', 'postgres']);
-    expect(byId(items, 'ext:mcp:postgres:query')?.category).toEqual(['扩展', 'MCP Servers', '算法·数据', 'postgres']);
-    expect(byId(items, 'ext:mcp:postgres:query')?.extension?.tool).toBe('query');
+    // MCP：库面板只到服务级，工具级条目不再拆出（工具颗粒度走属性面板「限定工具」）。
+    expect(byId(items, 'ext:mcp:postgres')?.category).toEqual(['扩展', 'MCP Servers']);
+    expect(byId(items, 'ext:mcp:postgres:query')).toBeUndefined();
     // Plugins：用途文件夹 + kind badge。
     const plugin = byId(items, 'ext:plugin:db-plugin');
     expect(plugin?.category).toEqual(['扩展', 'Plugins', '其它']);
     expect(plugin?.badge).toBe('MCP');
   });
 
-  it('未运行 MCP 标记禁用且不展开工具；损坏插件禁用', () => {
+  it('未运行 MCP 标记禁用；损坏插件禁用', () => {
     const items = buildLibraryItems(known(false));
     expect(byId(items, 'ext:mcp:postgres')?.disabled).toBeTruthy();
     expect(byId(items, 'ext:mcp:postgres:query')).toBeUndefined();
@@ -82,8 +81,8 @@ describe('buildLibraryItems', () => {
     const server = byId(items, 'ext:mcp:postgres')?.detail;
     expect(server?.meta?.some(([label, value]) => label === '状态' && value.includes('运行中'))).toBe(true);
     expect(server?.usage).toContain('mcp__postgres__*');
-    // mcp tool：tools/list 描述 + 只读标记 + 精确工具语义
-    const tool = byId(items, 'ext:mcp:postgres:query')?.detail;
+    // mcp tool：库面板不拆工具条目，但工具 detail 仍可按 ext 反查（限定工具节点的详情卡）
+    const tool = detailForExtension({ kind: 'mcp', target: 'postgres', tool: 'query' });
     expect(tool?.description).toBe('SQL 查询');
     expect(tool?.meta?.some(([label, value]) => label === '读写性' && value === '只读')).toBe(true);
     expect(tool?.usage).toContain('mcp__postgres__query');

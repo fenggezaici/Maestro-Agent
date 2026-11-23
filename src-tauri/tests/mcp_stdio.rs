@@ -60,9 +60,13 @@ async fn fake_stdio_server_lists_calls_and_respects_trust() {
                 command: "node".into(),
                 args: vec![script.to_string_lossy().into_owned()],
                 env: Default::default(),
+                transport: maestro_lib::domain::McpTransport::Stdio,
+                url: None,
+                headers: Default::default(),
                 disabled: false,
                 auto_start: false,
                 trust: false,
+                timeout_ms: None,
             },
         )
         .unwrap();
@@ -77,7 +81,7 @@ async fn fake_stdio_server_lists_calls_and_respects_trust() {
     assert!(manager.tool_is_read_only("mcp__fake__echo").await);
 
     let text = manager
-        .call_tool("mcp__fake__echo", json!({ "text": "hi" }))
+        .call_tool("mcp__fake__echo", json!({ "text": "hi" }), None)
         .await
         .unwrap();
     assert_eq!(text, "echo:hi");
@@ -94,5 +98,47 @@ async fn fake_stdio_server_lists_calls_and_respects_trust() {
     manager.start_enabled().await;
     assert!(!manager.list_servers().await.unwrap()[0].running);
 
+    manager.shutdown().await;
+}
+
+/// Real-world reproduction: spawn `npx -y chrome-devtools-mcp@latest` through
+/// the full `spawn_stdio` chain (cmd /C on Windows, sanitized env, real
+/// handshake). Exercises the exact path that exits 1 inside the app.
+/// Run manually:
+///   corepack pnpm exec cargo test --test mcp_stdio -- --ignored
+#[tokio::test]
+#[ignore = "hits the network and a real npm package; run manually"]
+async fn real_npx_server_handshakes_or_reports_cause() {
+    if !node_available() {
+        eprintln!("skip: node is not available on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let manager = McpManager::default();
+    manager.set_config_path(dir.path().join("mcp.json"));
+    manager
+        .upsert_server(
+            "cdm",
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                env: Default::default(),
+                transport: maestro_lib::domain::McpTransport::Stdio,
+                url: None,
+                headers: Default::default(),
+                disabled: false,
+                auto_start: false,
+                trust: true,
+                timeout_ms: None,
+            },
+        )
+        .unwrap();
+    match manager.start("cdm").await {
+        Ok(view) => {
+            eprintln!("started: {} tools", view.tool_count);
+            assert!(view.tool_count > 0);
+        }
+        Err(error) => panic!("start failed: {error}"),
+    }
     manager.shutdown().await;
 }

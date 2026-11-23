@@ -29,7 +29,7 @@ pub use architecture::{
 pub use error::AppResult;
 pub use event::{EventData, KernelEvent, ToolPhase};
 pub use extension::{
-    CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, PluginCondition,
+    CommandView, McpConfigFile, McpServerConfig, McpServerView, McpToolView, McpTransport, PluginCondition,
     PluginKind, PluginManifest, PluginView, RecommendedItem, SkillImportOutcome, SkillSource,
     SkillView, WorkspaceTrustStatus,
 };
@@ -45,7 +45,7 @@ pub use plan::{
     validate_plan_steps, PlanCard, PlanDecision, PlanDraft, PlanStatus, PlanStep, PlanStepStatus,
     ProposedDiff,
 };
-pub use policy::{authorize, classify, gate, gate_call, ToolEffect, ToolGate};
+pub use policy::{authorize, classify, gate, gate_call, spec_visible, ToolEffect, ToolGate};
 pub use session::{
     unix_now, Mode, ProjectView, ReasoningSegment, RunMessage, RunPart, RunStatus, RunView, SessionDetail,
     SessionView, Snapshot, ToolCallView,

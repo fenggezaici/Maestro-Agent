@@ -39,7 +39,7 @@ export default function ApprovalRulesDialog({ runId, open, onOpenChange }: {
     <DialogContent variant="form" className="confirm-dialog">
       <DialogTitle className="confirm-dialog-title"><ShieldCheck size={18} />本会话授权规则</DialogTitle>
       <DialogDescription className="confirm-dialog-description">
-        这些规则只在本会话内免除审批；切到「计划」模式时仍然会被拒绝。撤销后相同调用会重新请求批准。
+        这些规则只在本会话内免除审批；切到「计划」模式时不生效——每项副作用调用仍需逐项批准。撤销后相同调用会重新请求批准。
       </DialogDescription>
       <div className="approval-rules-list">
         {loading ? <p><Loader2 size={13} className="spin" />正在读取规则…</p>
@@ -49,7 +49,7 @@ export default function ApprovalRulesDialog({ runId, open, onOpenChange }: {
               <strong>{rule.tool === '*' ? '本会话全部放行' : rule.tool}</strong>
               <code>{rule.tool === '*' ? '所有需要审批的调用' : rule.prefix ? `${rule.pattern} *` : rule.pattern}</code>
               <em>{rule.tool === '*'
-                ? '仅本会话、不持久化；切到「计划」模式仍然拒绝'
+                ? '仅本会话、不持久化；计划模式下不生效'
                 : rule.prefix ? '前缀：同前缀的其他命令也会免审' : '精确匹配'}</em>
             </div>
             <button type="button" className="button-ghost" aria-label={`撤销规则 ${rule.tool} ${rule.pattern}`} onClick={() => revoke(rule)}>

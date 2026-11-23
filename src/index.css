@@ -572,6 +572,7 @@ body[data-scroll-locked] { padding-right: 0 !important; }
 .extension-description p { color: #828282; font-size: 12px; line-height: 1.7; margin-top: 5px; }
 .extension-description p code { color: #9a8fb0; font-size: 12px; }
 .extension-state { display: block; color: #82778f; font-size: 10px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.extension-state.extension-error { color: #c98f7e; white-space: pre-wrap; word-break: break-all; max-height: 96px; overflow-y: auto; }
 .extension-section { margin-bottom: 26px; }
 .extension-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 18px 0 12px; }
 .extension-section-heading h4 { display: flex; align-items: center; gap: 8px; color: #b8b8b8; font-size: 13px; font-weight: 550; letter-spacing: .4px; }

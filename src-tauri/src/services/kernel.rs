@@ -1074,6 +1074,13 @@ impl Kernel {
         self.router.tool_specs(mode, root).await
     }
 
+    /// The tool's resolved effect (MCP tools consult the server readOnlyHint).
+    /// Subagent tool lists filter to `ReadOnly` so children never see
+    /// approvable side-effect tools like Plan-mode `run_command`.
+    pub(crate) async fn tool_effect(&self, tool: &str) -> AppResult<ToolEffect> {
+        self.router.classify(tool).await
+    }
+
     /// The workspace root bound to `run_id` at start (None when no run is
     /// active or the run never had one).
     pub(crate) async fn run_workspace_root(&self, run_id: i64) -> Option<PathBuf> {
@@ -1545,35 +1552,60 @@ impl Kernel {
             });
             // A historical "always allow" rule or a session grant only waives
             // an approval that the current mode would otherwise demand. It can
-            // never lift a mode's absolute denial (Plan), so the gate is
-            // resolved first.
-            let auto = self.is_auto_approved(run.session_id, &candidate);
+            // never lift a mode's absolute denial (Plan), and in Plan every
+            // side-effect call must ask explicitly — rules are ignored there
+            // too (会话放行对 Plan 早已无效，见上方 full_access 排除)。
+            let auto =
+                mode != Mode::Plan && self.is_auto_approved(run.session_id, &candidate);
+            // Plan 下 background:true 走 shell 路径，按非只读拒绝：command 置
+            // 空后 gate_call 的只读白名单判定失败，自然落回 Deny。
+            let command = if mode == Mode::Plan
+                && tool == "run_command"
+                && serde_json::from_str::<serde_json::Value>(arguments_json)
+                    .ok()
+                    .and_then(|value| value.get("background").and_then(|v| v.as_bool()))
+                    .unwrap_or(false)
+            {
+                None
+            } else {
+                command
+            };
             let mut gate = match self.router.classify(tool).await {
                 Err(reason) => Gate::Denied(self.block_tool_scoped(run_id, subagent_id, tool, reason).await),
-                Ok(effect) => match policy::gate_call(mode, effect, command.as_deref()) {
-                    ToolGate::Deny => Gate::Denied(
-                        self.block_tool_scoped(
-                            run_id,
-                            subagent_id,
-                            tool,
-                            format!("Plan Mode blocked tool: {tool}; only read tools are allowed"),
-                        )
-                        .await,
-                    ),
-                    ToolGate::RequireApproval if auto || full_access => {
-                        audit_kinds[index] = if auto {
-                            AuditKind::RuleApproved
-                        } else {
-                            AuditKind::SessionGranted
-                        };
-                        Gate::Allow(effect)
+                Ok(effect) => {
+                    // 子智能体保持只读硬门槛：可审批在其作用域内一律降级为
+                    // 拒绝——它的契约是"不执行命令"，审批卡只能由主对话发起。
+                    let tool_gate = match policy::gate_call(mode, tool, effect, command.as_deref()) {
+                        ToolGate::RequireApproval if subagent_id.is_some() => ToolGate::Deny,
+                        result => result,
+                    };
+                    match tool_gate {
+                        ToolGate::Deny => Gate::Denied(
+                            self.block_tool_scoped(
+                                run_id,
+                                subagent_id,
+                                tool,
+                                format!(
+                                    "Plan Mode blocked tool: {tool}; only read tools and allowlisted read-only commands are allowed"
+                                ),
+                            )
+                            .await,
+                        ),
+                        ToolGate::RequireApproval if auto || full_access => {
+                            audit_kinds[index] = if auto {
+                                AuditKind::RuleApproved
+                            } else {
+                                AuditKind::SessionGranted
+                            };
+                            Gate::Allow(effect)
+                        }
+                        ToolGate::RequireApproval => {
+                            any_suspended = true;
+                            Gate::Suspended(effect, candidate)
+                        }
+                        ToolGate::Allow => Gate::Allow(effect),
                     }
-                    ToolGate::RequireApproval => {
-                        any_suspended = true;
-                        Gate::Suspended(effect, candidate)
-                    }
-                    ToolGate::Allow => Gate::Allow(effect),
-                },
+                }
             };
             // 架构预检（审批前）：本会话历史 + 本批次此前调用的乐观快照。
             // 命中阻断即在进入审批前拦下；是否可放行仍以 Phase 3 真实历史为准。
@@ -3267,7 +3299,16 @@ mod tests {
         assert!(plan.iter().any(|name| name == "update_plan"));
         assert!(!plan.iter().any(|name| name == "write_file"));
         assert!(!plan.iter().any(|name| name == "apply_patch"));
-        assert!(!plan.iter().any(|name| name == "run_command"));
+        // run_command 在 Plan 下保留：白名单只读命令可发起调用并逐项审批；
+        // 且 Plan 规格不暴露 background 参数（后台执行走 shell，一律拒绝）。
+        assert!(plan.iter().any(|name| name == "run_command"));
+        let run_command = kernel
+            .agent_tools(Mode::Plan, None)
+            .await
+            .into_iter()
+            .find(|tool| tool.name == "run_command")
+            .unwrap();
+        assert!(run_command.parameters["properties"].get("background").is_none());
         for mode in [Mode::Code, Mode::Confirm, Mode::Auto] {
             let names: Vec<String> = kernel
                 .agent_tools(mode, None)
@@ -3319,13 +3360,25 @@ mod tests {
         events: &Arc<StdMutex<Vec<KernelEvent>>>,
         phase: ToolPhase,
     ) {
+        wait_for_phase_count(events, phase, 1).await;
+    }
+
+    /// 顺序挂起按出现次数等待：同一 run 里第二次 AwaitingApproval 不能命中
+    /// 第一次留下的旧事件。
+    async fn wait_for_phase_count(
+        events: &Arc<StdMutex<Vec<KernelEvent>>>,
+        phase: ToolPhase,
+        count: usize,
+    ) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if events
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|event| matches!(&event.data, EventData::ToolCall { phase: p, .. } if *p == phase))
+                    .filter(|event| matches!(&event.data, EventData::ToolCall { phase: p, .. } if *p == phase))
+                    .count()
+                    >= count
                 {
                     break;
                 }
@@ -3953,7 +4006,7 @@ mod tests {
             .resolve_approval(id, ApprovalDecision::AllowSession, CommandScope::Exact, None)
             .await
             .unwrap();
-        call.await.unwrap();
+        let _ = call.await.unwrap();
         // 合成行出现在授权规则列表，可撤销。
         let rules = kernel.list_approval_rules(id).await.unwrap();
         assert!(rules.iter().any(|rule| rule.tool == "*"));
@@ -3996,16 +4049,33 @@ mod tests {
             .resolve_approval(id, ApprovalDecision::AllowSession, CommandScope::Exact, None)
             .await
             .unwrap();
-        call.await.unwrap();
-        // 同会话切到 Plan：绝对拒绝优先于会话放行。
+        let _ = call.await.unwrap();
+        // 同会话切到 Plan：非白名单命令的绝对拒绝优先于会话放行。
         let results = kernel
             .execute_tool_calls_as(
                 id,
-                &[("run_command".into(), r#"{"command":"git status"}"#.into())],
+                &[("run_command".into(), r#"{"command":"git push"}"#.into())],
                 Some(Mode::Plan),
             )
             .await;
         assert!(results[0].is_err());
+        // 白名单命令在 Plan 下只挂起等逐项审批——会话放行同样不豁免。
+        let worker = kernel.clone();
+        let suspended = tokio::spawn(async move {
+            worker
+                .execute_tool_calls_as(
+                    id,
+                    &[("run_command".into(), r#"{"command":"git status"}"#.into())],
+                    Some(Mode::Plan),
+                )
+                .await
+        });
+        wait_for_phase_count(&events, ToolPhase::AwaitingApproval, 2).await;
+        kernel
+            .resolve_approval(id, ApprovalDecision::Deny, CommandScope::Exact, None)
+            .await
+            .unwrap();
+        assert!(suspended.await.unwrap()[0].is_err());
         kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
@@ -4242,7 +4312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_allow_always_cannot_bypass_plan_commands() {
+    async fn historical_allow_always_does_not_waive_plan_command_approvals() {
         let (kernel, events) = test_kernel().await;
         let workspace = tempfile::tempdir().unwrap();
         kernel
@@ -4253,7 +4323,7 @@ mod tests {
         let worker = kernel.clone();
         let first = tokio::spawn(async move {
             worker
-                .execute_model_tool(confirm_run, "run_command", r#"{"command":"echo approved-once"}"#)
+                .execute_model_tool(confirm_run, "run_command", r#"{"command":"whoami"}"#)
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
@@ -4261,15 +4331,87 @@ mod tests {
             .resolve_approval(confirm_run, ApprovalDecision::AllowAlways, CommandScope::Exact, None)
             .await
             .unwrap();
-        assert!(first.await.unwrap().unwrap().contains("approved-once"));
+        assert!(first.await.unwrap().is_ok());
         kernel.finish(confirm_run, RunStatus::Completed, None).await;
 
+        // Plan 模式：持久规则不免除逐项审批——同样的白名单命令仍挂起等批准。
         let plan_run = seed_run_in_session(&kernel, session_id, Mode::Plan).await;
-        let denied = kernel
-            .execute_model_tool(plan_run, "run_command", r#"{"command":"echo approved-once"}"#)
+        let worker = kernel.clone();
+        let suspended = tokio::spawn(async move {
+            worker
+                .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
+                .await
+        });
+        wait_for_phase_count(&events, ToolPhase::AwaitingApproval, 2).await;
+        kernel
+            .resolve_approval(plan_run, ApprovalDecision::AllowOnce, CommandScope::Exact, None)
             .await
-            .unwrap_err();
-        assert!(denied.contains("Plan Mode blocked"), "{denied}");
+            .unwrap();
+        let output = suspended.await.unwrap().unwrap();
+        assert!(!output.trim().is_empty());
+        kernel.finish(plan_run, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_non_allowlisted_and_background_commands() {
+        let (kernel, events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (plan_run, _rx) = seed_run_mode(&kernel, Mode::Plan).await;
+        // 非白名单命令：不挂起，直接拒绝。
+        for arguments in [
+            r#"{"command":"npm install"}"#,
+            r#"{"command":"git push"}"#,
+            r#"{"command":"whoami","background":true}"#,
+        ] {
+            let denied = kernel
+                .execute_model_tool(plan_run, "run_command", arguments)
+                .await
+                .unwrap_err();
+            assert!(denied.contains("Plan Mode blocked"), "{denied}");
+        }
+        // 白名单命令拒绝路径：挂起后用户拒绝，模型拿到拒绝原因。
+        let worker = kernel.clone();
+        let suspended = tokio::spawn(async move {
+            worker
+                .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
+                .await
+        });
+        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
+        kernel
+            .resolve_approval(plan_run, ApprovalDecision::Deny, CommandScope::Exact, Some("计划阶段不要跑命令".into()))
+            .await
+            .unwrap();
+        let denied = suspended.await.unwrap().unwrap_err();
+        assert!(denied.contains("用户拒绝"), "{denied}");
+        kernel.finish(plan_run, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_scoped_calls_downgrade_plan_approval_to_deny() {
+        let (kernel, _events) = test_kernel().await;
+        let workspace = tempfile::tempdir().unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (plan_run, _rx) = seed_run_mode(&kernel, Mode::Plan).await;
+        // 同一条白名单命令：主作用域会挂起审批，子智能体作用域直接拒绝。
+        let calls = [(
+            "run_command".to_string(),
+            r#"{"command":"whoami"}"#.to_string(),
+        )];
+        let results = kernel
+            .execute_subagent_tool_calls(plan_run, "sub-plan", &calls, Some(Mode::Plan))
+            .await;
+        assert!(
+            results[0].as_ref().unwrap_err().contains("Plan Mode blocked"),
+            "{:?}",
+            results[0]
+        );
         kernel.finish(plan_run, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }

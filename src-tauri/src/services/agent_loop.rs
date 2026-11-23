@@ -95,7 +95,7 @@ pub fn replay_budget_bytes(context_window: Option<u64>) -> usize {
 /// completed turns of the same session within a window-derived byte budget.
 pub fn conversation(detail: &SessionDetail, run: &RunView, context_window: Option<u64>) -> Vec<ChatMessage> {
     let policy = match run.mode {
-        Mode::Plan => "你处于只读计划模式。仅可使用列表中提供的只读工具进行分析；写操作与命令执行不会出现在工具列表中，也不得声称已应用变更。",
+        Mode::Plan => "你处于计划模式。只读工具直接执行；白名单只读命令（git/rg/cat/ls 等）可经 run_command 调用，但每次调用都会挂起等待用户逐项批准，批准后才会真实执行。写文件、补丁、非白名单命令与非只读扩展工具不可用，也不得声称已应用变更或已执行。",
         Mode::Code => "你处于 Code 模式。读操作和写文件/补丁直接执行；只有危险命令会挂起等待批准，安全命令直接执行——以工具结果为准，不得声称已应用未成功的修改。",
         Mode::Confirm => "你处于 Confirm 模式。每个工具调用（含只读）都会挂起等待用户逐项确认后才执行；以工具结果为准，不得声称已执行未经确认的操作。",
         Mode::Execute => "你处于历史 execute 模式（遗留记录）。仅可使用实际开放且授权的能力。",
@@ -893,9 +893,18 @@ async fn run_subagent(
     let tool_allowed = |name: &str| {
         allowed.iter().any(|entry| entry == name || (entry.ends_with("__") && name.starts_with(entry.as_str())))
     };
-    let tools: Vec<_> = kernel.agent_tools(Mode::Plan, run_root.as_deref()).await.into_iter()
-        .filter(|tool| tool.name != "spawn_subagent" && (base_open || tool_allowed(&tool.name)))
-        .collect();
+    // 只读研究契约：子智能体清单再按 effect 过滤——Plan 下 run_command 等
+    // 可审批工具不进子智能体（执行侧同口径降级为拒绝）。
+    let mut tools: Vec<_> = Vec::new();
+    for spec in kernel.agent_tools(Mode::Plan, run_root.as_deref()).await {
+        if spec.name == "spawn_subagent" || (!base_open && !tool_allowed(&spec.name)) {
+            continue;
+        }
+        if !matches!(kernel.tool_effect(&spec.name).await, Ok(crate::domain::ToolEffect::ReadOnly)) {
+            continue;
+        }
+        tools.push(spec);
+    }
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
     let tool_budget = subagent_tool_budget(&definition);
     let system_prompt = format!("{}

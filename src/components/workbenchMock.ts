@@ -45,11 +45,11 @@ export function sandboxFixtureExtensions(): KnownExtensions {
       { name: 'plan-review', description: '计划审查流程', source: 'project', path: '<workspace>/.maestro/skills/plan-review/SKILL.md' },
     ],
     servers: [
-      { name: 'postgres', command: 'npx', args: ['-y', 'server-pg'], env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
+      { name: 'postgres', command: 'npx', args: ['-y', 'server-pg'], transport: 'stdio', url: null, headerKeys: [], timeoutMs: null, env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
         { name: 'query', description: 'Run a read-only SQL query', inputSchema: {}, readOnly: true },
         { name: 'describe_schema', description: 'Inspect table schema', inputSchema: {}, readOnly: true },
       ] },
-      { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
+      { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], transport: 'stdio', url: null, headerKeys: [], timeoutMs: null, env: {}, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
     ],
     plugins: [
       { name: 'acceptance-checklist', description: '验收清单（项目级清单示例）', kind: 'skill', target: 'plan-review', tool: null, condition: 'required', params: {}, source: 'project', path: '<workspace>/.maestro/plugins/acceptance-checklist.json', error: null },
@@ -72,11 +72,11 @@ export function usePreviewExtensions(): ExtensionsController {
     { name: 'pdf-tools', description: '项目级技能示例', source: 'project', path: '<workspace>/.maestro/skills/pdf-tools/SKILL.md' },
   ]);
   const [servers, setServers] = useState<McpServerView[]>([
-    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
+    { name: 'filesystem', command: 'npx', args: ['-y', 'server-fs'], transport: 'stdio', url: null, headerKeys: [], timeoutMs: null, env: {}, disabled: false, autoStart: true, trust: false, running: true, toolCount: 2, error: null, tools: [
       { name: 'read_file', description: 'Read a file', inputSchema: {}, readOnly: true },
       { name: 'list_dir', description: 'List directory', inputSchema: {}, readOnly: true },
     ] },
-    { name: 'github', command: 'npx', args: ['-y', 'server-gh'], env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_preview' }, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
+    { name: 'github', command: '', args: [], transport: 'http', url: 'https://api.githubcopilot.com/mcp/', headerKeys: ['Authorization'], timeoutMs: null, env: {}, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
   ]);
   const [pending, setPending] = useState<string | null>(null);
   const noop = async () => null;
@@ -85,14 +85,14 @@ export function usePreviewExtensions(): ExtensionsController {
     recommendedSkills: previewRecommended.filter((i) => i.kind === 'skill'),
     recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
     mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
-    loading: false, pending,
+    loading: false, pending, loadError: null,
     importSummary: null, real: false, hasWorkspace: true,
     installErrors: {}, isInstalled: () => false,
     refresh: async () => {},
     createSkill: async (name, description, scope = 'global') => { setSkills((items) => [...items, { name, description, source: scope, path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
     deleteSkill: async (skill) => { setSkills((items) => items.filter((item) => !(item.name === skill.name && item.source === skill.source))); return null; },
     importSkill: noop, importSkillGithub: noop,
-    addMcpServer: async (name, command, args, env = {}, trust = false) => { setServers((items) => [...items, { name, command, args, env, disabled: false, autoStart: false, trust, running: false, toolCount: 0, error: null, tools: [] }]); return null; },
+    addMcpServer: async (name, command, args, env = {}, trust = false, transport, url, headers, timeoutMs) => { setServers((items) => [...items, { name, command, args, transport: (transport as McpServerView['transport']) ?? 'stdio', url: url ?? null, headerKeys: Object.keys(headers ?? {}), timeoutMs: timeoutMs ?? null, env, disabled: false, autoStart: false, trust, running: false, toolCount: 0, error: null, tools: [] }]); return null; },
     setMcpTrust: async (server, trust) => { setServers((items) => items.map((item) => item.name === server.name ? { ...item, trust } : item)); },
     importMcpJson: noop,
     toggleMcpServer: async (server, enable) => {

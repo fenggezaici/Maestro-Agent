@@ -7,7 +7,7 @@ import { ExternalLink, FolderInput, FolderOpen, GitBranch, PlugZap, Plus, Puzzle
 import type { ExtensionsController } from '../hooks/useExtensions';
 import type { McpServerView, RecommendedItem, SkillView } from '../api/extensions';
 import { pickDirectory, pickFile } from '../api/dialog';
-import { formatEnvText, parseEnvText } from '../lib/envText';
+import { formatEnvText, parseEnvText, parseHeadersText } from '../lib/envText';
 import ConfirmDialog from './ConfirmDialog';
 import { IconButton } from './ui';
 
@@ -20,6 +20,8 @@ interface FormField {
   browse?: 'directory' | 'file';
   disabled?: boolean;
   options?: { value: string; label: string; disabled?: boolean }[];
+  /// 条件显示（例如 MCP 按类型切换 stdio/远程字段）；隐藏字段不参与必填校验。
+  when?: (values: Record<string, string>) => boolean;
 }
 
 function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canBrowse = false, initialValues, onSubmit }: {
@@ -38,6 +40,7 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canB
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   useEffect(() => { if (open) setValues(defaults()); }, [open]);
+  const visible = fields.filter((field) => !field.when || field.when(values));
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (pending) return;
@@ -52,7 +55,7 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canB
         <DialogTitle asChild><h3>{title}</h3></DialogTitle>
         {hint && <p className="dialog-hint">{hint}</p>}
         <form onSubmit={(event) => void submit(event)}>
-          {fields.map((field) => <div key={field.id}>
+          {visible.map((field) => <div key={field.id}>
             <label htmlFor={`ext-${field.id}`}>{field.label}{field.required !== false && !field.options ? ' *' : ''}</label>
             {field.options
               ? <select id={`ext-${field.id}`} value={values[field.id] ?? field.options[0]?.value ?? ''} disabled={field.disabled}
@@ -73,7 +76,7 @@ function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canB
           {error && <p role="alert" className="settings-form-error">{error}</p>}
           <div className="dialog-actions">
             <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
-            <button type="submit" className="button-approve" disabled={pending || fields.some((f) => f.required !== false && !(values[f.id] ?? '').trim())}>{submitLabel}</button>
+            <button type="submit" className="button-approve" disabled={pending || visible.some((f) => f.required !== false && !f.options && !(values[f.id] ?? '').trim())}>{submitLabel}</button>
           </div>
         </form>
     </DialogContent>
@@ -152,17 +155,37 @@ function McpList({ c }: { c: ExtensionsController }) {
       title={editing ? `编辑 MCP 服务 ${editing.name}` : '添加 MCP 服务'}
       hint="写入 ~/.maestro/mcp.json；启用状态会跨重启保留，应用启动时自动拉起已启用的服务。"
       submitLabel={editing ? '保存' : '添加'}
-      initialValues={editing ? { name: editing.name, command: editing.command, args: editing.args.join(' '), env: formatEnvText(editing.env) } : undefined}
+      initialValues={editing ? {
+        name: editing.name,
+        transport: editing.transport ?? 'stdio',
+        command: editing.command, args: editing.args.join(' '), env: formatEnvText(editing.env),
+        url: editing.url ?? '', headers: editing.headerKeys.map((key) => `${key}: `).join('\n'),
+        timeoutMs: editing.timeoutMs ? String(editing.timeoutMs) : '',
+      } : undefined}
       fields={[
         { id: 'name', label: '名称', placeholder: 'filesystem', disabled: Boolean(editing) },
-        { id: 'command', label: '启动命令', placeholder: 'npx' },
-        { id: 'args', label: '参数（空格分隔，可选）', placeholder: '-y @modelcontextprotocol/server-filesystem', required: false },
-        { id: 'env', label: '环境变量（每行 KEY=VALUE，可选）', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx', textarea: true, required: false },
+        { id: 'transport', label: '类型', required: false, options: [
+          { value: 'stdio', label: 'stdio（本地命令）' },
+          { value: 'http', label: 'HTTP（Streamable）' },
+          { value: 'sse', label: 'SSE（Server-Sent Events）' },
+        ] },
+        { id: 'command', label: '启动命令', placeholder: 'npx', when: (v) => (v.transport ?? 'stdio') === 'stdio' },
+        { id: 'args', label: '参数（空格或逗号分隔，可选）', placeholder: '-y @modelcontextprotocol/server-filesystem', required: false, when: (v) => (v.transport ?? 'stdio') === 'stdio' },
+        { id: 'env', label: '环境变量（JSON 或每行 KEY=VALUE，可选）', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx', textarea: true, required: false, when: (v) => (v.transport ?? 'stdio') === 'stdio' },
+        { id: 'url', label: 'URL', placeholder: 'https://api.githubcopilot.com/mcp/', when: (v) => (v.transport ?? 'stdio') !== 'stdio' },
+        { id: 'headers', label: '请求头（JSON 或每行 Name: value，可选）', placeholder: 'Authorization: Bearer ghp_xxx', textarea: true, required: false, when: (v) => (v.transport ?? 'stdio') !== 'stdio' },
+        { id: 'timeoutMs', label: '启动超时（毫秒，可选）', placeholder: '默认 stdio 60s / 远程 20s；npx 冷装可调大', required: false },
       ]}
       onSubmit={(v) => {
         const parsed = parseEnvText(v.env ?? '');
         if (parsed.error) return Promise.resolve(parsed.error);
-        return c.addMcpServer(v.name, v.command, (v.args ?? '').split(' ').filter(Boolean), parsed.env, editing?.trust ?? false);
+        const headers = parseHeadersText(v.headers ?? '');
+        if (headers.error) return Promise.resolve(headers.error);
+        const transport = v.transport ?? 'stdio';
+        const timeoutText = (v.timeoutMs ?? '').trim();
+        const timeoutMs = timeoutText ? Number(timeoutText) : undefined;
+        if (timeoutText && (!Number.isFinite(timeoutMs) || timeoutMs === undefined || timeoutMs < 1000 || timeoutMs > 600000)) return Promise.resolve('启动超时需为 1000–600000 毫秒之间的数字');
+        return c.addMcpServer(v.name, transport === 'stdio' ? v.command : '', (v.args ?? '').split(/[\s,]+/).filter(Boolean), parsed.env, editing?.trust ?? false, transport, transport === 'stdio' ? undefined : v.url, headers.map, timeoutMs);
       }} />
     <FormDialog open={dialog === 'import'} onOpenChange={(o) => !o && setDialog(null)} title="导入 MCP JSON"
       hint="读取一个含 mcpServers 字段的 JSON 文件并合并到 ~/.maestro/mcp.json。" submitLabel="导入" canBrowse={!!c.real}
@@ -178,9 +201,10 @@ function McpRow({ c, server, onEdit }: { c: ExtensionsController; server: McpSer
     <span className={`extension-status-dot ${server.running ? 'running' : server.error ? 'error' : ''}`} aria-hidden="true" />
     <div className="extension-description">
       <strong>{server.name}</strong>
-      <p><code>{server.command} {server.args.join(' ')}</code></p>
+      <p><code>{server.transport === 'stdio' ? `${server.command} ${server.args.join(' ')}` : `${server.transport} ${server.url ?? ''}`}</code></p>
       {envKeys.length > 0 && <p className="extension-state">环境变量：{envKeys.join('、')}</p>}
-      <span className="extension-state">
+      {server.headerKeys.length > 0 && <p className="extension-state">请求头：{server.headerKeys.join('、')}</p>}
+      <span className={`extension-state${!busy && !server.running && server.error ? ' extension-error' : ''}`}>
         {busy ? '处理中…' : server.running ? `运行中 · 已加载 ${server.toolCount} 个工具` : server.error ? server.error : server.disabled ? '已禁用（重启后保持）' : '已停止'}
       </span>
     </div>
@@ -188,7 +212,7 @@ function McpRow({ c, server, onEdit }: { c: ExtensionsController; server: McpSer
     <Switch.Root aria-label={`信任只读声明 ${server.name}`} className="settings-switch" checked={server.trust} disabled={busy}
       onCheckedChange={(trust) => void c.setMcpTrust(server, trust)}><Switch.Thumb /></Switch.Root>
     <button type="button" className="button-ghost" disabled={busy} onClick={onEdit}>编辑</button>
-    <Switch.Root aria-label={`启用 ${server.name}`} className="settings-switch" checked={server.running} disabled={busy}
+    <Switch.Root aria-label={`启用 ${server.name}`} className="settings-switch" checked={!server.disabled} disabled={busy}
       onCheckedChange={(enable) => void c.toggleMcpServer(server, enable)}><Switch.Thumb /></Switch.Root>
     <button type="button" className="icon-button" aria-label={`删除 ${server.name}`} disabled={busy} onClick={() => void c.removeMcpServer(server.name)}><Trash2 size={13} /></button>
   </article>;
@@ -216,6 +240,7 @@ export default function ExtensionsView({ controller: c }: { controller: Extensio
   const t = useT();
   return <section aria-label="扩展工作区" className="extensions-view">
     <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">{t.workspaceCapabilities}</p><h3>{t.extensions}</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
+    {c.loadError && <p role="alert" className="settings-form-error extensions-load-error">部分扩展数据加载失败：{c.loadError}（若涉及 mcp.json，请检查 ~/.maestro/mcp.json 是否为合法 JSON）</p>}
     <Tabs.Root defaultValue="skills" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
       <Tabs.Trigger value="skills">技能</Tabs.Trigger>
       <Tabs.Trigger value="mcp">MCP 服务</Tabs.Trigger>

@@ -28,6 +28,12 @@ export interface McpServerView {
   name: string;
   command: string;
   args: string[];
+  transport: 'stdio' | 'http' | 'sse';
+  url: string | null;
+  /** Header names only — values may hold credentials and never leave the backend. */
+  headerKeys: string[];
+  /** Optional per-server handshake timeout (ms); backend defaults by transport. */
+  timeoutMs: number | null;
   env: Record<string, string>;
   disabled: boolean;
   autoStart: boolean;
@@ -82,8 +88,8 @@ export const extensionsApi = {
   scanCommands: () => invoke<CommandView[]>('scan_commands'),
   readCommand: (name: string) => invoke<string>('read_command', { name }),
   listMcpServers: () => invoke<McpServerView[]>('list_mcp_servers'),
-  addMcpServer: (name: string, command: string, args: string[], env: Record<string, string> = {}, trust = false) =>
-    invoke<void>('add_mcp_server', { name, command, args, env, trust }),
+  addMcpServer: (name: string, command: string, args: string[], env: Record<string, string> = {}, trust = false, transport?: string, url?: string, headers?: Record<string, string>, timeoutMs?: number) =>
+    invoke<void>('add_mcp_server', { name, command, args, env, trust, transport, url, headers, timeoutMs }),
   setMcpServerTrust: (name: string, trust: boolean) =>
     invoke<void>('set_mcp_server_trust', { name, trust }),
   importMcpJson: (path: string) => invoke<number>('import_mcp_json', { path }),

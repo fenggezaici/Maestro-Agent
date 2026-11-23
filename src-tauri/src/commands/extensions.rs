@@ -163,17 +163,30 @@ pub async fn add_mcp_server(
     args: Option<Vec<String>>,
     env: Option<std::collections::BTreeMap<String, String>>,
     trust: Option<bool>,
+    transport: Option<String>,
+    url: Option<String>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    timeout_ms: Option<u64>,
 ) -> AppResult<()> {
     require_main(&window)?;
+    let transport = match transport.as_deref().unwrap_or("stdio") {
+        "http" => crate::domain::McpTransport::Http,
+        "sse" => crate::domain::McpTransport::Sse,
+        _ => crate::domain::McpTransport::Stdio,
+    };
     kernel.extensions().mcp.upsert_server(
         &name,
         McpServerConfig {
             command,
             args: args.unwrap_or_default(),
             env: env.unwrap_or_default(),
+            transport,
+            url,
+            headers: headers.unwrap_or_default(),
             disabled: false,
-            auto_start: false,
+            auto_start: true,
             trust: trust.unwrap_or(false),
+            timeout_ms,
         },
     )
 }

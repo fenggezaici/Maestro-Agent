@@ -430,7 +430,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   }, [c.subagents]);
   const slashSources = useSlashSources(!preview && c.state.ready, `${currentProject.id}:${c.workspaceTick ?? 0}`);
   const slashActions: SlashAction[] = [
-    { id: 'plan', description: '切换到 Plan 模式（只读分析）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
+    { id: 'plan', description: '切换到 Plan 模式（只读分析，白名单命令逐项批准）', disabled: running || c.state.mode === 'plan', run: () => void c.setMode('plan') },
     { id: 'code', description: '切换到 Code 模式（写入直接执行）', disabled: running || c.state.mode === 'code', run: () => void c.setMode('code') },
     { id: 'confirm', description: '切换到 Confirm 模式（每个工具都需确认）', disabled: running || c.state.mode === 'confirm', run: () => void c.setMode('confirm') },
     { id: 'auto', description: '切换到 Auto 模式（已开放工具直接执行）', disabled: running || c.state.mode === 'auto', run: () => void c.setMode('auto') },

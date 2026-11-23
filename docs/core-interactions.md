@@ -33,7 +33,7 @@ OpenAI and DeepSeek use Chat Completions SSE. Anthropic uses Messages, `x-api-ke
 
 Rust owns selectable Plan / Code / Confirm / Auto; Plan is the backend default.
 
-- Plan: read-only policy; side-effect tools are stripped from the model's tool list.
+- Plan: read-only policy plus an approval path for allowlisted read-only commands — `run_command` stays advertised, and `is_read_only_safe` calls (no `background`) suspend for per-call approval; writes, non-allowlisted commands and non-readOnly MCP tools are stripped and denied outright.
 - Code: reads and workspace writes run immediately (ZCode-style autonomous mode); `run_command` goes through a three-tier risk classifier — allowlisted read-only programs execute as parsed argv with no shell, commands matching no danger rule run through the platform shell without asking, and any segment hitting the classifier (nested shells/executors, `-c`/`-e` inline code, `xargs`, destructive/privilege/network-mutation patterns…) suspends for approval. The classifier is best-effort, not a security boundary: nested executors always ask because a blacklist cannot bound `cmd /C` indirection.
 - Confirm: every tool/command suspends for explicit per-call confirmation, then executes.
 - Auto: already-authorized tools execute directly, including writes and commands.
@@ -77,7 +77,7 @@ Code mode treats workspace writes as normal work and runs non-dangerous commands
 
 Subagent definitions are resolved from three sources with `builtin < global < project` precedence: built-ins (`explore`, `general`), `~/.maestro/agents/*.md`, and `<workspace>/.maestro/agents/*.md`. Frontmatter accepts `tool_budget: N` — the per-run tool-call cap for that child (`DEFAULT_SUBAGENT_TOOL_BUDGET` 100 when unset, clamped by `MAX_SUBAGENT_TOOL_BUDGET` 500). The settings panel lists the merged view with a source badge, locks the name of an existing definition, and lets a built-in be overridden by a global file (deleting that file restores the built-in). The `spawn_subagent` enum is generated from the same merged list, so a definition saved in Settings is selectable by the model without editing code; `hidden: true` and `mode` other than `subagent` stay out of the enum.
 
-The child loop never inherits the parent's authorization: its tool calls are filtered against the tools offered to that agent and executed under the Plan gate, so `write_file`/`apply_patch`/`run_command` are denied even when the parent run is in Code or Auto. A consequence is that read-only child calls do not suspend for per-call approval in Confirm mode; the parent's approval slot is not consumed by research work.
+The child loop never inherits the parent's authorization: its tool list is additionally filtered to read-only effects (so Plan-mode `run_command` never reaches it) and its calls execute under the Plan gate with `RequireApproval` downgraded to `Deny`, so `write_file`/`apply_patch`/`run_command` are denied even when the parent run is in Code or Auto. A consequence is that read-only child calls do not suspend for per-call approval in Confirm mode; the parent's approval slot is not consumed by research work.
 
 Model reasoning levels come from the models.dev catalog (`reasoning_options[type=effort].values`); the model config dialog defaults to smart config and only shows the composer slider when more than one level is resolved. Advanced config can override input types, capabilities, ordered levels, and the reasoning mapping JSON.
 

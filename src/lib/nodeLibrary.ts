@@ -314,8 +314,15 @@ function agentItems(agents: AgentDefinition[]): LibraryItem[] {
 
 // ---- 扩展节点库（动态来自已安装扩展） -------------------------------------------
 
-function extensionItems(known: KnownExtensions): LibraryItem[] {
+function extensionItems(known: KnownExtensions): {
+  items: LibraryItem[];
+  /// 工具级条目不进库面板（同服务工具按各自关键词散落各用途文件夹、
+  /// 服务名重复出现），但 detail 仍注册进 extensionHints——画布上
+  /// 「限定工具」的节点详情卡靠 detailForExtension 反查不受影响。
+  toolHints: { extension: ExtensionData; detail: ItemDetail }[];
+} {
   const items: LibraryItem[] = [];
+  const toolHints: { extension: ExtensionData; detail: ItemDetail }[] = [];
   for (const skill of known.skills) {
     items.push(item({
       id: `ext:skill:${skill.source}:${skill.name}`,
@@ -351,24 +358,18 @@ function extensionItems(known: KnownExtensions): LibraryItem[] {
       title: `🧩 ${server.name}`,
       subtitle: server.running ? `运行中 · ${server.tools.length} 个工具` : (disabled ?? ''),
       keywords: `mcp server 服务 ${server.name}`,
-      category: ['扩展', 'MCP Servers', classifyUsage(server.name, server.command), server.name],
+      category: ['扩展', 'MCP Servers'],
       nodeKind: 'extension',
       extension: { kind: 'mcp', name: server.name, target: server.name, requirement: 'required', scope: 'session' },
       disabled,
       detail: {
         meta,
-        usage: `必选：触发器命中后，模型须调用 mcp__${server.name}__* 任一工具，否则关联工具调用被拦截。属性面板可改为「事后」做改后验收。`,
+        usage: `必选：触发器命中后，模型须调用 mcp__${server.name}__* 任一工具，否则关联工具调用被拦截。属性面板可改为「事后」做改后验收、用「限定工具」收窄到单个工具。`,
       },
     }));
     if (server.running) {
       for (const tool of server.tools) {
-        items.push(item({
-          id: `ext:mcp:${server.name}:${tool.name}`,
-          title: `↳ ${tool.name}`,
-          subtitle: tool.description || '必选后模型须实际调用该工具',
-          keywords: `mcp tool 工具 ${server.name} ${tool.name} ${tool.description ?? ''}`,
-          category: ['扩展', 'MCP Servers', classifyUsage(server.name, tool.description ?? tool.name), server.name],
-          nodeKind: 'extension',
+        toolHints.push({
           extension: { kind: 'mcp', name: `${server.name}/${tool.name}`, target: server.name, tool: tool.name, requirement: 'required', scope: 'session' },
           detail: {
             description: tool.description || undefined,
@@ -378,7 +379,7 @@ function extensionItems(known: KnownExtensions): LibraryItem[] {
             ],
             usage: `必选：触发器命中后，模型须实际调用 mcp__${server.name}__${tool.name}，否则关联工具调用被拦截。`,
           },
-        }));
+        });
       }
     }
   }
@@ -407,7 +408,7 @@ function extensionItems(known: KnownExtensions): LibraryItem[] {
       },
     }));
   }
-  return items;
+  return { items, toolHints };
 }
 
 // ---- 预置流程 ------------------------------------------------------------------
@@ -449,11 +450,15 @@ export function detailForExtension(ext: Pick<ExtensionData, 'kind' | 'target' | 
 }
 
 export function buildLibraryItems(known: KnownExtensions): LibraryItem[] {
-  const items = [...coreItems(), ...agentItems(known.agents ?? []), ...extensionItems(known), ...templateItems()];
+  const extensions = extensionItems(known);
+  const items = [...coreItems(), ...agentItems(known.agents ?? []), ...extensions.items, ...templateItems()];
   // 重建映射：扩展清单随扫描结果变化，旧 key 全部废弃。
   extensionHints.clear();
   for (const entry of items) {
     if (entry.extension && entry.detail) extensionHints.set(extensionKey(entry.extension), entry.detail);
+  }
+  for (const hint of extensions.toolHints) {
+    extensionHints.set(extensionKey(hint.extension), hint.detail);
   }
   return items;
 }

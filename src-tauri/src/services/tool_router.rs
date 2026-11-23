@@ -12,7 +12,7 @@ use crate::{
     domain::{
         armed_obligations, effective_after_set, evaluate_architecture, optional_extensions,
         required_extensions, trigger_ancestors,
-        policy::{self, ToolGate},
+        policy,
         validate_plan_steps, AppResult, ArchitectureGraph, ArmedObligation, ExtensionKind,
         ExtensionSnapshot, GraphDecision, HistoryEntry, merge_file_changes, Mode,
         PendingCall, PlanStep, PluginKind, ResolvedPlugin, RevertIssue, RevertPreview, RevertResult,
@@ -694,18 +694,40 @@ impl ToolRouter {
                 "required": ["path", "content"]
             }),
         });
+        let (run_command_description, run_command_parameters) = if mode == Mode::Plan {
+            // Plan 仅白名单只读命令可经批准执行；background 走 shell，整个
+            // 参数在 Plan 下不提供（传了也会被拒绝）。
+            (
+                "在工作区目录执行一条命令。当前 Plan 模式：仅白名单只读命令（git/rg/cat/ls 等）可调用，每次需用户逐项批准；其他命令会被拒绝。command 为完整命令行；timeout_ms 可调（1s–600s，默认 60s）。"
+                    .to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout_ms": { "type": "integer", "description": "超时毫秒数，1000–600000，默认 60000" }
+                    },
+                    "required": ["command"]
+                }),
+            )
+        } else {
+            (
+                "在工作区目录执行一条 shell 命令（有副作用；调用会挂起等待用户批准，超时强制终止）。command 为完整命令行；timeout_ms 可调（1s–600s，默认 60s）；background 为 true 时立即返回任务 id，配合 task_output/task_stop 管理。"
+                    .to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout_ms": { "type": "integer", "description": "超时毫秒数，1000–600000，默认 60000" },
+                        "background": { "type": "boolean", "description": "true 时后台运行并返回任务 id" }
+                    },
+                    "required": ["command"]
+                }),
+            )
+        };
         tools.push(ToolSpec {
             name: "run_command".into(),
-            description: "在工作区目录执行一条 shell 命令（有副作用；调用会挂起等待用户批准，超时强制终止）。command 为完整命令行；timeout_ms 可调（1s–600s，默认 60s）；background 为 true 时立即返回任务 id，配合 task_output/task_stop 管理。".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "description": "超时毫秒数，1000–600000，默认 60000" },
-                    "background": { "type": "boolean", "description": "true 时后台运行并返回任务 id" }
-                },
-                "required": ["command"]
-            }),
+            description: run_command_description,
+            parameters: run_command_parameters,
         });
         tools.push(ToolSpec {
             name: "task_output".into(),
@@ -828,12 +850,13 @@ impl ToolRouter {
                 "required": ["steps"]
             }),
         });
-        // Strip every tool the mode gate would deny: Plan mode requests must
-        // not advertise side-effect tools at all, whether built-in or MCP.
+        // Strip every tool the mode gate would deny — except Plan keeps
+        // `run_command` visible: its allowlisted read-only calls suspend for
+        // approval there (see `policy::spec_visible`).
         let mut visible = Vec::with_capacity(tools.len());
         for spec in tools {
             match self.classify(&spec.name).await {
-                Ok(effect) if policy::gate(mode, effect) != ToolGate::Deny => visible.push(spec),
+                Ok(effect) if policy::spec_visible(mode, &spec.name, effect) => visible.push(spec),
                 _ => {}
             }
         }

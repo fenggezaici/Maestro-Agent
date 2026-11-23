@@ -63,23 +63,52 @@ pub struct WorkspaceTrustStatus {
 
 // ---- MCP servers ------------------------------------------------------------
 
+/// MCP transport kind. `stdio` spawns a child process; `http`/`sse` talk to a
+/// remote endpoint directly (no local bridge like mcp-remote needed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    /// Streamable HTTP (current MCP spec): single POST endpoint, session via
+    /// `Mcp-Session-Id` response header.
+    Http,
+    /// Legacy HTTP+SSE: GET stream emits an `endpoint` event for POSTs.
+    Sse,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpServerConfig {
+    /// stdio：本地命令；http/sse 下可为空字符串。
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
+    pub transport: McpTransport,
+    /// http/sse 必填：远端 MCP 端点。
+    #[serde(default)]
+    pub url: Option<String>,
+    /// http/sse 附加请求头（如 `Authorization: Bearer <PAT>`）。
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
     pub disabled: bool,
-    /// Explicit "restore on startup" intent; imported servers default off.
+    /// 开关意图的镜像字段（`!disabled`），仅为序列化兼容保留；
+    /// 启动恢复只认 `disabled`，不再读取此字段。
     #[serde(default)]
     pub auto_start: bool,
     /// Explicit user opt-in for this server's `readOnlyHint`. Default false:
     /// an untrusted server's tools always count as side-effecting.
     #[serde(default)]
     pub trust: bool,
+    /// 启动握手（initialize→tools/list）超时毫秒数；None 按传输取默认
+    /// （stdio 60s 覆盖 npx 冷装，remote 20s）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -105,10 +134,15 @@ pub struct McpServerView {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    pub transport: McpTransport,
+    pub url: Option<String>,
+    /// 仅透传 header 名（值可能含 PAT 等凭据，不回传 UI）。
+    pub header_keys: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub disabled: bool,
     pub auto_start: bool,
     pub trust: bool,
+    pub timeout_ms: Option<u64>,
     pub running: bool,
     pub tool_count: usize,
     /// 运行中 Server 的 `tools/list` 结果；未运行或失败时为空。

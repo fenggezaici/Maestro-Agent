@@ -17,8 +17,8 @@
 | **架构沙盘（规则编排）** | React Flow 节点图取代 YAML/静态门禁：Trigger（modify/read/command/plan/any）→ Requirement/Restriction/扩展节点（Skill·MCP·插件，必选项要求真实调用）→ Action（Block/Warn/Remind + 自定义拦截语）。事前拦截、事后验收欠账（还清前其他实质操作被拦、Run 结束被追问）、多路 fail 汇入同一 Action 时逐条列出全部未满足项（merge 语义）。DAG 校验、项目规则优先全局回退、`architecture_trace` 实时节点高亮；提示语留空自动按上游关卡派生、支持 `{call}`/`{target}` 占位符 |
 | **子智能体装配** | 扩展节点 →「通过」出口 → 🤖 子智能体节点：声明 `spawn_subagent(type=…)` 时子循环获得的能力。必选绑定在子循环内强制真实调用（Skill 正文预注入 ≠ 已调用），未调完不能收尾，耗尽标注「装配违例」回父模型；可选只注入建议 |
 | **Provider 聊天** | OpenAI 兼容/Anthropic SSE 统一适配；reasoning/content Rust 侧分类，经单一 `kernel-event` 通道下发（32ms 窗口合并同 key token，前端再按 40ms tick 合并调度——流式高峰期不饿死 invoke 与懒加载） |
-| **工具循环与审批** | `ToolRouter` 统一注册内置/MCP 工具；Plan 只读、Code 对齐 ZCode 自主模式（写直接执行；命令三档分类——只读 argv 免审/未命中危险规则直接执行/命中挂起，嵌套 shell 一律询问）、Confirm 全审、Auto 放行；审批卡片支持 本次/批量/会话/始终 四级；拒绝原因回传模型 |
-| **Skills / MCP / 命令** | `~/.maestro` + `<workspace>/.maestro` 双源（项目覆盖全局，项目源需显式信任工作区）；`load_skill` 真实加载；MCP stdio 客户端 `mcp__server__tool` 注入、trust/readOnlyHint 门禁；`/` 斜杠命令面板 |
+| **工具循环与审批** | `ToolRouter` 统一注册内置/MCP 工具；Plan 只读直放 + 白名单只读命令逐项审批（非白名单命令/非只读 MCP/写操作硬拒）、Code 对齐 ZCode 自主模式（写直接执行；命令三档分类——只读 argv 免审/未命中危险规则直接执行/命中挂起，嵌套 shell 一律询问）、Confirm 全审、Auto 放行；审批卡片支持 本次/批量/会话/始终 四级；拒绝原因回传模型 |
+| **Skills / MCP / 命令** | `~/.maestro` + `<workspace>/.maestro` 双源（项目覆盖全局，项目源需显式信任工作区）；`load_skill` 真实加载；MCP stdio 客户端 `mcp__server__tool` 注入、trust/readOnlyHint 门禁、每服务 `timeoutMs`、配置即自动启动（`disabled` 除外，单服务失败行内提示）；`/` 斜杠命令面板 |
 | **子智能体** | `spawn_subagent` 只读研究循环（内置 explore/general + 自定义 `.maestro/agents`，frontmatter 支持 `tool_budget` 默认 100/上限 500），独立 trace 面板可下钻/回看，超时/预算/单独停止 |
 | **附件** | 文件选择/剪贴板粘贴/拖拽三通道统一接入（图片/视频/文本，20MiB 上限；图片 ≤3MiB、文本 ≤64KB 内联），粘贴文本行为不受拦截 |
 | **停止与队列** | 前端乐观终结 + 迟到 token 丢弃；停止期间输入入队，旧 run 终态后自动续跑；取消按 run_id 精确作用域，不误伤新 run |
@@ -46,7 +46,7 @@ pnpm.cmd tauri dev     # 启动后 Settings → Models 填 Provider/Key/Model
 ## 安全边界
 
 - API Key 走 Windows DPAPI，不落地 localStorage/数据库
-- Plan 模式拒绝一切副作用工具；`.maestro/` 项目扩展未信任不注入
+- Plan 模式拒绝写操作、非白名单命令与非只读 MCP——仅 `is_read_only_safe` 白名单命令可经逐项审批执行（持久授权规则在 Plan 下不免除）；`.maestro/` 项目扩展未信任不注入
 - Workspace 读取限界（路径/链接/扫描预算），敏感文件 denylist（`.env`/私钥/`.ssh` 等）对模型一律拒绝
 - `run_command` 风险分类器为尽力拦截而非安全边界：嵌套 shell/执行器一律询问，未命中规则经平台 shell 直跑
 
