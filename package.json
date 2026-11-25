@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "screenshot": "node scripts/capture-preview.mjs",
+    "screenshot:features": "node scripts/capture-features.mjs",
     "screenshot:verify": "node scripts/capture-ui.mjs",
     "tauri": "tauri",
     "e2e:preview": "node scripts/e2e-preview.mjs",

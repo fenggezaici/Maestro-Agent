@@ -8,7 +8,11 @@
 
 ## 界面预览
 
-![Maestro-Agent workbench](artifacts/ui/maestro-workbench.png)
+| 会话工作台（含架构规则拦截） | 架构沙盘（规则编排） |
+| --- | --- |
+| ![会话工作台](artifacts/ui/maestro-workbench.png) | ![架构沙盘](artifacts/ui/maestro-sandbox.png) |
+| **军团子沙盘（指挥→成员派发）** | **活动面板（用量与热力图）** |
+| ![军团子沙盘](artifacts/ui/maestro-squad.png) | ![活动面板](artifacts/ui/maestro-activity.png) |
 
 ## 核心能力
 
