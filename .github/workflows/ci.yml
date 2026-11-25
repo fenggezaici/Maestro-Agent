@@ -32,6 +32,9 @@ jobs:
       - name: Frontend build (typecheck + bundle)
         run: corepack pnpm build
 
+      # rust-toolchain.toml pins the minor channel (1.97); this step just
+      # bootstraps rustup — a floating `stable` lets surprise new lints
+      # break previously-green code between pushes.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

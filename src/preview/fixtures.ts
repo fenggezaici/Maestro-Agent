@@ -75,7 +75,7 @@ private:
 `;
 
 export const previewPlan: PlanCard = {
-  id: 204, sessionId: 101, runId: 1001, status: 'pending',
+  id: 204, sessionId: 102, runId: 1020, status: 'pending',
   draft: {
     title: 'Session lifecycle refactor',
     summary: '保留公共 API，分三步完善会话生命周期。静态示例。',
@@ -122,7 +122,9 @@ function exampleSession(id: number, title: string, projectId: number): SessionDe
 export const previewProjects: PreviewProject[] = [
   { id: '1', name: 'Maestro-Agent', activity: sampleActivity, today: { changedLines: 120, completedPlans: 3 }, sessions: [
     { session: { id: 101, title: 'Refactor session lifecycle', updatedAt: 1, runCount: 1, projectId: 1, archived: false }, runs: [mainRun], plans: [] },
-    exampleSession(102, 'Improve event dispatch pipeline', 1),
+    { session: { id: 102, title: 'Improve event dispatch pipeline', updatedAt: 1, runCount: 1, projectId: 1, archived: false },
+      runs: [{ ...mainRun, id: 1020, sessionId: 102, prompt: 'Improve event dispatch pipeline', output: '此会话属于另一个预览项目。所有内容为本地 Mock，未连接 Rust 或模型服务。' }],
+      plans: [previewPlan] },
   ] },
   { id: '2', name: 'Agent Tools', activity: sampleActivity, today: { changedLines: 37, completedPlans: 1 }, sessions: [
     exampleSession(103, 'Review database migrations', 2), exampleSession(104, 'Add integration test coverage', 2),

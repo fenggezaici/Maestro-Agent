@@ -160,17 +160,12 @@ pub struct McpServerView {
 // 声明一个「插件 = 对 Skill 或 MCP 的封装引用」；架构沙盘把插件节点解析为
 // 其声明的 Skill/MCP 依赖再强制调用。清单本身不可执行，绝不伪造运行时代码。
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginCondition {
+    #[default]
     Required,
     Optional,
-}
-
-impl Default for PluginCondition {
-    fn default() -> Self {
-        Self::Required
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

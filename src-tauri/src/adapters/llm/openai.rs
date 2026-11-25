@@ -147,10 +147,7 @@ fn merge_call(
         .and_then(|a| a.as_str())
         .or_else(|| call.get("arguments").and_then(|a| a.as_str()));
     if let Some(args) = args.filter(|a| !a.is_empty()) {
-        if append_args {
-            acc.arguments.push_str(args);
-            text.push_str(args);
-        } else if acc.arguments.is_empty() {
+        if append_args || acc.arguments.is_empty() {
             acc.arguments.push_str(args);
             text.push_str(args);
         }

@@ -17,13 +17,14 @@ it('shows explicit preview data without making Rust calls or enabling backend mu
   expect(screen.getByText('前端预览')).toBeInTheDocument();
   expect(screen.getByText('示例数据 · 无 Rust IPC')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
+  // 遗留计划审批卡挂在「Improve event dispatch」会话上（见 fixtures）。
+  fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   expect(screen.getByRole('button', { name: '批准计划' })).toBeDisabled();
   expect(screen.getByRole('button', { name: '在项目 Maestro-Agent 下新建会话' })).toBeEnabled();
   expect(screen.getByLabelText('由 Rust 强制执行')).toHaveTextContent('代码');
   expect(screen.getByRole('button', { name: 'src/bridge/BridgeSession.h' })).toHaveAttribute('aria-pressed', 'true');
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   expect(screen.getByLabelText('Diff tests/BridgeSession.test.cpp')).toHaveTextContent('stop_is_idempotent');
-  fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   expect(screen.getByRole('button', { name: /Improve event dispatch/ })).toHaveAttribute('aria-pressed', 'true');
   expect(ipc.invoke).not.toHaveBeenCalled();
   expect(ipc.listen).not.toHaveBeenCalled();
@@ -69,6 +70,8 @@ it('filters the current project session list by search query', () => {
 it('routes Activity to the middle dashboard, keeps Diff state, and restores chat without a modal', { timeout: 15000 }, async () => {
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+  // Diff 列表来自「Improve event dispatch」会话的遗留计划卡。
+  fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   fireEvent.click(screen.getByRole('button', { name: 'tests/BridgeSession.test.cpp' }));
   const activity = screen.getByRole('button', { name: '活动' });
   expect(activity).toHaveTextContent('今日 120 行');
@@ -92,7 +95,7 @@ it('routes Activity to the middle dashboard, keeps Diff state, and restores chat
   expect(ipc.listen).not.toHaveBeenCalled();
 });
 
-it('returns to chat through Agents, a session, or new-session creation', async () => {
+it('returns to chat through Agents, a session, or new-session creation', { timeout: 15000 }, async () => {
   render(<PreviewApp />);
   async function openDashboard() {
     fireEvent.click(screen.getByRole('button', { name: '活动' }));
@@ -144,6 +147,8 @@ it('supports composer mock controls, two-column Settings and shortcut rebinding 
 it('switches Review/Explorer, folds folders and preserves virtual extension states', () => {
   render(<PreviewApp />);
   fireEvent.click(screen.getByRole('button', { name: '切换右侧面板' }));
+  // 「变更」diff 入口来自「Improve event dispatch」会话的遗留计划卡。
+  fireEvent.click(screen.getByRole('button', { name: /Improve event dispatch/ }));
   fireEvent.click(screen.getByRole('tab', { name: '文件' }));
   expect(screen.getByLabelText('文件浏览器')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /BridgeSession.cpp/ }));

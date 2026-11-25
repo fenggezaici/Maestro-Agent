@@ -860,13 +860,16 @@ pub struct ArmedObligation {
     pub message: String,
 }
 
+/// (passed, blocked, 阻塞原因, 轨迹) —— 各节点义务求值的记忆化结果。
+type EvalMemo<'a> = HashMap<&'a str, (bool, bool, Option<String>, Vec<TraceStep>)>;
+
 struct Eval<'a> {
     history: &'a [HistoryEntry],
     run_id: i64,
     ext: &'a ExtensionSnapshot,
     by_id: HashMap<&'a str, &'a GraphNode>,
     out_edges: HashMap<&'a str, Vec<&'a GraphEdge>>,
-    memo: HashMap<&'a str, (bool, bool, Option<String>, Vec<TraceStep>)>,
+    memo: EvalMemo<'a>,
     /// 本次待执行调用：Restriction 检查体 + 事后满足判定共用。
     call: &'a PendingCall,
     /// 已挂起的事后义务节点 id（evaluate 前置计算）。
@@ -1850,7 +1853,7 @@ pub fn evaluate(
                     .iter()
                     .take(5)
                     .enumerate()
-                    .map(|(i, o)| format!("{}. {}", i + 1, eval.obligation_short(*o)))
+                    .map(|(i, o)| format!("{}. {}", i + 1, eval.obligation_short(o)))
                     .collect();
                 if blockers.len() > 5 {
                     lines.push(format!("等 {} 项", blockers.len()));

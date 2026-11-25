@@ -155,6 +155,7 @@ pub async fn list_mcp_servers(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn add_mcp_server(
     window: WebviewWindow,
     kernel: State<'_, Arc<Kernel>>,

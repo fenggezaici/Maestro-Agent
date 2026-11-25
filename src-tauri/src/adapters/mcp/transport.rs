@@ -31,6 +31,7 @@ pub struct Pending {
 }
 
 /// One spawned/connected server's transport state.
+#[allow(clippy::large_enum_variant)]
 pub enum Transport {
     Stdio {
         child: tokio::sync::Mutex<Child>,
@@ -252,6 +253,7 @@ impl RunningServer {
         race_future(send, timeout, cancel, &format!("MCP {method}")).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn sse_request(
         &self,
         id: u64,

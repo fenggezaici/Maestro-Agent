@@ -387,7 +387,7 @@ impl ToolRouter {
         bindings
             .into_iter()
             .take(8)
-            .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+            .map(|binding| self.grant_with_body(binding, maestro, trusted.as_deref()))
             .collect()
     }
 
@@ -471,7 +471,7 @@ impl ToolRouter {
             coordinator_grants: plan
                 .coordinator_grants
                 .into_iter()
-                .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                .map(|binding| self.grant_with_body(binding, maestro, trusted.as_deref()))
                 .collect(),
             members: plan
                 .members
@@ -482,14 +482,14 @@ impl ToolRouter {
                     grants: member
                         .grants
                         .into_iter()
-                        .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                        .map(|binding| self.grant_with_body(binding, maestro, trusted.as_deref()))
                         .collect(),
                 })
                 .collect(),
             squad_grants: plan
                 .squad_grants
                 .into_iter()
-                .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                .map(|binding| self.grant_with_body(binding, maestro, trusted.as_deref()))
                 .collect(),
         })
     }
@@ -549,6 +549,7 @@ impl ToolRouter {
 
     /// 工具执行前的架构判定。`history` 为「本会话已成功 + 本批次乐观」的
     /// 调用历史；`run_id` 用于 `scope: run` 节点判定。
+    #[allow(clippy::too_many_arguments)]
     pub async fn architecture_decision(
         &self,
         tool: &str,
@@ -1372,7 +1373,7 @@ impl ToolRouter {
             // 「必须先调用」——装配段会单独描述「派发时子循环内必须调用」。
             let bound_to_subagent = graph.edges.iter().any(|edge| {
                 edge.source == node.id
-                    && edge.source_handle.as_deref().map_or(true, |h| h == "pass")
+                    && edge.source_handle.as_deref().is_none_or(|h| h == "pass")
                     && graph.nodes.iter().any(|target| {
                         target.id == edge.target
                             && crate::domain::NodeKind::parse(&target.node_type)

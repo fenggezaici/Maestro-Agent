@@ -1,0 +1,6 @@
+# 钉住 minor 版本：CI 的 `stable` 漂移会不定期引入新 clippy lint 打挂既有代码
+# （rust-toolchain.toml 对 cargo/clippy 的解析优先于 dtolnay 步骤装的 stable）。
+# 升级时改 channel 并顺手清新 lint。
+[toolchain]
+channel = "1.97"
+components = ["clippy", "rustfmt"]

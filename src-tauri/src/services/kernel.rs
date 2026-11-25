@@ -168,6 +168,9 @@ struct RuntimeState {
     storage_failed: bool,
 }
 
+/// Per-run 按路径累计的 (首版 before, 最新 after) 净差表。
+type RunWriteNet = StdMutex<HashMap<i64, HashMap<String, (String, String)>>>;
+
 pub struct Kernel {
     database: Arc<Database>,
     /// Tool registry/dispatcher: extension stores + workspace root.
@@ -185,7 +188,7 @@ pub struct Kernel {
     metrics_acc: StdMutex<HashMap<i64, MetricsAccumulator>>,
     /// Per-run 按路径累计的 首版 before → 最新 after：write_result 载荷里的
     /// before/after 有截断上限，面板合并多次写入时无法重算净差，由此下发权威计数。
-    write_net: StdMutex<HashMap<i64, HashMap<String, (String, String)>>>,
+    write_net: RunWriteNet,
     /// Session-scoped "always allow" rules; cleared when the app exits.
     approval_rules: StdMutex<HashMap<i64, Vec<ApprovalRule>>>,
     /// 会话级「全部放行」（ZCode full access 对应物）：纯内存不落库，
