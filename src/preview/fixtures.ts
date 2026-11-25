@@ -94,7 +94,7 @@ export const previewPlan: PlanCard = {
 const mainRun: RunView = {
   id: 1001, sessionId: 101, mode: 'code', status: 'completed', error: null,
   prompt: '重构 BridgeSession 的生命周期管理，保留现有 API。\n让重复 stop 安全，并修复并发状态切换问题，先提交修改计划。',
-  output: '建议保留公共 API，收敛所有权与状态边界。示例 Diff 为 start / stop 增加幂等保护，并统一并发状态访问。下面是建议的实现计划。',
+  output: '建议保留公共 API，收敛所有权与状态边界：start / stop 增加幂等保护，统一并发状态访问，再补生命周期回归测试。已按三步拆分任务（见右上任务计划面板），先从所有权收敛开始。',
 };
 
 export const previewSnapshot: Snapshot = { ready: false, mode: 'code', activeRun: null, lastRun: null, sequence: 0 };
@@ -121,7 +121,7 @@ function exampleSession(id: number, title: string, projectId: number): SessionDe
 
 export const previewProjects: PreviewProject[] = [
   { id: '1', name: 'Maestro-Agent', activity: sampleActivity, today: { changedLines: 120, completedPlans: 3 }, sessions: [
-    { session: { id: 101, title: 'Refactor session lifecycle', updatedAt: 1, runCount: 1, projectId: 1, archived: false }, runs: [mainRun], plans: [previewPlan] },
+    { session: { id: 101, title: 'Refactor session lifecycle', updatedAt: 1, runCount: 1, projectId: 1, archived: false }, runs: [mainRun], plans: [] },
     exampleSession(102, 'Improve event dispatch pipeline', 1),
   ] },
   { id: '2', name: 'Agent Tools', activity: sampleActivity, today: { changedLines: 37, completedPlans: 1 }, sessions: [

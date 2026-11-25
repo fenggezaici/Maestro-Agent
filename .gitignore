@@ -39,8 +39,7 @@ Thumbs.db
 /artifacts/*
 !/artifacts/ui/
 /artifacts/ui/*
-!/artifacts/ui/maestro-workbench.png
-!/artifacts/ui/maestro-explorer.png
+!/artifacts/ui/maestro-*.png
 
 # pnpm is the authoritative frontend package manager
 /package-lock.json
