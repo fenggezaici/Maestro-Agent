@@ -1,31 +1,33 @@
 /// 架构沙盘：可视化规则编排（Node Graph）。
 /// Trigger → Requirement / Restriction / Extension(Skill·MCP·Plugin) → Action
 /// 组成 DAG，序列化为 `.maestro/graph_rules.json` 由 Rust 在工具执行前权威拦截。
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   Background, BackgroundVariant, BaseEdge, Controls, Handle, MiniMap, Panel, Position,
-  ReactFlow, ReactFlowProvider, SelectionMode, addEdge, getBezierPath, useEdgesState,
-  useNodesState, useReactFlow, type Connection, type Edge, type EdgeProps,
-  type FinalConnectionState, type Node, type NodeProps, type XYPosition,
+  ReactFlow, ReactFlowProvider, SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges,
+  getBezierPath, useEdgesState, useNodesState, useReactFlow,
+  type Connection, type Edge, type EdgeProps, type FinalConnectionState,
+  type Node, type NodeChange, type NodeProps, type EdgeChange, type XYPosition,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
-  BookOpenCheck, Bot, ChevronDown, CircleAlert, FileCode2, Flag,
-  Layers, ListChecks, Plus, Puzzle, Save, ShieldAlert, Sparkles, WandSparkles,
+  ArrowLeft, BookOpenCheck, Bot, ChevronDown, CircleAlert, FileCode2, Flag,
+  Layers, ListChecks, ListTree, Network, Plus, Puzzle, Save, ShieldAlert, Sparkles, WandSparkles,
 } from 'lucide-react';
 import { architectureApi, type ArchitectureGraph, type ExtensionData, type ExtensionKind, type GateMode, type GateTiming, type GraphNodeData, type SatisfyScope, type TriggerAction } from '../api/architecture';
 import { listAgentsApi, type AgentDefinition } from '../api/agents';
 import type { ArchitectureTrace } from '../api/types';
 import type { ExtensionsController } from '../hooks/useExtensions';
 import {
-  ACTION_LABELS, NODE_LABELS, SANDBOX_TEMPLATES, createExtensionNode, createNode,
-  deserializeGraph, edgeTone, isConnectionAllowed, nodeSummary, remapIds, sampleGraph,
+  ACTION_LABELS, NODE_LABELS, SANDBOX_TEMPLATES, SQUAD_NODE_KINDS, createExtensionNode, createNode,
+  deserializeGraph, edgeTone, isConnectionAllowed, isSquadConnectionAllowed, layoutSquadTree,
+  nextSquadName, nodeSummary, remapIds, sampleGraph, squadSkeleton,
   serializeGraph, traceNodeStatus, effectiveAfterSet, validateDraft, autoActionMessage, type KnownExtensions, type NodeKind,
-  type TraceStatus,
+  type SandboxTemplate, type TraceStatus,
 } from '../lib/architectureGraph';
 import {
   buildLibraryItems, detailForExtension, filterLibrary, libraryTree, readRecentIds,
-  recordRecentId, treeLeafCount, type LibraryItem, type LibraryTreeGroup, type PendingConnection,
+  recordRecentId, treeLeafCount, type LibraryItem, type LibrarySection, type LibraryTreeGroup, type PendingConnection,
 } from '../lib/nodeLibrary';
 import NodeLibrary, { ItemHint } from './NodeLibrary';
 import { sandboxFixtureExtensions } from './workbenchMock';
@@ -48,6 +50,7 @@ const KIND_ICON: Record<NodeKind, typeof Flag> = {
   action: CircleAlert,
   extension: Puzzle,
   subagent: Bot,
+  squad: Network,
 };
 
 const STATUS_LABEL: Record<TraceStatus, string> = {
@@ -57,7 +60,9 @@ const STATUS_LABEL: Record<TraceStatus, string> = {
 
 // ---- 自定义节点 -----------------------------------------------------------------
 
-function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
+// memo：displayNodes 的 data 经 WeakMap 保持引用稳定，拖动中只有被拖节点的
+// position props 变化触发重渲染——未拖节点整棵跳过重绘。
+const MaestroNode = memo(function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
   const kind = data.nodeType as NodeKind;
   const summary = nodeSummary({ id: '', type: kind, position: { x: 0, y: 0 }, data } as never);
   const status = data.traceStatus as TraceStatus | undefined;
@@ -69,15 +74,18 @@ function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
   const isAfter = (data.effectiveAfter as boolean | undefined) ?? rawAfter;
   // raw 未设时机但有效 after → 徽标标注「继承」，让用户看清明细。
   const inherited = isAfter && !(kind === 'requirement' ? data.timing : ext?.timing);
+  const insideSquad = Boolean(data.insideSquad);
   const title = kind === 'extension'
     ? `${ext?.kind === 'skill' ? '📜' : ext?.kind === 'mcp' ? '🧩' : '🔌'} ${ext?.name || ext?.target || NODE_LABELS.extension}`
     : kind === 'trigger' ? `⚡ ${NODE_LABELS.trigger}`
     : kind === 'requirement' ? (isAfter ? '📋 事后要求' : `📋 ${NODE_LABELS.requirement}`)
     : kind === 'restriction' ? `🚧 ${NODE_LABELS.restriction}`
-    : kind === 'subagent' ? `🤖 ${String(data.agent ?? '') || NODE_LABELS.subagent}` : `⛔ ${NODE_LABELS.action}`;
+    : kind === 'subagent'
+      ? insideSquad ? `🤖 ${String(data.agent ?? '') || '成员'}${data.requirement === 'optional' ? ' · 可选' : ''}` : `🤖 ${String(data.agent ?? '') || NODE_LABELS.subagent}`
+    : kind === 'squad' ? `🏰 ${String(data.squad ?? '') || NODE_LABELS.squad}` : `⛔ ${NODE_LABELS.action}`;
   const Icon = KIND_ICON[kind];
   const hasTarget = kind !== 'trigger';
-  const handles = kind === 'trigger' ? ['out'] : kind === 'action' ? [] : ['pass', 'fail'];
+  const squadMeta = data.squadMeta as { members: number } | undefined;
   const extDetail = detailForExtension(ext);
   const node = (
     <div className={`maestro-node kind-${kind} ${isAfter ? 'timing-after' : ''} ${selected ? 'selected' : ''} ${status ? `trace-${status}` : ''}`}>
@@ -94,8 +102,22 @@ function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
         </div>
       )}
       <div className="maestro-node-body">{summary}</div>
+      {kind === 'squad' && (
+        <div className="maestro-node-squadmeta">
+          {squadMeta ? `${squadMeta.members} 名成员 · 双击进入编排` : '双击进入编排'}
+        </div>
+      )}
       {kind === 'trigger' && <Handle id="out" type="source" position={Position.Right} className="maestro-handle out" />}
-      {kind !== 'trigger' && kind !== 'action' && kind !== 'subagent' && <>
+      {/* 军团内：成员只有 dispatch 派发出口；扩展只有 pass 装配出口。 */}
+      {insideSquad && kind === 'subagent' && <>
+        <Handle id="dispatch" type="source" position={Position.Right} className="maestro-handle dispatch" style={{ top: '62%' }} />
+        <span className="maestro-handle-tag tag-dispatch" style={{ top: '54%' }}>派发</span>
+      </>}
+      {insideSquad && kind === 'extension' && <>
+        <Handle id="pass" type="source" position={Position.Right} className="maestro-handle pass" style={{ top: '62%' }} />
+        <span className="maestro-handle-tag tag-pass" style={{ top: '54%' }}>装配</span>
+      </>}
+      {!insideSquad && kind !== 'trigger' && kind !== 'action' && kind !== 'subagent' && kind !== 'squad' && <>
         <Handle id="pass" type="source" position={Position.Right} className="maestro-handle pass" style={{ top: '32%' }} />
         <span className="maestro-handle-tag tag-pass" style={{ top: '24%' }}>通过</span>
         {(kind !== 'extension' || ext?.requirement !== 'optional') && <>
@@ -107,11 +129,11 @@ function MaestroNode({ data, selected }: NodeProps<SandboxNode>) {
   );
   // 扩展节点 hover 出详情卡；详情经 extensionHints 反查，不写入序列化数据。
   return kind === 'extension' ? <ItemHint title={title} detail={extDetail} side="top">{node}</ItemHint> : node;
-}
+});
 
 // ---- 自定义边：贝塞尔 + 语义色 + 执行高亮动画 ---------------------------------------
 
-function MaestroEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, selected }: EdgeProps) {
+const MaestroEdge = memo(function MaestroEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, selected }: EdgeProps) {
   const [path] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition });
   const tone = (data?.tone as 'fail' | 'warn' | 'default' | undefined) ?? 'default';
   const active = Boolean(data?.active);
@@ -119,11 +141,16 @@ function MaestroEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, t
     <BaseEdge id={id} path={path} className={`maestro-edge edge-${tone} ${selected ? 'selected' : ''}`} />
     {active && <circle r="3.5" className={`maestro-edge-dot dot-${tone}`}><animateMotion dur="1.6s" path={path} repeatCount="indefinite" /></circle>}
   </>;
-}
+});
 
 const nodeTypes = { maestro: MaestroNode };
 const edgeTypes = { maestro: MaestroEdge };
 const DND_MIME = 'application/maestro-node';
+// ReactFlow 静态 props 提为模块常量——内联对象/数组每渲染新建会让 RF 内部
+// store 反复 set（拖动帧尤其敏感）。
+const PAN_ON_DRAG: number[] = [1, 2];
+const DEFAULT_EDGE_OPTIONS = { type: 'maestro' } as const;
+const PRO_OPTIONS = { hideAttribution: true } as const;
 
 // ---- 物料区卡片（LibraryItem 驱动：指针拖拽 + 点击双通道） -------------------------
 // 说明：不用 HTML5 DnD——`.workbench` 的 CSS zoom（fontScale）会让 Chromium/WebView2
@@ -133,7 +160,9 @@ interface CardDrag {
   x: number; y: number; pointerId: number; active: boolean;
 }
 
-function PaletteCard({ entry, compact, onPlace }: {
+// memo：物料树在 SandboxInner 每帧重渲染（含拖动帧）中是最大 DOM 块——
+// entry/onPlace 引用稳定时跳过整卡（含 Radix Tooltip 三层）重渲染。
+const PaletteCard = memo(function PaletteCard({ entry, compact, onPlace }: {
   entry: LibraryItem;
   compact?: boolean;
   onPlace: (entry: LibraryItem, client?: { x: number; y: number }) => void;
@@ -194,10 +223,10 @@ function PaletteCard({ entry, compact, onPlace }: {
       )}
     </>
   );
-}
+});
 
 /// 左侧分类树：顶层组恒展开；子文件夹叶子 >8 时默认折叠；子文件夹内用紧凑单行卡。
-function PaletteTree({ group, depth, onPlace }: {
+const PaletteTree = memo(function PaletteTree({ group, depth, onPlace }: {
   group: LibraryTreeGroup; depth: number; onPlace: (entry: LibraryItem, client?: { x: number; y: number }) => void;
 }) {
   const count = treeLeafCount(group);
@@ -211,7 +240,41 @@ function PaletteTree({ group, depth, onPlace }: {
       {group.items.map((entry) => <PaletteCard key={entry.id} entry={entry} compact={depth > 0} onPlace={onPlace} />)}
     </details>
   );
-}
+});
+
+/// 左侧物料栏整体：抽出 memo——拖动帧 props（query/tree/results/onPlace）全部
+/// 引用稳定，~数百张 Tooltip 卡整块跳过重渲染（回归前每帧全量 diff 的卡顿源）。
+const PaletteSidebar = memo(function PaletteSidebar({ query, onQuery, tree, results, onPlace }: {
+  query: string;
+  onQuery: (value: string) => void;
+  tree: LibraryTreeGroup[];
+  results: LibrarySection[] | null;
+  onPlace: (entry: LibraryItem, client?: { x: number; y: number }) => void;
+}) {
+  return <aside className="sandbox-palette">
+    <div className="palette-search">
+      <input value={query} onChange={(event) => onQuery(event.target.value)}
+        placeholder="筛选节点…" aria-label="筛选节点" />
+      {query && <button type="button" onClick={() => onQuery('')} aria-label="清空筛选">×</button>}
+    </div>
+    {results ? (
+      <div className="palette-section">
+        {results.map((section) => (
+          <div key={section.label}>
+            <p className="palette-heading">{section.label}</p>
+            {section.items.map((entry) => <PaletteCard key={entry.id} entry={entry} onPlace={onPlace} />)}
+          </div>
+        ))}
+        {results.every((section) => section.items.length === 0) && (
+          <p className="palette-empty">没有匹配的节点</p>
+        )}
+      </div>
+    ) : (
+      tree.map((group) => <PaletteTree key={group.label} group={group} depth={0} onPlace={onPlace} />)
+    )}
+    <p className="palette-tip">双击画布或按 Tab 打开节点库；把连线拖到空白处可搜索接入节点。</p>
+  </aside>;
+});
 
 // ---- 属性面板 -----------------------------------------------------------------
 
@@ -219,13 +282,20 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return <label className="prop-field"><span className="prop-label">{label}</span>{children}</label>;
 }
 
-function PropertyPanel({ node, known, effectiveAfter, upstream, onChange, onDelete }: {
+// memo 自定义比较：拖动已选中节点时每帧 node 引用变（position）但 data 不变，
+// upstream 数组重建但元素 data 引用不变——按 id+data 比较可整面板跳过重渲染。
+const sameUpstream = (a?: SandboxNode[], b?: SandboxNode[]) =>
+  (a?.length ?? 0) === (b?.length ?? 0)
+  && (a ?? []).every((node, i) => node.id === b![i].id && node.data === b![i].data);
+const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter, upstream, insideSquad, onChange, onDelete }: {
   node: SandboxNode;
   known: KnownExtensions;
   /** 节点当前的有效时机是否为事后（含 pass 边继承，供提示行显示）。 */
   effectiveAfter: boolean;
   /** 全部入边来源节点（fail 优先；Action 预览 merge 派生文案用）。 */
   upstream?: SandboxNode[];
+  /** 当前画布是否在军团子沙盘内（成员节点多出必选开关、提示文案换装配语境）。 */
+  insideSquad?: boolean;
   onChange: (id: string, patch: Partial<SandboxNodeData>) => void;
   onDelete: (id: string) => void;
 }) {
@@ -444,9 +514,20 @@ function PropertyPanel({ node, known, effectiveAfter, upstream, onChange, onDele
           <input className="prop-input" value={String(data.agent ?? '')} placeholder="或手动输入类型名（如 explore）"
             onChange={(e) => set({ agent: e.target.value })} />
         </Field>
+        {insideSquad && (
+          <Field label="派发级别">
+            <Choice label="派发级别" value={String(data.requirement ?? 'required')} onChange={(v) => set({ requirement: v as 'required' | 'optional' })}
+              options={[
+                { value: 'required', label: '必选（指挥收尾前必须实际派发）' },
+                { value: 'optional', label: '可选（指挥按需派发）' },
+              ]} />
+          </Field>
+        )}
         <p className="prop-note">
-          装配终点：扩展节点用「通过」出口连入本节点——spawn_subagent(type={String(data.agent ?? '') || '…'}) 派发时，
-          子循环获得这些扩展能力；必选条目强制真实调用后才能收尾，可选条目只注入建议。本节点不参与调用链求值。
+          {insideSquad
+            ? <>军团成员：用「派发」出口连向其他成员即成为指挥（至多一个）；扩展「装配」出口连入本成员 = 该成员的能力授权。{String(data.requirement ?? 'required') === 'required' ? '必选成员未派发会被逐轮追问，耗尽标注「编排违例」。' : ''}</>
+            : <>装配终点：扩展节点用「通过」出口连入本节点——spawn_subagent(type={String(data.agent ?? '') || '…'}) 派发时，
+              子循环获得这些扩展能力；必选条目强制真实调用后才能收尾，可选条目只注入建议。本节点不参与调用链求值。</>}
         </p>
         {upstream && upstream.length > 0 && (
           <div className="prop-detail">
@@ -468,10 +549,43 @@ function PropertyPanel({ node, known, effectiveAfter, upstream, onChange, onDele
         )}
       </>}
 
+      {data.nodeType === 'squad' && <>
+        <Field label="军团名（spawn_subagent 调用名）">
+          <input className="prop-input" value={String(data.squad ?? '')} placeholder="team-1（字母/数字/-/_）"
+            onChange={(e) => set({ squad: e.target.value })} />
+        </Field>
+        <p className="prop-note">
+          双击本节点进入子沙盘编排：成员（子智能体）「派发」出口连成「指挥→成员」树，扩展「装配」出口给单个成员授权。
+          有指挥 = 指挥嵌套派发成员；无指挥 = 全员并行。本节点是装配终点：主图扩展「通过」出口连入 = 全员共享授权。
+        </p>
+        {upstream && upstream.length > 0 && (
+          <div className="prop-detail">
+            <p className="prop-detail-title">军团级授权（全员生效，{upstream.length}）</p>
+            <dl className="prop-detail-meta">
+              {upstream.map((src) => {
+                const srcExt = src.data.extension as ExtensionData | undefined;
+                return (
+                  <div key={src.id} className="prop-detail-meta-row">
+                    <dt>{srcExt?.kind === 'skill' ? 'Skill' : srcExt?.kind === 'mcp' ? 'MCP' : '插件'}</dt>
+                    <dd title={srcExt?.tool ? `${srcExt.target}/${srcExt.tool}` : srcExt?.target}>
+                      {srcExt?.name || srcExt?.target || src.id}{srcExt?.tool ? ` / ${srcExt.tool}` : ''} · {srcExt?.requirement === 'optional' ? '可选' : '必选'}
+                    </dd>
+                  </div>
+                );
+              })}
+            </dl>
+          </div>
+        )}
+      </>}
+
       <button type="button" className="prop-delete" onClick={() => onDelete(node.id)}>删除节点</button>
     </div>
   );
-}
+}, (prev, next) =>
+  prev.node.id === next.node.id && prev.node.data === next.node.data
+  && prev.effectiveAfter === next.effectiveAfter && prev.insideSquad === next.insideSquad
+  && prev.known === next.known && prev.onChange === next.onChange && prev.onDelete === next.onDelete
+  && sameUpstream(prev.upstream, next.upstream));
 
 /// 属性面板「用途」块：按当前 ext 反查扩展详情（与节点库同一份 detail），
 /// 手动输入的 target 不在清单中时如实标注，不编造描述。
@@ -503,8 +617,8 @@ interface SandboxProps {
 }
 
 function SandboxInner({ preview, extensions, trace }: SandboxProps) {
-  const [nodes, setNodes, onNodesChange] = useNodesState<SandboxNode>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<SandboxEdge>([]);
+  const [nodes, setNodes] = useNodesState<SandboxNode>([]);
+  const [edges, setEdges] = useEdgesState<SandboxEdge>([]);
   const [scope, setScope] = useState<'project' | 'global'>(extensions.hasWorkspace ? 'project' : 'global');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [status, setStatus] = useState<{ kind: 'info' | 'ok' | 'error' | 'warn'; text: string } | null>(null);
@@ -526,6 +640,58 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   const markDirty = useCallback(() => { dirtyRef.current = true; setDirty(true); }, []);
   const { screenToFlowPosition, fitView } = useReactFlow();
 
+  // ---- 军团子沙盘（Houdini subnet）：squads 键 ↔ squad 节点 data.squad ----
+  // openSquad 非空 = 当前画布切到该军团内部（只允许 子智能体/扩展 节点）。
+  const [squads, setSquads] = useState<Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>>({});
+  const [openSquad, setOpenSquad] = useState<string | null>(null);
+  const inSquad = openSquad !== null;
+  const canvasNodes: SandboxNode[] = inSquad ? squads[openSquad]?.nodes ?? [] : nodes;
+  const canvasEdges: SandboxEdge[] = inSquad ? squads[openSquad]?.edges ?? [] : edges;
+
+  // ---- 拖动性能：引用稳定层 -------------------------------------------------
+  // onNodesChange 每帧重建 nodes（position 字段），但 data 引用与连接结构不变。
+  // 回调经 ref 读最新值、结构派生按签名 memo——拖动帧不再每帧新建函数与全量重算。
+  const canvasNodesRef = useRef(canvasNodes);
+  canvasNodesRef.current = canvasNodes;
+  const canvasEdgesRef = useRef(canvasEdges);
+  canvasEdgesRef.current = canvasEdges;
+  const squadsRef = useRef(squads);
+  squadsRef.current = squads;
+  // 结构签名：节点 id+data（不含 position）与边连接关系——签名不变即结构未变。
+  const structuralSig = canvasNodes.map((node) => `${node.id}:${JSON.stringify(node.data)}`).join('|')
+    + '#' + canvasEdges.map((edge) => `${edge.id}>${edge.source}${edge.sourceHandle ?? ''}->${edge.target}`).join('|');
+  const updateCanvasNodes = useCallback((updater: (items: SandboxNode[]) => SandboxNode[]) => {
+    if (openSquad !== null) {
+      setSquads((map) => ({
+        ...map,
+        [openSquad]: { nodes: updater(map[openSquad]?.nodes ?? []), edges: map[openSquad]?.edges ?? [] },
+      }));
+    } else {
+      setNodes(updater as never);
+    }
+  }, [openSquad, setNodes]);
+  const updateCanvasEdges = useCallback((updater: (items: SandboxEdge[]) => SandboxEdge[]) => {
+    if (openSquad !== null) {
+      setSquads((map) => ({
+        ...map,
+        [openSquad]: { nodes: map[openSquad]?.nodes ?? [], edges: updater(map[openSquad]?.edges ?? []) },
+      }));
+    } else {
+      setEdges(updater as never);
+    }
+  }, [openSquad, setEdges]);
+  const enterSquad = useCallback((name: string) => {
+    setSquads((map) => (map[name] ? map : { ...map, [name]: { nodes: [], edges: [] } }));
+    markDirty();
+    setOpenSquad(name);
+    setSelectedId(null);
+    setStatus({ kind: 'info', text: `已进入军团 ${name} 的子沙盘：成员用「派发」出口连成树，扩展「装配」出口连到成员` });
+  }, [markDirty]);
+  const exitSquad = useCallback(() => {
+    setOpenSquad(null);
+    setSelectedId(null);
+  }, []);
+
   // 可装配子智能体清单：subagent 节点下拉与「未定义」告警共用；preview 走 fixture。
   const [agents, setAgents] = useState<AgentDefinition[]>([]);
   useEffect(() => {
@@ -544,10 +710,15 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
 
   // 节点库数据源：左侧分类树与 Tab 浮层共用。
   const libraryItems = useMemo(() => buildLibraryItems(known), [known]);
-  const sidebarTree = useMemo(() => libraryTree(libraryItems), [libraryItems]);
-  const sidebarResults = useMemo(
-    () => (paletteQuery.trim() ? filterLibrary(libraryItems, paletteQuery, null, readRecentIds()) : null),
-    [libraryItems, paletteQuery],
+
+  // 军团内物料只保留 子智能体/扩展（模板/触发器等主图节点不可入子沙盘）。
+  const canvasLibraryItems = useMemo(() => (inSquad
+    ? libraryItems.filter((entry) => SQUAD_NODE_KINDS.has(entry.nodeKind as NodeKind))
+    : libraryItems), [libraryItems, inSquad]);
+  const canvasSidebarTree = useMemo(() => libraryTree(canvasLibraryItems), [canvasLibraryItems]);
+  const canvasSidebarResults = useMemo(
+    () => (paletteQuery.trim() ? filterLibrary(canvasLibraryItems, paletteQuery, null, readRecentIds()) : null),
+    [canvasLibraryItems, paletteQuery],
   );
 
   // 加载规则
@@ -557,6 +728,8 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
       const sample = sampleGraph(known);
       setNodes(sample.nodes as SandboxNode[]);
       setEdges(sample.edges as SandboxEdge[]);
+      setSquads({});
+      setOpenSquad(null);
       setLoaded({ path: null, source: 'preview' });
       setDirty(false); dirtyRef.current = false;
       return;
@@ -575,9 +748,12 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
           const draft = deserializeGraph(result.graph);
           setNodes(draft.nodes as SandboxNode[]);
           setEdges(draft.edges as SandboxEdge[]);
+          setSquads(draft.squads as Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>);
         } else {
           setNodes([]); setEdges([]);
+          setSquads({});
         }
+        setOpenSquad(null);
         setLoaded({ path: result.path, source: result.resolvedScope ?? scope });
         setDirty(false); dirtyRef.current = false;
         if (!result.error) setStatus(result.resolvedScope && result.resolvedScope !== scope
@@ -589,36 +765,92 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, preview, reloadKey]);
 
-  // 校验提示
-  const validation = useMemo(() => validateDraft(nodes, edges, known), [nodes, edges, known]);
+  // Trace 高亮 + 有效时机注入（事后沿 pass 边继承，与 Rust effective_after_set 同款）。
+  // 军团内画布不继承主图 trace/时机——装配节点不参与调用求值。
+  const statusByNode = useMemo(() => (inSquad ? {} : traceNodeStatus(trace?.steps ?? [])), [trace, inSquad]);
+  // 时机集合只依赖结构（节点 data/边连接）与 position 无关——按结构签名 memo。
+  const afterByNode = useMemo(
+    () => (inSquad ? new Set<string>() : effectiveAfterSet(canvasNodesRef.current as never, canvasEdgesRef.current as never)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 由 structuralSig 门控，position 变化不重算
+    [inSquad, structuralSig],
+  );
 
-  // Trace 高亮 + 有效时机注入（事后沿 pass 边继承，与 Rust effective_after_set 同款）
-  const statusByNode = useMemo(() => traceNodeStatus(trace?.steps ?? []), [trace]);
-  const afterByNode = useMemo(() => effectiveAfterSet(nodes, edges), [nodes, edges]);
-  const displayNodes = useMemo(() => nodes.map((node) => ({
-    ...node,
-    data: { ...node.data, traceStatus: statusByNode[node.id], effectiveAfter: afterByNode.has(node.id) },
-  })), [nodes, statusByNode, afterByNode]);
-  const displayEdges = useMemo(() => edges.map((edge) => ({
+  // 逐节点缓存：node 引用未变 + 注入值未变 → 复用包装对象，RF diff 与
+  // memo(MaestroNode) 双双跳过；data 经 WeakMap 二级缓存——被拖节点 position
+  // 变化但 data 引用稳定，注入值未变时 data 也复用（被拖节点组件也不重渲染）。
+  const nodeWrapCache = useRef(new Map<string, { node: SandboxNode; inject: string; wrapped: SandboxNode }>());
+  const dataWrapCache = useRef(new WeakMap<SandboxNode['data'], { inject: string; data: SandboxNode['data'] }>());
+  const displayNodes = useMemo(() => {
+    const next = new Map<string, { node: SandboxNode; inject: string; wrapped: SandboxNode }>();
+    const wrapped = canvasNodes.map((node) => {
+      const isSquad = node.data.nodeType === 'squad';
+      // squad 节点副标显示成员数（squads 状态注入，不进序列化）。
+      const members = isSquad
+        ? (squads[String(node.data.squad ?? '')]?.nodes ?? []).filter((item) => item.data.nodeType === 'subagent').length
+        : 0;
+      const inject = `${statusByNode[node.id] ?? ''}|${afterByNode.has(node.id)}|${inSquad}|${isSquad ? members : ''}`;
+      const cached = nodeWrapCache.current.get(node.id);
+      if (cached && cached.node === node && cached.inject === inject) {
+        next.set(node.id, cached);
+        return cached.wrapped;
+      }
+      let cachedData = dataWrapCache.current.get(node.data);
+      if (!cachedData || cachedData.inject !== inject) {
+        cachedData = {
+          inject,
+          data: {
+            ...node.data,
+            traceStatus: statusByNode[node.id],
+            effectiveAfter: afterByNode.has(node.id),
+            insideSquad: inSquad || undefined,
+            squadMeta: isSquad ? { members } : undefined,
+          },
+        };
+        dataWrapCache.current.set(node.data, cachedData);
+      }
+      const entry = { node, inject, wrapped: { ...node, data: cachedData.data } };
+      next.set(node.id, entry);
+      return entry.wrapped;
+    });
+    nodeWrapCache.current = next;
+    return wrapped;
+  }, [canvasNodes, statusByNode, afterByNode, inSquad, squads]);
+
+  // 边显示只依赖边表 + 节点结构（kind/result）+ trace——nodeById 按结构签名
+  // memo：节点拖动中 canvasEdges 不变 → displayEdges 引用稳定，RF 跳过边 diff。
+  const nodeById = useMemo(
+    () => new Map(canvasNodesRef.current.map((node) => [node.id, node])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 由 structuralSig 门控
+    [structuralSig],
+  );
+  const toneNodes = useMemo(() => [...nodeById.values()], [nodeById]);
+  const displayEdges = useMemo(() => canvasEdges.map((edge) => ({
     ...edge,
     data: {
-      tone: edgeTone(edge as never, displayNodes as never),
+      tone: edgeTone(edge as never, toneNodes as never),
       active: Boolean(statusByNode[edge.source]),
     },
-  })), [edges, displayNodes, statusByNode]);
+  })), [canvasEdges, toneNodes, statusByNode]);
 
-  const selected = nodes.find((node) => node.id === selectedId) ?? null;
+  const selected = canvasNodes.find((node) => node.id === selectedId) ?? null;
   // Action 预览自动派生文案：全部入边来源（fail 优先——merge 时逐条列出）。
+  // 读 ref：回调引用稳定（拖动帧不新建），PropertyPanel memo 才能生效。
   const upstreamsOf = useCallback((nodeId: string): SandboxNode[] => {
-    const incoming = edges.filter((edge) => edge.target === nodeId);
+    const incoming = canvasEdgesRef.current.filter((edge) => edge.target === nodeId);
     incoming.sort((a, b) => (a.sourceHandle === 'fail' ? 0 : 1) - (b.sourceHandle === 'fail' ? 0 : 1));
     return incoming
-      .map((edge) => nodes.find((node) => node.id === edge.source))
+      .map((edge) => canvasNodesRef.current.find((node) => node.id === edge.source))
       .filter((node): node is SandboxNode => Boolean(node));
-  }, [edges, nodes]);
+  }, []);
+
+  const checkConnection = useCallback((candidate: {
+    source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null;
+  }) => inSquad
+    ? isSquadConnectionAllowed(canvasNodesRef.current as never, canvasEdgesRef.current as never, candidate)
+    : isConnectionAllowed(canvasNodesRef.current as never, canvasEdgesRef.current as never, candidate), [inSquad]);
 
   const onConnect = useCallback((connection: Connection) => {
-    const check = isConnectionAllowed(nodes as never, edges as never, {
+    const check = checkConnection({
       source: connection.source, target: connection.target,
       sourceHandle: connection.sourceHandle, targetHandle: connection.targetHandle,
     });
@@ -627,23 +859,41 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
       return;
     }
     markDirty();
-    setEdges((eds) => addEdge({ ...connection, type: 'maestro', targetHandle: 'in' }, eds));
-  }, [nodes, edges, setEdges, markDirty]);
+    updateCanvasEdges((eds) => addEdge({ ...connection, type: 'maestro', targetHandle: 'in' }, eds));
+  }, [checkConnection, updateCanvasEdges, markDirty]);
 
   const isValidConnection = useCallback((connection: Connection | Edge) =>
-    isConnectionAllowed(nodes as never, edges as never, {
+    checkConnection({
       source: connection.source ?? '', target: connection.target ?? '',
       sourceHandle: 'sourceHandle' in connection ? connection.sourceHandle : undefined,
       targetHandle: 'in',
-    }).ok, [nodes, edges]);
+    }).ok, [checkConnection]);
 
   // 模板/示例链整体平移到落点。
   const insertTemplateAt = useCallback((templateId: string, flow: XYPosition) => {
-    const built = templateId === 'sample'
+    const built: ReturnType<SandboxTemplate['build']> | undefined = templateId === 'sample'
       ? sampleGraph(known)
       : SANDBOX_TEMPLATES.find((item) => item.id === templateId)?.build(known);
     if (!built) return;
     const keyed = remapIds(built.nodes, built.edges);
+    // 携带军团子图的模板：军团名防重名，squad 节点 data.squad 同步改写；
+    // 子图节点/边有独立 id 空间，各自 remapIds。
+    if (built.squads) {
+      const taken = new Set(Object.keys(squadsRef.current));
+      for (const [templateName, sub] of Object.entries(built.squads)) {
+        const name = taken.has(templateName) ? nextSquadName(taken) : templateName;
+        taken.add(name);
+        const subKeyed = remapIds(sub.nodes, sub.edges);
+        // squads 值用组件内 React Flow 节点类型——与 lib SandboxNode 同名
+        // 不同型，沿用本文件既有的 as never 桥接惯例。
+        setSquads((map) => ({ ...map, [name]: { nodes: subKeyed.nodes, edges: subKeyed.edges } as never }));
+        for (const node of keyed.nodes) {
+          if (node.data.nodeType === 'squad' && node.data.squad === templateName) {
+            node.data = { ...node.data, squad: name };
+          }
+        }
+      }
+    }
     const minX = Math.min(...keyed.nodes.map((node) => node.position.x));
     const minY = Math.min(...keyed.nodes.map((node) => node.position.y));
     markDirty();
@@ -658,32 +908,53 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   const placeItem = useCallback((entry: LibraryItem, flow: XYPosition, pending?: PendingConnection | null) => {
     if (entry.disabled) return;
     if (entry.nodeKind === 'template') {
+      if (inSquad) {
+        setStatus({ kind: 'warn', text: '军团子沙盘不支持预置模板' });
+        return;
+      }
       if (!entry.templateId) return;
       insertTemplateAt(entry.templateId, flow);
       recordRecentId(entry.id);
       return;
     }
+    if (inSquad && !SQUAD_NODE_KINDS.has(entry.nodeKind as NodeKind)) {
+      setStatus({ kind: 'warn', text: '军团内只允许 子智能体 / 扩展 节点' });
+      return;
+    }
     const node = entry.extension
       ? createExtensionNode(flow, entry.extension)
       : createNode(entry.nodeKind as NodeKind, flow, entry.seed as Partial<GraphNodeData> | undefined);
+    // squad 节点：分配唯一军团名并预置 CTO 骨架（general 指挥 dispatch→explore
+    // 必选成员）——双击进子沙盘开箱即见两层树，改 agent 类型/加兄弟成员即可；
+    // 删掉 dispatch 边即退化为并行军团。
+    if (node.data.nodeType === 'squad') {
+      const name = nextSquadName(new Set(Object.keys(squadsRef.current)));
+      node.data = { ...node.data, squad: name };
+      setSquads((map) => ({ ...map, [name]: (map[name] ?? squadSkeleton()) as never }));
+    }
     markDirty();
-    setNodes((items) => [...items, node as SandboxNode]);
+    updateCanvasNodes((items) => [...items, node as SandboxNode]);
     setSelectedId(node.id);
     recordRecentId(entry.id);
     if (pending) {
       // 新节点尚未入列，校验时手动并入，否则 target 查找必失败（"节点不存在"）。
-      const check = isConnectionAllowed([...nodes, node] as never, edges as never, {
-        source: pending.source, target: node.id, sourceHandle: pending.sourceHandle, targetHandle: 'in',
-      });
+      const merged = [...canvasNodesRef.current, node] as never[];
+      const check = inSquad
+        ? isSquadConnectionAllowed(merged, canvasEdgesRef.current as never, {
+          source: pending.source, target: node.id, sourceHandle: pending.sourceHandle, targetHandle: 'in',
+        })
+        : isConnectionAllowed(merged, canvasEdgesRef.current as never, {
+          source: pending.source, target: node.id, sourceHandle: pending.sourceHandle, targetHandle: 'in',
+        });
       if (check.ok) {
-        setEdges((eds) => addEdge({
+        updateCanvasEdges((eds) => addEdge({
           source: pending.source, sourceHandle: pending.sourceHandle, target: node.id, targetHandle: 'in', type: 'maestro',
         }, eds));
       } else {
         setStatus({ kind: 'warn', text: `不能连线：${check.reason}` });
       }
     }
-  }, [nodes, edges, markDirty, setNodes, setEdges, insertTemplateAt]);
+  }, [markDirty, updateCanvasNodes, updateCanvasEdges, insertTemplateAt, inSquad]);
 
   // 浮层打开：client 坐标 → 面板锚点（相对 wrap，夹取边界）+ flow 落点。
   const openLibraryAt = useCallback((clientX: number, clientY: number, pending?: PendingConnection | null) => {
@@ -694,11 +965,11 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     const y = Math.min(Math.max(0, clientY - rect.top), Math.max(0, rect.height - 400));
     let pendingLabel: string | undefined;
     if (pending) {
-      const source = nodes.find((node) => node.id === pending.source);
+      const source = canvasNodesRef.current.find((node) => node.id === pending.source);
       pendingLabel = `⚡ ${source ? nodeSummary(source as never) : pending.source} → 选择要连接的节点`;
     }
     setLibrary({ x, y, flow: screenToFlowPosition({ x: clientX, y: clientY }), pending: pending ?? undefined, pendingLabel });
-  }, [nodes, screenToFlowPosition]);
+  }, [screenToFlowPosition]);
 
   // 左侧树/工具栏：点击放视口中心（级联偏移）；指针拖拽带落点坐标放指定位置。
   const handlePlace = useCallback((entry: LibraryItem, client?: { x: number; y: number }) => {
@@ -721,9 +992,10 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     const point = 'changedTouches' in event ? event.changedTouches[0] : event;
     openLibraryAt(point.clientX, point.clientY, {
       source: state.fromNode.id,
-      sourceHandle: state.fromHandle?.id ?? 'out',
+      // 军团内成员缺省 dispatch 出口；扩展/主图按源类型默认。
+      sourceHandle: state.fromHandle?.id ?? (inSquad ? 'dispatch' : 'out'),
     });
-  }, [openLibraryAt]);
+  }, [openLibraryAt, inSquad]);
 
   // Tab 唤起（Houdini）：仅当指针悬停在沙盘画布区且不在输入控件中。
   useEffect(() => {
@@ -763,38 +1035,66 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
           extension: payload.extension, seed: payload.seed, templateId: payload.templateId,
         };
       } else if (payload.id) {
-        entry = libraryItems.find((item) => item.id === payload.id);
+        entry = canvasLibraryItems.find((item) => item.id === payload.id);
       }
     } catch {
-      entry = libraryItems.find((item) => item.id === raw);
+      entry = canvasLibraryItems.find((item) => item.id === raw);
     }
     if (entry) placeItem(entry, flow, null);
     else setStatus({ kind: 'warn', text: '无法识别的拖拽内容，请改用点击或 Tab 放置' });
-  }, [screenToFlowPosition, libraryItems, placeItem]);
+  }, [screenToFlowPosition, canvasLibraryItems, placeItem]);
 
   const patchNode = useCallback((id: string, patch: Partial<SandboxNodeData>) => {
     markDirty();
-    setNodes((items) => items.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch } } : node));
-  }, [setNodes, markDirty]);
+    const target = canvasNodesRef.current.find((node) => node.id === id);
+    updateCanvasNodes((items) => items.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch } } : node));
+    // squad 节点改名 → 同步迁移 squads 键（新名冲突/留空时保留旧键，校验兜底）。
+    if (!inSquad && target?.data.nodeType === 'squad' && 'squad' in patch) {
+      const prev = String(target.data.squad ?? '').trim();
+      const next = String(patch.squad ?? '').trim();
+      if (prev && next && prev !== next) {
+        setSquads((map) => {
+          if (!(prev in map) || next in map) return map;
+          const { [prev]: draft, ...rest } = map;
+          return { ...rest, [next]: draft };
+        });
+      }
+    }
+  }, [inSquad, updateCanvasNodes, markDirty]);
 
   const deleteNode = useCallback((id: string) => {
     markDirty();
-    setNodes((items) => items.filter((node) => node.id !== id));
-    setEdges((items) => items.filter((edge) => edge.source !== id && edge.target !== id));
+    const target = canvasNodesRef.current.find((node) => node.id === id);
+    updateCanvasNodes((items) => items.filter((node) => node.id !== id));
+    updateCanvasEdges((items) => items.filter((edge) => edge.source !== id && edge.target !== id));
+    // 删除 squad 节点连同其子图定义（避免悬空引用）。
+    if (!inSquad && target?.data.nodeType === 'squad') {
+      const name = String(target.data.squad ?? '').trim();
+      if (name) {
+        setSquads((map) => {
+          const { [name]: _dropped, ...rest } = map;
+          return rest;
+        });
+      }
+    }
     setSelectedId(null);
-  }, [setNodes, setEdges, markDirty]);
+  }, [inSquad, updateCanvasNodes, updateCanvasEdges, markDirty]);
 
+  // 工具栏模板入口：复用 insertTemplateAt（携带 squads 子图 + 防重名），
+  // 落点画布视口中心。
   const insertTemplate = (id: string) => {
-    const template = SANDBOX_TEMPLATES.find((item) => item.id === id);
-    if (!template) return;
-    const built = template.build({ skills: known.skills, servers: known.servers, plugins: known.plugins });
-    markDirty();
-    setNodes((items) => [...items, ...built.nodes as SandboxNode[]]);
-    setEdges((items) => [...items, ...built.edges as SandboxEdge[]]);
+    const rect = wrapRef.current?.getBoundingClientRect();
+    const center = rect
+      ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+      : { x: 0, y: 0 };
+    insertTemplateAt(id, screenToFlowPosition(center));
     setTemplateOpen(false);
   };
 
+  // 校验提示：主图 + 全部军团内部（含未打开的子沙盘）。只在点击时计算——
+  // 此前的 useMemo 让 validateDraft 在每个拖动帧空跑。
   const runValidation = () => {
+    const validation = validateDraft(nodes as never, edges as never, known, squads as never);
     setIssues(validation);
     setStatus(validation.errors.length
       ? { kind: 'error', text: `校验失败：${validation.errors.length} 个错误` }
@@ -804,6 +1104,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   };
 
   const save = async () => {
+    const validation = validateDraft(nodes as never, edges as never, known, squads as never);
     if (validation.errors.length) {
       setIssues(validation);
       setStatus({ kind: 'error', text: '存在错误，无法保存' });
@@ -813,7 +1114,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
       setStatus({ kind: 'warn', text: '预览模式不会写入 Rust 规则文件' });
       return;
     }
-    const graph: ArchitectureGraph = serializeGraph(nodes as never, edges as never);
+    const graph: ArchitectureGraph = serializeGraph(nodes as never, edges as never, squads as never);
     setStatus({ kind: 'info', text: '保存中…' });
     try {
       const result = await architectureApi.save(graph, scope);
@@ -825,34 +1126,56 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     }
   };
 
-  const graphJson = useMemo(() => JSON.stringify(serializeGraph(nodes as never, edges as never), null, 2), [nodes, edges]);
+  // JSON 预览只在面板打开时序列化——此前每个拖动帧都跑一遍 stringify。
+  const graphJson = useMemo(
+    () => (showJson ? JSON.stringify(serializeGraph(nodes as never, edges as never, squads as never), null, 2) : ''),
+    [showJson, nodes, edges, squads],
+  );
+
+  // RF 变更统一经画布适配层回写（主图 useNodesState / 军团 squads 映射）。
+  const handleNodesChange = useCallback((changes: NodeChange<SandboxNode>[]) => {
+    updateCanvasNodes((items) => applyNodeChanges(changes, items));
+    if (changes.some((c) => c.type !== 'select')) markDirty();
+  }, [updateCanvasNodes, markDirty]);
+  const handleEdgesChange = useCallback((changes: EdgeChange<SandboxEdge>[]) => {
+    updateCanvasEdges((items) => applyEdgeChanges(changes, items));
+    if (changes.some((c) => c.type !== 'select')) markDirty();
+  }, [updateCanvasEdges, markDirty]);
+
+  // 树状排列：军团内部按 dispatch 树分层（指挥置顶 / 成员中层 / 扩展底层）。
+  const applyTreeLayout = useCallback(() => {
+    markDirty();
+    updateCanvasNodes((items) => layoutSquadTree(items as never, canvasEdgesRef.current as never) as never);
+    void fitView({ duration: 200 });
+  }, [markDirty, updateCanvasNodes, fitView]);
+
+  // ReactFlow 事件回调全部 useCallback 稳定——内联函数每帧新建会让
+  // RF useStoreUpdater 每帧写入内部 store（拖动手感的隐形开销）。
+  const onDragOver = useCallback((event: DragEvent) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }, []);
+  const onNodeDoubleClick = useCallback((_event: React.MouseEvent, node: Node) => {
+    // Houdini subnet：双击 squad 节点下钻到子沙盘。
+    const squadName = (node.data as Record<string, unknown>).squad;
+    if (!inSquad && node.data.nodeType === 'squad' && squadName) {
+      enterSquad(String(squadName));
+    }
+  }, [inSquad, enterSquad]);
+  const onCanvasDoubleClick = useCallback((event: React.MouseEvent) => {
+    if ((event.target as HTMLElement).classList.contains('react-flow__pane')) {
+      openLibraryAt(event.clientX, event.clientY, null);
+    }
+  }, [openLibraryAt]);
+  const onSelectionChange = useCallback((params: { nodes: Node[] }) => {
+    setSelectedId(params.nodes[0]?.id ?? null);
+  }, []);
 
   return (
     <div className="sandbox-root">
-      {/* 左侧节点库：与 Tab 浮层同源的分类树 */}
-      <aside className="sandbox-palette">
-        <div className="palette-search">
-          <input value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
-            placeholder="筛选节点…" aria-label="筛选节点" />
-          {paletteQuery && <button type="button" onClick={() => setPaletteQuery('')} aria-label="清空筛选">×</button>}
-        </div>
-        {sidebarResults ? (
-          <div className="palette-section">
-            {sidebarResults.map((section) => (
-              <div key={section.label}>
-                <p className="palette-heading">{section.label}</p>
-                {section.items.map((entry) => <PaletteCard key={entry.id} entry={entry} onPlace={handlePlace} />)}
-              </div>
-            ))}
-            {sidebarResults.every((section) => section.items.length === 0) && (
-              <p className="palette-empty">没有匹配的节点</p>
-            )}
-          </div>
-        ) : (
-          sidebarTree.map((group) => <PaletteTree key={group.label} group={group} depth={0} onPlace={handlePlace} />)
-        )}
-        <p className="palette-tip">双击画布或按 Tab 打开节点库；把连线拖到空白处可搜索接入节点。</p>
-      </aside>
+      {/* 左侧节点库：与 Tab 浮层同源的分类树；memo 化——拖动帧整块跳过重渲染 */}
+      <PaletteSidebar query={paletteQuery} onQuery={setPaletteQuery}
+        tree={canvasSidebarTree} results={canvasSidebarResults} onPlace={handlePlace} />
 
       {/* 中央画布 */}
       <div className="sandbox-canvas-wrap" ref={wrapRef}
@@ -862,12 +1185,23 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
         }}>
         <header className="sandbox-toolbar">
           <div className="toolbar-group">
-            <Layers size={14} />
-            <Choice label="规则作用域" value={scope} onChange={(v) => { if (dirtyRef.current && !window.confirm('未保存的修改将丢失，仍切换作用域？')) return; setScope(v as 'project' | 'global'); }}
-              options={[
-                { value: 'project', label: `项目规则${extensions.hasWorkspace || preview ? '' : '（需工作区）'}` },
-                { value: 'global', label: '全局规则' },
-              ]} />
+            {inSquad ? (
+              <>
+                <button type="button" className="toolbar-btn" onClick={exitSquad} title="返回主沙盘">
+                  <ArrowLeft size={13} /> 主沙盘
+                </button>
+                <span className="squad-crumb" title={`spawn_subagent(type=${openSquad})`}>🏰 {openSquad}</span>
+              </>
+            ) : (
+              <>
+                <Layers size={14} />
+                <Choice label="规则作用域" value={scope} onChange={(v) => { if (dirtyRef.current && !window.confirm('未保存的修改将丢失，仍切换作用域？')) return; setScope(v as 'project' | 'global'); }}
+                  options={[
+                    { value: 'project', label: `项目规则${extensions.hasWorkspace || preview ? '' : '（需工作区）'}` },
+                    { value: 'global', label: '全局规则' },
+                  ]} />
+              </>
+            )}
           </div>
           <div className="toolbar-group">
             <button type="button" className="toolbar-btn" title="打开节点库（Tab / 双击画布）"
@@ -877,6 +1211,12 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
               }}>
               <Plus size={13} /> 节点 <kbd className="toolbar-kbd">Tab</kbd>
             </button>
+            {inSquad && (
+              <button type="button" className="toolbar-btn" onClick={applyTreeLayout} title="按 dispatch 派发树分层排列">
+                <ListTree size={13} /> 树状排列
+              </button>
+            )}
+            {!inSquad && (
             <div className="template-picker">
               <button type="button" className="toolbar-btn" onClick={() => setTemplateOpen((v) => !v)}>
                 <WandSparkles size={13} /> 预置模板 <ChevronDown size={11} />
@@ -901,6 +1241,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
                 </div>
               )}
             </div>
+            )}
             <button type="button" className="toolbar-btn" onClick={runValidation}><ListChecks size={13} /> 校验</button>
             <button type="button" className="toolbar-btn" onClick={() => setShowJson((v) => !v)}><FileCode2 size={13} /> JSON</button>
           </div>
@@ -928,26 +1269,23 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
           edges={displayEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          onNodesChange={(changes) => { onNodesChange(changes); if (changes.some((c) => c.type !== 'select')) markDirty(); }}
-          onEdgesChange={(changes) => { onEdgesChange(changes); if (changes.some((c) => c.type !== 'select')) markDirty(); }}
+          onNodesChange={handleNodesChange}
+          onEdgesChange={handleEdgesChange}
           onConnect={onConnect}
           onConnectEnd={onConnectEnd}
           isValidConnection={isValidConnection}
           onDrop={onDrop}
-          onDragOver={(event: DragEvent) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}
-          onDoubleClick={(event) => {
-            if ((event.target as HTMLElement).classList.contains('react-flow__pane')) {
-              openLibraryAt(event.clientX, event.clientY, null);
-            }
-          }}
-          onSelectionChange={(params) => setSelectedId(params.nodes[0]?.id ?? null)}
+          onDragOver={onDragOver}
+          onNodeDoubleClick={onNodeDoubleClick}
+          onDoubleClick={onCanvasDoubleClick}
+          onSelectionChange={onSelectionChange}
           selectionOnDrag
           selectionMode={SelectionMode.Partial}
-          panOnDrag={[1, 2]}
-          defaultEdgeOptions={{ type: 'maestro' }}
+          panOnDrag={PAN_ON_DRAG}
+          defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
           connectionRadius={32}
           fitView
-          proOptions={{ hideAttribution: true }}
+          proOptions={PRO_OPTIONS}
           colorMode="dark"
           deleteKeyCode={['Backspace', 'Delete']}
         >
@@ -967,10 +1305,20 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
             </Panel>
           )}
         </ReactFlow>
-        {nodes.length === 0 && !library && (
+        {canvasNodes.length === 0 && !library && (
           <div className="sandbox-empty-hint" aria-hidden>
-            <p>双击空白或按 <kbd>Tab</kbd> 打开节点库</p>
-            <p>也可以点击左侧节点卡片直接放置</p>
+            {inSquad ? (
+              <>
+                <p>🏰 军团 {openSquad}：三步编排——① 拖入成员节点 ② 顶部成员的「派发」出口连成员 = 指挥 ③ 扩展「装配」出口连成员 = 授权</p>
+                <p>新军团自带「general 指挥 → explore 成员」骨架；指挥至多一个；无指挥 = 一次性并行派发</p>
+                <p>扩展连到指挥 = 仅指挥可用；主图扩展连军团节点 = 全员共享</p>
+              </>
+            ) : (
+              <>
+                <p>双击空白或按 <kbd>Tab</kbd> 打开节点库</p>
+                <p>也可以点击左侧节点卡片直接放置</p>
+              </>
+            )}
           </div>
         )}
         {library && (
@@ -978,7 +1326,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
             anchor={{ x: library.x, y: library.y }}
             pending={library.pending}
             pendingLabel={library.pendingLabel}
-            items={libraryItems}
+            items={canvasLibraryItems}
             onPick={(entry, keepOpen) => {
               placeItem(entry, library.flow, library.pending);
               if (!keepOpen) setLibrary(null);
@@ -996,7 +1344,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
       {/* 右侧属性面板 */}
       <aside className="sandbox-props">
         {selected ? (
-          <PropertyPanel node={selected} known={known} effectiveAfter={afterByNode.has(selected.id)} upstream={upstreamsOf(selected.id)} onChange={patchNode} onDelete={deleteNode} />
+          <PropertyPanel node={selected} known={known} effectiveAfter={afterByNode.has(selected.id)} upstream={upstreamsOf(selected.id)} insideSquad={inSquad} onChange={patchNode} onDelete={deleteNode} />
         ) : (
           <div className="prop-empty">
             <Sparkles size={20} strokeWidth={1.5} />

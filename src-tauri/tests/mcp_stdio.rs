@@ -95,7 +95,7 @@ async fn fake_stdio_server_lists_calls_and_respects_trust() {
     assert!(manager.start("fake").await.is_err());
 
     // Startup restore ignores disabled entries.
-    manager.start_enabled().await;
+    manager.start_enabled(&|_| {}).await;
     assert!(!manager.list_servers().await.unwrap()[0].running);
 
     manager.shutdown().await;

@@ -18,6 +18,11 @@ const MAX_EXT_CHARS: usize = 128;
 const MAX_PARAMS: usize = 20;
 const MAX_PARAM_KEY_CHARS: usize = 64;
 const MAX_PARAM_VALUE_CHARS: usize = 256;
+const MAX_SQUADS: usize = 16;
+const MAX_SQUAD_NODES: usize = 32;
+const MAX_SQUAD_EDGES: usize = 64;
+/// 军团成员上限：并行态一次全派、指挥态也在 enum 内——控制单次 fan-out。
+const MAX_SQUAD_MEMBERS: usize = 8;
 
 // ---- 图结构 -----------------------------------------------------------------
 
@@ -30,6 +35,10 @@ pub struct ArchitectureGraph {
     pub nodes: Vec<GraphNode>,
     #[serde(default)]
     pub edges: Vec<GraphEdge>,
+    /// 智能体军团（subnet 子沙盘）：`squad` 节点 data.squad 引用这里的键。
+    /// 内部只允许 子智能体/扩展 节点——指挥（dispatch 出边）→ 成员树。
+    #[serde(default)]
+    pub squads: BTreeMap<String, SquadGraph>,
 }
 
 impl ArchitectureGraph {
@@ -84,6 +93,10 @@ pub struct GraphNodeData {
     pub extension: Option<ExtensionData>,
     // Subagent 装配节点：绑定的子智能体类型名（如 explore/reviewer）。
     pub agent: Option<String>,
+    // Squad 封装节点：引用的军团名（squads 键）。
+    pub squad: Option<String>,
+    // 军团成员必选性：仅军团内 Subagent 节点使用（默认 required）。
+    pub requirement: Option<ExtensionRequirement>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,6 +111,18 @@ pub struct GraphEdge {
     pub target_handle: Option<String>,
 }
 
+/// 军团内部子图（Houdini subnet）：仅 子智能体/扩展 节点。
+/// dispatch 出边（sourceHandle="dispatch"）的子智能体 = 指挥；其出边
+/// 目标 = 可派成员。无 dispatch 边 = 并行军团（spawn 一次全派）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SquadGraph {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub edges: Vec<GraphEdge>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Trigger,
@@ -108,6 +133,9 @@ pub enum NodeKind {
     /// 装配节点（不参与调用求值）：Extension → Subagent 入边声明
     /// 「该类型子智能体获得这些扩展授权」，spawn_subagent 时生效。
     Subagent,
+    /// 军团封装节点（subnet）：`data.squad` 引用 `squads` 键；求值透明端点，
+    /// spawn_subagent(type=squad名) 按内部编排解析为并行军团或指挥派发。
+    Squad,
 }
 
 impl NodeKind {
@@ -119,6 +147,7 @@ impl NodeKind {
             "action" => Self::Action,
             "extension" => Self::Extension,
             "subagent" => Self::Subagent,
+            "squad" => Self::Squad,
             _ => return None,
         })
     }
@@ -409,20 +438,23 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
         if source_kind == NodeKind::Action {
             return Err(format!("Action 节点 {} 不能有出边", source.id));
         }
-        // 装配终点：子智能体节点只消费扩展入边，自身不向图求值输出。
+        // 装配终点：子智能体/军团节点只消费扩展入边，自身不向图求值输出。
         if source_kind == NodeKind::Subagent {
             return Err(format!("Subagent 节点 {} 不能有出边", source.id));
+        }
+        if source_kind == NodeKind::Squad {
+            return Err(format!("Squad 节点 {} 不能有出边", source.id));
         }
         if target_kind == NodeKind::Trigger {
             return Err(format!("Trigger 节点 {} 不能作为目标", target.id));
         }
-        if target_kind == NodeKind::Subagent {
+        if matches!(target_kind, NodeKind::Subagent | NodeKind::Squad) {
             if source_kind != NodeKind::Extension {
-                return Err(format!("Subagent 节点 {} 只接受扩展节点入边", target.id));
+                return Err(format!("{:?} 节点 {} 只接受扩展节点入边", target_kind, target.id));
             }
             // 装配连线仅表达「授予」，fail 出口在此无意义（未满足在子循环内处理）。
             if edge.source_handle.as_deref().is_some_and(|handle| handle != "pass") {
-                return Err(format!("扩展 → Subagent 装配边只能使用 pass 出口（边 {}）", edge.id));
+                return Err(format!("扩展 → 装配终点的连线只能使用 pass 出口（边 {}）", edge.id));
             }
         }
         if let Some(handle) = edge.target_handle.as_deref() {
@@ -457,13 +489,22 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
                     return Err(format!("可选扩展节点 {} 不允许 fail 出边", source.id));
                 }
             }
-            NodeKind::Action | NodeKind::Subagent => unreachable!(),
+            NodeKind::Action | NodeKind::Subagent | NodeKind::Squad => unreachable!(),
         }
     }
     // DAG：Kahn 拓扑，剩环即拒。
-    let mut indegree: HashMap<&str, usize> = graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
+    if has_cycle(&graph.nodes, &graph.edges) {
+        return Err("规则图存在环（必须是 DAG）".into());
+    }
+    validate_squads(graph)?;
+    Ok(())
+}
+
+/// Kahn 拓扑：有环返回 true。主图与军团内图共用。
+fn has_cycle(nodes: &[GraphNode], edges: &[GraphEdge]) -> bool {
+    let mut indegree: HashMap<&str, usize> = nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
     let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
-    for edge in &graph.edges {
+    for edge in edges {
         *indegree.entry(edge.target.as_str()).or_default() += 1;
         outgoing.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
     }
@@ -483,8 +524,117 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
             }
         }
     }
-    if visited != graph.nodes.len() {
-        return Err("规则图存在环（必须是 DAG）".into());
+    visited != nodes.len()
+}
+
+/// 军团层校验：squad 节点引用约束 + 每个军团内部结构（指挥/成员/dispatch 边）。
+fn validate_squads(graph: &ArchitectureGraph) -> AppResult<()> {
+    if graph.squads.len() > MAX_SQUADS {
+        return Err(format!("军团数超过 {MAX_SQUADS} 上限"));
+    }
+    let mut squad_node_names = HashSet::new();
+    for node in &graph.nodes {
+        if NodeKind::parse(&node.node_type) != Some(NodeKind::Squad) {
+            continue;
+        }
+        let name = node.data.squad.as_deref().map(str::trim).unwrap_or_default();
+        if !squad_node_names.insert(name.to_string()) {
+            return Err(format!("Squad 节点重名：{name}"));
+        }
+        if !graph.squads.contains_key(name) {
+            return Err(format!("Squad 节点 {} 引用的军团 {name} 不存在于 squads", node.id));
+        }
+    }
+    for (name, squad) in &graph.squads {
+        validate_squad(name, squad)?;
+    }
+    Ok(())
+}
+
+/// 军团内部：只允许 子智能体/扩展 节点；dispatch 出边全图至多一个源
+/// （指挥），指挥不可被 dispatch 指向；extension 仅 pass→成员；整体 DAG。
+fn validate_squad(name: &str, squad: &SquadGraph) -> AppResult<()> {
+    if squad.nodes.len() > MAX_SQUAD_NODES {
+        return Err(format!("军团 {name} 节点数超过 {MAX_SQUAD_NODES} 上限"));
+    }
+    if squad.edges.len() > MAX_SQUAD_EDGES {
+        return Err(format!("军团 {name} 边数超过 {MAX_SQUAD_EDGES} 上限"));
+    }
+    let mut ids = HashSet::with_capacity(squad.nodes.len());
+    let mut members = 0usize;
+    for node in &squad.nodes {
+        if node.id.trim().is_empty() || node.id.chars().count() > MAX_ID_CHARS {
+            return Err(format!("军团 {name} 节点 id 非法：{}", node.id));
+        }
+        if !ids.insert(node.id.clone()) {
+            return Err(format!("军团 {name} 节点 id 重复：{}", node.id));
+        }
+        let kind = NodeKind::parse(&node.node_type)
+            .ok_or_else(|| format!("军团 {name} 存在未知节点类型：{}", node.node_type))?;
+        if !matches!(kind, NodeKind::Subagent | NodeKind::Extension) {
+            return Err(format!("军团 {name} 只允许 子智能体/扩展 节点（{} 非法）", node.node_type));
+        }
+        if kind == NodeKind::Subagent {
+            members += 1;
+        }
+        validate_node_data(kind, node, false)?;
+    }
+    if members == 0 {
+        return Err(format!("军团 {name} 没有成员子智能体"));
+    }
+    if members > MAX_SQUAD_MEMBERS {
+        return Err(format!("军团 {name} 成员数超过 {MAX_SQUAD_MEMBERS} 上限"));
+    }
+    let mut edge_ids = HashSet::with_capacity(squad.edges.len());
+    let mut coordinator: Option<&str> = None;
+    let mut dispatch_targets: HashSet<&str> = HashSet::new();
+    for edge in &squad.edges {
+        if !edge_ids.insert(edge.id.clone()) {
+            return Err(format!("军团 {name} 边 id 重复：{}", edge.id));
+        }
+        let source = squad
+            .nodes
+            .iter()
+            .find(|node| node.id == edge.source)
+            .ok_or_else(|| format!("军团 {name} 边 {} 的 source 不存在", edge.id))?;
+        let target = squad
+            .nodes
+            .iter()
+            .find(|node| node.id == edge.target)
+            .ok_or_else(|| format!("军团 {name} 边 {} 的 target 不存在", edge.id))?;
+        let source_kind = NodeKind::parse(&source.node_type).unwrap();
+        let target_kind = NodeKind::parse(&target.node_type).unwrap();
+        if target_kind != NodeKind::Subagent {
+            return Err(format!("军团 {name} 内扩展/成员只能指向子智能体成员（边 {}）", edge.id));
+        }
+        if edge.target_handle.as_deref().is_some_and(|handle| handle != "in") {
+            return Err(format!("军团 {name} 边 {} 的 targetHandle 只能为 in", edge.id));
+        }
+        match source_kind {
+            NodeKind::Extension => {
+                if edge.source_handle.as_deref().is_some_and(|handle| handle != "pass") {
+                    return Err(format!("军团 {name} 内扩展 → 成员只能使用 pass 出口（边 {}）", edge.id));
+                }
+            }
+            NodeKind::Subagent => {
+                if edge.source_handle.as_deref() != Some("dispatch") {
+                    return Err(format!("军团 {name} 内成员的调度出边必须使用 dispatch 出口（边 {}）", edge.id));
+                }
+                if coordinator.replace(source.id.as_str()).is_some_and(|prev| prev != source.id) {
+                    return Err(format!("军团 {name} 至多允许一个指挥（dispatch 出边源）"));
+                }
+                dispatch_targets.insert(target.id.as_str());
+            }
+            _ => unreachable!(),
+        }
+    }
+    if let Some(coordinator) = coordinator {
+        if dispatch_targets.contains(coordinator) {
+            return Err(format!("军团 {name} 的指挥不能被 dispatch 指向"));
+        }
+    }
+    if has_cycle(&squad.nodes, &squad.edges) {
+        return Err(format!("军团 {name} 内部存在环（必须是 DAG）"));
     }
     Ok(())
 }
@@ -547,6 +697,19 @@ fn validate_node_data(kind: NodeKind, node: &GraphNode, effective_after: bool) -
                 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 return Err(format!("Subagent {} 的 agent 名必须为字母/数字/-/_", node.id));
+            }
+        }
+        NodeKind::Squad => {
+            let name = data
+                .squad
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("Squad {} 缺少 squad 军团名", node.id))?;
+            if name.chars().count() > 64
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(format!("Squad {} 的军团名必须为字母/数字/-/_", node.id));
             }
         }
         NodeKind::Extension => {
@@ -1113,8 +1276,8 @@ impl<'a> Eval<'a> {
                 let warn = result == ActionResult::Warn;
                 (true, warn, message, trace)
             }
-            NodeKind::Subagent => {
-                // 装配终点：求值透明——连线只声明授权，不拦截、不产生 trace 步骤。
+            NodeKind::Subagent | NodeKind::Squad => {
+                // 装配终点：求值透明——连线只声明授权/编排，不拦截、不产生 trace 步骤。
                 (false, false, None, trace)
             }
             NodeKind::Requirement | NodeKind::Restriction | NodeKind::Extension => {
@@ -1271,31 +1434,38 @@ pub struct BoundExtension {
     pub missing: Option<String>,
 }
 
-/// 图中绑给 `agent` 类型子智能体的全部扩展：Extension → Subagent(name=agent)
-/// 入边集合（merge 输入语义）。插件按 `plugins` 清单展开为底层 Skill/MCP；
-/// 同一目标去重，required 优先于 optional。
-pub fn subagent_bindings(
-    graph: &ArchitectureGraph,
-    agent: &str,
+/// 扩展声明解析为真实绑定（插件按清单展开，缺失带 missing 告警）。
+fn resolve_ext(
+    ext: &ExtensionData,
+    plugins: &BTreeMap<String, ResolvedPlugin>,
+) -> (ExtensionKind, String, Option<String>, Option<String>) {
+    let target = ext.target.as_deref().unwrap_or_default();
+    match ext.kind.unwrap_or(ExtensionKind::Skill) {
+        ExtensionKind::Plugin => match plugins.get(target) {
+            Some(plugin) => (plugin.kind, plugin.target.clone(), plugin.tool.clone().or(ext.tool.clone()), None),
+            None => (ExtensionKind::Plugin, target.to_string(), None, Some(format!("插件 {target} 未安装或清单损坏"))),
+        },
+        kind => (kind, target.to_string(), ext.tool.clone(), None),
+    }
+}
+
+/// Extension → target_ids 入边集合（merge 输入语义）：插件按 `plugins` 清单
+/// 展开为底层 Skill/MCP；同一目标去重，required 优先于 optional。
+/// 主图与军团内图共用（装配语义一致）。
+fn collect_bound(
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+    target_ids: &HashSet<&str>,
     plugins: &BTreeMap<String, ResolvedPlugin>,
 ) -> Vec<BoundExtension> {
-    let subagent_ids: HashSet<&str> = graph
-        .nodes
-        .iter()
-        .filter(|node| {
-            NodeKind::parse(&node.node_type) == Some(NodeKind::Subagent)
-                && node.data.agent.as_deref().map(str::trim) == Some(agent)
-        })
-        .map(|node| node.id.as_str())
-        .collect();
-    if subagent_ids.is_empty() {
+    if target_ids.is_empty() {
         return Vec::new();
     }
     let by_id: HashMap<&str, &GraphNode> =
-        graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        nodes.iter().map(|node| (node.id.as_str(), node)).collect();
     let mut out: Vec<BoundExtension> = Vec::new();
-    for edge in &graph.edges {
-        if !subagent_ids.contains(edge.target.as_str()) {
+    for edge in edges {
+        if !target_ids.contains(edge.target.as_str()) {
             continue;
         }
         let Some(source) = by_id.get(edge.source.as_str()) else { continue };
@@ -1303,16 +1473,8 @@ pub fn subagent_bindings(
             continue;
         }
         let Some(ext) = source.data.extension.as_ref() else { continue };
-        let target = ext.target.as_deref().unwrap_or_default();
         let required = ext.is_required();
-        let resolved = match ext.kind.unwrap_or(ExtensionKind::Skill) {
-            ExtensionKind::Plugin => match plugins.get(target) {
-                Some(plugin) => Some((plugin.kind, plugin.target.clone(), plugin.tool.clone().or(ext.tool.clone()), None)),
-                None => Some((ExtensionKind::Plugin, target.to_string(), None, Some(format!("插件 {target} 未安装或清单损坏")))),
-            },
-            kind => Some((kind, target.to_string(), ext.tool.clone(), None)),
-        };
-        let Some((kind, target, tool, missing)) = resolved else { continue };
+        let (kind, target, tool, missing) = resolve_ext(ext, plugins);
         // 去重键不含 required：同名绑定合并为更严格的 required。
         let key = (kind, target.clone(), tool.clone());
         if let Some(existing) = out.iter_mut().find(|item| {
@@ -1324,6 +1486,130 @@ pub fn subagent_bindings(
         out.push(BoundExtension { kind: key.0, target: key.1, tool: key.2, required, params: ext.params.clone(), missing });
     }
     out
+}
+
+/// 图中绑给 `agent` 类型子智能体的全部扩展：Extension → Subagent(name=agent)
+/// 入边集合（merge 输入语义）。插件按 `plugins` 清单展开为底层 Skill/MCP；
+/// 同一目标去重，required 优先于 optional。
+pub fn subagent_bindings(
+    graph: &ArchitectureGraph,
+    agent: &str,
+    plugins: &BTreeMap<String, ResolvedPlugin>,
+) -> Vec<BoundExtension> {
+    let ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            NodeKind::parse(&node.node_type) == Some(NodeKind::Subagent)
+                && node.data.agent.as_deref().map(str::trim) == Some(agent)
+        })
+        .map(|node| node.id.as_str())
+        .collect();
+    collect_bound(&graph.nodes, &graph.edges, &ids, plugins)
+}
+
+/// 主图 Extension → Squad(name) 入边：军团级授权（对指挥与全部成员生效）。
+pub fn squad_bindings(
+    graph: &ArchitectureGraph,
+    squad: &str,
+    plugins: &BTreeMap<String, ResolvedPlugin>,
+) -> Vec<BoundExtension> {
+    let ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            NodeKind::parse(&node.node_type) == Some(NodeKind::Squad)
+                && node.data.squad.as_deref().map(str::trim) == Some(squad)
+        })
+        .map(|node| node.id.as_str())
+        .collect();
+    collect_bound(&graph.nodes, &graph.edges, &ids, plugins)
+}
+
+// ---- 智能体军团（squad 编排解析，spawn_subagent 时用） -----------------------------
+
+/// 军团成员：引用一个 AgentDefinition 的子智能体节点 + 军团内装配授权。
+#[derive(Debug, Clone)]
+pub struct SquadMember {
+    /// 成员的 `data.agent`（spawn_subagent 的 subagent_type 候选）。
+    pub agent: String,
+    /// `data.requirement`（默认 required）：指挥态未派被追问；并行态忽略（全员皆派）。
+    pub required: bool,
+    /// 军团内 Extension → 该成员的装配授权。
+    pub grants: Vec<BoundExtension>,
+}
+
+/// 军团编排解析：有指挥（dispatch 出边源）→ 嵌套派发；
+/// 无指挥 → 并行军团（成员全部并行派生）。
+#[derive(Debug, Clone)]
+pub struct SquadPlan {
+    /// 指挥成员的 agent 类型（dispatch 出边源；校验保证至多一个）。
+    pub coordinator: Option<String>,
+    /// 军团内 Extension → 指挥的装配授权（指挥也是子智能体，ext→指挥
+    /// 连线合法且必须生效——此前只收集成员 grants，指挥绑定静默丢失）。
+    pub coordinator_grants: Vec<BoundExtension>,
+    /// 可派成员：指挥态 = dispatch 边目标；并行态 = 全部成员。
+    pub members: Vec<SquadMember>,
+    /// 主图 Extension → Squad 的军团级授权（全员生效）。
+    pub squad_grants: Vec<BoundExtension>,
+}
+
+/// 按 `squads` 键解析军团编排；军团不存在 → None。
+pub fn squad_plan(
+    graph: &ArchitectureGraph,
+    name: &str,
+    plugins: &BTreeMap<String, ResolvedPlugin>,
+) -> Option<SquadPlan> {
+    let squad = graph.squads.get(name)?;
+    let coordinator_node = squad.edges.iter().find_map(|edge| {
+        (edge.source_handle.as_deref() == Some("dispatch"))
+            .then(|| squad.nodes.iter().find(|node| node.id == edge.source))
+            .flatten()
+    });
+    let coordinator_id = coordinator_node.map(|node| node.id.as_str());
+    // 指挥态：dispatch 边目标即成员；并行态：全部成员。
+    let member_ids: HashSet<&str> = if coordinator_id.is_some() {
+        squad
+            .edges
+            .iter()
+            .filter(|edge| edge.source_handle.as_deref() == Some("dispatch") && edge.source == coordinator_id.unwrap())
+            .map(|edge| edge.target.as_str())
+            .collect()
+    } else {
+        squad
+            .nodes
+            .iter()
+            .filter(|node| NodeKind::parse(&node.node_type) == Some(NodeKind::Subagent))
+            .map(|node| node.id.as_str())
+            .collect()
+    };
+    let coordinator = coordinator_node.and_then(|node| node.data.agent.as_deref()).map(|agent| agent.trim().to_string());
+    let members = squad
+        .nodes
+        .iter()
+        .filter(|node| {
+            member_ids.contains(node.id.as_str())
+                && NodeKind::parse(&node.node_type) == Some(NodeKind::Subagent)
+        })
+        .map(|node| SquadMember {
+            agent: node.data.agent.as_deref().unwrap_or_default().trim().to_string(),
+            required: node.data.requirement != Some(ExtensionRequirement::Optional),
+            grants: collect_bound(
+                &squad.nodes,
+                &squad.edges,
+                &HashSet::from([node.id.as_str()]),
+                plugins,
+            ),
+        })
+        .collect();
+    Some(SquadPlan {
+        coordinator,
+        coordinator_grants: coordinator_id
+            .map(|id| collect_bound(&squad.nodes, &squad.edges, &HashSet::from([id]), plugins))
+            .unwrap_or_default(),
+        members,
+        squad_grants: squad_bindings(graph, name, plugins),
+    })
 }
 
 /// 多分支阻断消息合并：>1 条编号清单（cap 5 + 等 N 项），单条原样。
@@ -2636,6 +2922,286 @@ mod tests {
         let hit = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
         assert!(hit.blocked);
         // Skill 已调用 → pass 无子节点 → 放行（装配边不产生拦截）。
+        let pass = evaluate(
+            &g,
+            &write_call("src/a.ts", "x"),
+            &[history("load_skill", "ui-guidelines", 1)],
+            1,
+            &snap,
+            "",
+        );
+        assert!(!pass.blocked);
+    }
+
+    // ---- 智能体军团（squad / subnet 子沙盘）----
+
+    fn squad_node(id: &str, squad: &str) -> serde_json::Value {
+        node(id, "squad", json!({ "squad": squad }))
+    }
+
+    /// 军团内部成员节点；required=false 时加 "requirement":"optional"。
+    fn member_node(id: &str, agent: &str, required: bool) -> serde_json::Value {
+        if required {
+            subagent_node(id, agent)
+        } else {
+            node(id, "subagent", json!({ "agent": agent, "requirement": "optional" }))
+        }
+    }
+
+    fn squad_json(nodes: Vec<serde_json::Value>, edges: Vec<serde_json::Value>) -> serde_json::Value {
+        json!({ "nodes": nodes, "edges": edges })
+    }
+
+    fn graph_with_squads(
+        nodes: Vec<serde_json::Value>,
+        edges: Vec<serde_json::Value>,
+        squads: serde_json::Value,
+    ) -> ArchitectureGraph {
+        serde_json::from_value(json!({ "version": 1, "nodes": nodes, "edges": edges, "squads": squads }))
+            .unwrap()
+    }
+
+    #[test]
+    fn squads_field_defaults_empty_for_old_files() {
+        // 旧版 graph_rules.json 没有 squads 键 → 反序列化为空表，不报错。
+        let g = graph(vec![], vec![]);
+        assert!(g.squads.is_empty());
+    }
+
+    #[test]
+    fn squad_node_requires_existing_squad_and_unique_name() {
+        let inner = squad_json(vec![member_node("m", "explore", true)], vec![]);
+        // 引用不存在的军团 → 拒
+        let missing = graph_with_squads(
+            vec![squad_node("sq", "nope")],
+            vec![],
+            json!({ "team": inner.clone() }),
+        );
+        assert!(validate_graph(&missing).is_err());
+        // 两个 squad 节点同名 → 拒
+        let dup = graph_with_squads(
+            vec![squad_node("sq1", "team"), squad_node("sq2", "team")],
+            vec![],
+            json!({ "team": inner.clone() }),
+        );
+        assert!(validate_graph(&dup).is_err());
+        // 合法：squad 节点 + 定义存在
+        let ok = graph_with_squads(
+            vec![squad_node("sq", "team")],
+            vec![],
+            json!({ "team": inner }),
+        );
+        assert!(validate_graph(&ok).is_ok());
+        // squad 节点出边 → 拒（与 subagent 同为装配终点）
+        let out = graph_with_squads(
+            vec![squad_node("sq", "team"), node("a", "action", json!({"result":"block"}))],
+            vec![edge("e1", "sq", "a", Some("pass"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        assert!(validate_graph(&out).is_err());
+        // 非扩展入边（trigger → squad）→ 拒
+        let bad_in = graph_with_squads(
+            vec![node("t", "trigger", json!({"action":"any"})), squad_node("sq", "team")],
+            vec![edge("e1", "t", "sq", Some("out"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        assert!(validate_graph(&bad_in).is_err());
+    }
+
+    #[test]
+    fn squad_internal_validation() {
+        let sq = |nodes, edges| {
+            graph_with_squads(
+                vec![squad_node("sq", "team")],
+                vec![],
+                json!({ "team": squad_json(nodes, edges) }),
+            )
+        };
+        // 非 子智能体/扩展 节点 → 拒
+        assert!(validate_graph(&sq(
+            vec![member_node("m", "explore", true), node("t", "trigger", json!({"action":"any"}))],
+            vec![],
+        ))
+        .is_err());
+        // 无成员 → 拒
+        assert!(validate_graph(&sq(
+            vec![skill_ext("x", "ui-guidelines", "required")],
+            vec![],
+        ))
+        .is_err());
+        // 成员普通出边（非 dispatch）→ 拒
+        assert!(validate_graph(&sq(
+            vec![member_node("c", "cto", true), member_node("m", "explore", true)],
+            vec![edge("e1", "c", "m", Some("pass"))],
+        ))
+        .is_err());
+        // 双指挥 → 拒
+        assert!(validate_graph(&sq(
+            vec![
+                member_node("c1", "cto", true),
+                member_node("c2", "lead", true),
+                member_node("m", "explore", true),
+            ],
+            vec![
+                edge("e1", "c1", "m", Some("dispatch")),
+                edge("e2", "c2", "m", Some("dispatch")),
+            ],
+        ))
+        .is_err());
+        // 指挥被 dispatch 指向 → 拒
+        assert!(validate_graph(&sq(
+            vec![member_node("c", "cto", true), member_node("m", "explore", true)],
+            vec![edge("e1", "m", "c", Some("dispatch")), edge("e2", "c", "m", Some("dispatch"))],
+        ))
+        .is_err());
+        // 扩展 fail 出口 → 拒
+        assert!(validate_graph(&sq(
+            vec![skill_ext("x", "ui-guidelines", "required"), member_node("m", "explore", true)],
+            vec![edge("e1", "x", "m", Some("fail"))],
+        ))
+        .is_err());
+        // 扩展 → 非成员（此处只能指向成员）→ 拒：ext→ext 不行
+        assert!(validate_graph(&sq(
+            vec![
+                skill_ext("x1", "ui-guidelines", "required"),
+                skill_ext("x2", "plan-review", "required"),
+                member_node("m", "explore", true),
+            ],
+            vec![edge("e1", "x1", "x2", Some("pass"))],
+        ))
+        .is_err());
+        // 成员再派成员 = 第二指挥 → 拒（成员环在结构上必然多指挥，DAG 检测为防御性兜底）
+        assert!(validate_graph(&sq(
+            vec![member_node("c", "cto", true), member_node("m1", "explore", true), member_node("m2", "review", true)],
+            vec![edge("e1", "c", "m1", Some("dispatch")), edge("e2", "c", "m2", Some("dispatch")), edge("e3", "m1", "m2", Some("dispatch"))],
+        ))
+        .is_err());
+        // 合法：指挥 + 成员 + 内部装配
+        assert!(validate_graph(&sq(
+            vec![
+                member_node("c", "cto", true),
+                member_node("m", "explore", true),
+                skill_ext("x", "ui-guidelines", "required"),
+            ],
+            vec![edge("e1", "c", "m", Some("dispatch")), edge("e2", "x", "m", Some("pass"))],
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn squad_plan_coordinator_mode() {
+        let g = graph_with_squads(
+            vec![squad_node("sq", "team")],
+            vec![],
+            json!({ "team": squad_json(
+                vec![
+                    member_node("c", "cto", true),
+                    member_node("m1", "explore", true),
+                    member_node("m2", "reviewer", false),
+                    member_node("stray", "general", true), // 未被 dispatch 指向 → 不算成员
+                    skill_ext("x", "ui-guidelines", "required"),
+                ],
+                vec![
+                    edge("d1", "c", "m1", Some("dispatch")),
+                    edge("d2", "c", "m2", Some("dispatch")),
+                    edge("b1", "x", "m1", Some("pass")),
+                ],
+            ) }),
+        );
+        validate_graph(&g).unwrap();
+        let plan = squad_plan(&g, "team", &BTreeMap::new()).unwrap();
+        assert_eq!(plan.coordinator.as_deref(), Some("cto"));
+        assert_eq!(plan.members.len(), 2);
+        let m1 = plan.members.iter().find(|m| m.agent == "explore").unwrap();
+        assert!(m1.required);
+        assert_eq!(m1.grants.len(), 1);
+        assert_eq!(m1.grants[0].target, "ui-guidelines");
+        let m2 = plan.members.iter().find(|m| m.agent == "reviewer").unwrap();
+        assert!(!m2.required);
+        assert!(m2.grants.is_empty());
+        // 未连接的成员不进 plan
+        assert!(!plan.members.iter().any(|m| m.agent == "general"));
+        assert!(squad_plan(&g, "nope", &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn squad_plan_coordinator_grants() {
+        // ext --pass--> 指挥：绑定进 coordinator_grants（不进成员 grants）。
+        let g = graph_with_squads(
+            vec![squad_node("sq", "team")],
+            vec![],
+            json!({ "team": squad_json(
+                vec![
+                    member_node("c", "cto", true),
+                    member_node("m", "explore", true),
+                    skill_ext("xc", "plan-review", "required"),
+                    skill_ext("xm", "ui-guidelines", "required"),
+                ],
+                vec![
+                    edge("d1", "c", "m", Some("dispatch")),
+                    edge("b1", "xc", "c", Some("pass")),
+                    edge("b2", "xm", "m", Some("pass")),
+                ],
+            ) }),
+        );
+        validate_graph(&g).unwrap();
+        let plan = squad_plan(&g, "team", &BTreeMap::new()).unwrap();
+        assert_eq!(plan.coordinator.as_deref(), Some("cto"));
+        assert_eq!(plan.coordinator_grants.len(), 1);
+        assert_eq!(plan.coordinator_grants[0].target, "plan-review");
+        assert!(plan.coordinator_grants[0].required);
+        // 成员 grants 不受指挥绑定污染。
+        let member = plan.members.iter().find(|m| m.agent == "explore").unwrap();
+        assert_eq!(member.grants.len(), 1);
+        assert_eq!(member.grants[0].target, "ui-guidelines");
+        // 并行态：无指挥 → coordinator_grants 恒空。
+        let g2 = graph_with_squads(
+            vec![squad_node("sq", "team")],
+            vec![],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        let plan2 = squad_plan(&g2, "team", &BTreeMap::new()).unwrap();
+        assert!(plan2.coordinator.is_none() && plan2.coordinator_grants.is_empty());
+    }
+
+    #[test]
+    fn squad_plan_parallel_mode_and_squad_grants() {
+        let g = graph_with_squads(
+            vec![
+                skill_ext("gx", "ui-guidelines", "required"),
+                squad_node("sq", "team"),
+            ],
+            vec![edge("ge", "gx", "sq", Some("pass"))],
+            json!({ "team": squad_json(
+                vec![member_node("m1", "explore", true), member_node("m2", "reviewer", false)],
+                vec![],
+            ) }),
+        );
+        validate_graph(&g).unwrap();
+        let plan = squad_plan(&g, "team", &BTreeMap::new()).unwrap();
+        // 无 dispatch 边 → 并行军团：全部成员，无指挥。
+        assert!(plan.coordinator.is_none());
+        assert_eq!(plan.members.len(), 2);
+        // 主图 Extension → Squad = 军团级授权。
+        assert_eq!(plan.squad_grants.len(), 1);
+        assert_eq!(plan.squad_grants[0].target, "ui-guidelines");
+    }
+
+    #[test]
+    fn squad_node_eval_transparent() {
+        // squad 装配节点不参与调用求值。
+        let g = graph_with_squads(
+            vec![
+                node("t", "trigger", json!({"action":"modify","targetDir":"src"})),
+                skill_ext("x", "ui-guidelines", "required"),
+                squad_node("sq", "team"),
+            ],
+            vec![edge("e1", "t", "x", Some("out")), edge("e2", "x", "sq", Some("pass"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        let snap = snapshot();
+        let hit = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert!(hit.blocked);
         let pass = evaluate(
             &g,
             &write_call("src/a.ts", "x"),

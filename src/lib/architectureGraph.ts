@@ -3,7 +3,7 @@
 /// 画布给即时反馈，Rust 保存/执行时做权威判定）。
 import type {
   ArchitectureGraph, ExtensionData, ExtensionKind, GraphEdge, GraphNode,
-  GraphNodeData, SatisfyScope, TriggerAction,
+  GraphNodeData, SatisfyScope, SquadGraph, TriggerAction,
 } from '../api/architecture';
 import type { AgentDefinition } from '../api/agents';
 import type { ArchitectureTraceStep } from '../api/types';
@@ -44,6 +44,7 @@ export const NODE_LABELS: Record<NodeKind, string> = {
   action: '结果动作',
   extension: '扩展',
   subagent: '子智能体',
+  squad: '军团',
 };
 
 export const ACTION_LABELS: Record<TriggerAction, string> = {
@@ -63,7 +64,28 @@ export function createNode(kind: NodeKind, position: { x: number; y: number }, s
     data.extension = { kind: 'skill', name: '', target: '', requirement: 'required', scope: 'session', params: {} };
   }
   if (kind === 'subagent' && !data.agent) data.agent = 'explore';
+  if (kind === 'squad' && !data.squad) data.squad = nextSquadName();
   return { id: nextId(), type: 'maestro', position, data };
+}
+
+/// 军团名缺省生成：team-N（字母/数字/-/_ 合法字符集）。
+export function nextSquadName(taken: ReadonlySet<string> = new Set()): string {
+  for (let i = 1; i < 1000; i++) {
+    const name = `team-${i}`;
+    if (!taken.has(name)) return name;
+  }
+  return `team-${Date.now().toString(36)}`;
+}
+
+/// 新军团子图骨架：general 指挥 --dispatch--> explore 必选成员。
+/// 拖入 squad 物料即预置——开箱见两层 CTO 树；删掉 dispatch 边退化并行军团。
+export function squadSkeleton(): { nodes: SandboxNode[]; edges: SandboxEdge[] } {
+  const coordinator = createNode('subagent', { x: 0, y: 0 }, { agent: 'general', requirement: 'required' });
+  const member = createNode('subagent', { x: 0, y: 170 }, { agent: 'explore', requirement: 'required' });
+  return {
+    nodes: [coordinator, member],
+    edges: [{ id: nextId(), source: coordinator.id, target: member.id, sourceHandle: 'dispatch', targetHandle: 'in', type: 'maestro' }],
+  };
 }
 
 export function createExtensionNode(
@@ -107,6 +129,8 @@ export function nodeSummary(node: SandboxNode | GraphNode): string {
     }
     case 'subagent':
       return `type=${data.agent?.trim() || '（未配置）'} · 装配终点`;
+    case 'squad':
+      return `军团 ${data.squad?.trim() || '（未配置）'} · spawn_subagent 可调用`;
   }
 }
 
@@ -163,7 +187,8 @@ const handlesFor = (node: SandboxNode): string[] => {
     case 'extension':
       return node.data.extension?.requirement === 'optional' ? ['pass'] : ['pass', 'fail'];
     case 'action':
-    case 'subagent': return [];
+    case 'subagent':
+    case 'squad': return [];
   }
 };
 
@@ -223,9 +248,10 @@ export function isConnectionAllowed(
   if (source.id === target.id) return { ok: false, reason: '不能连接自身' };
   if (source.data.nodeType === 'action') return { ok: false, reason: 'Action 是终点，不能作为起点' };
   if (source.data.nodeType === 'subagent') return { ok: false, reason: 'Subagent 是装配终点，不能作为起点' };
+  if (source.data.nodeType === 'squad') return { ok: false, reason: 'Squad 是装配终点，不能作为起点' };
   if (target.data.nodeType === 'trigger') return { ok: false, reason: 'Trigger 是起点，不能作为目标' };
-  if (target.data.nodeType === 'subagent' && source.data.nodeType !== 'extension') {
-    return { ok: false, reason: 'Subagent 只接受扩展节点入边' };
+  if ((target.data.nodeType === 'subagent' || target.data.nodeType === 'squad') && source.data.nodeType !== 'extension') {
+    return { ok: false, reason: `${NODE_LABELS[target.data.nodeType]} 只接受扩展节点入边` };
   }
   if ((candidate.targetHandle ?? 'in') !== 'in') return { ok: false, reason: '目标仅接受入口 Handle' };
   // 缺省出口按 source 类型取默认 Handle（与 Rust None 语义一致）：
@@ -240,9 +266,9 @@ export function isConnectionAllowed(
         : '该 Handle 不支持从此节点出发',
     };
   }
-  // 装配连线仅表达「授予」：扩展 → Subagent 只允许 pass（缺省出口按 pass 计）。
-  if (target.data.nodeType === 'subagent' && handle === 'fail') {
-    return { ok: false, reason: '扩展 → Subagent 装配边只能使用 pass 出口' };
+  // 装配连线仅表达「授予」：扩展 → Subagent/Squad 只允许 pass（缺省出口按 pass 计）。
+  if ((target.data.nodeType === 'subagent' || target.data.nodeType === 'squad') && handle === 'fail') {
+    return { ok: false, reason: '扩展 → 装配终点的连线只能使用 pass 出口' };
   }
   // 存储边的缺省出口同样按 source 类型归一化（trigger→out，其余→pass）再比较。
   const defaultHandle = source.data.nodeType === 'trigger' ? 'out' : 'pass';
@@ -255,14 +281,143 @@ export function isConnectionAllowed(
   return { ok: true };
 }
 
-/// 边的语义色：fail → 红；目标为 warn Action → 黄；pass/out → 默认。
-export function edgeTone(edge: SandboxEdge, nodes: SandboxNode[]): 'fail' | 'warn' | 'default' {
-  if ((edge.sourceHandle ?? 'out') === 'fail') return 'fail';
+/// 边的语义色：fail → 红；目标为 warn Action → 黄；dispatch（指挥→成员）→ 紫；pass/out → 默认。
+export function edgeTone(edge: SandboxEdge, nodes: SandboxNode[]): 'fail' | 'warn' | 'dispatch' | 'default' {
+  const handle = edge.sourceHandle ?? 'out';
+  if (handle === 'fail') return 'fail';
+  if (handle === 'dispatch') return 'dispatch';
   const target = nodes.find((node) => node.id === edge.target);
   if (target?.data.nodeType === 'action') {
     return target.data.result === 'warn' ? 'warn' : 'fail';
   }
   return 'default';
+}
+
+// ---- 军团内部画布（subnet 子沙盘）：节点仅 subagent/extension；调度用 dispatch 出口 ----
+
+/// 指挥节点 id：dispatch 出边源（全图至多一个，校验保证）。
+export function squadCoordinatorId(nodes: SandboxNode[], edges: SandboxEdge[]): string | null {
+  const edge = edges.find((item) => (item.sourceHandle ?? '') === 'dispatch');
+  return edge?.source ?? null;
+}
+
+/// 军团内连线规则（镜像 Rust validate_squad）：
+/// extension --pass--> 成员；成员 --dispatch--> 成员；指挥唯一且不可被 dispatch 指向；DAG。
+export function isSquadConnectionAllowed(
+  nodes: SandboxNode[],
+  edges: SandboxEdge[],
+  candidate: ConnectionCandidate,
+): { ok: boolean; reason?: string } {
+  const source = nodes.find((node) => node.id === candidate.source);
+  const target = nodes.find((node) => node.id === candidate.target);
+  if (!source || !target) return { ok: false, reason: '节点不存在' };
+  if (source.id === target.id) return { ok: false, reason: '不能连接自身' };
+  if (target.data.nodeType !== 'subagent') return { ok: false, reason: '军团内只能指向成员（子智能体节点）' };
+  if ((candidate.targetHandle ?? 'in') !== 'in') return { ok: false, reason: '目标仅接受入口 Handle' };
+  if (source.data.nodeType === 'extension') {
+    const handle = candidate.sourceHandle ?? 'pass';
+    if (handle !== 'pass') return { ok: false, reason: '扩展 → 成员只能使用 pass 出口' };
+  } else if (source.data.nodeType === 'subagent') {
+    const handle = candidate.sourceHandle ?? 'dispatch';
+    if (handle !== 'dispatch') return { ok: false, reason: '成员的调度出边只能使用 dispatch 出口' };
+    const coordinator = squadCoordinatorId(nodes, edges);
+    if (coordinator && coordinator !== source.id) {
+      return { ok: false, reason: '军团至多一个指挥（已有 dispatch 出边源）' };
+    }
+    if (target.id === coordinator || edges.some((edge) => (edge.sourceHandle ?? '') === 'dispatch' && edge.target === source.id)) {
+      return { ok: false, reason: '指挥不能被 dispatch 指向' };
+    }
+  } else {
+    return { ok: false, reason: '军团内只允许 子智能体/扩展 节点' };
+  }
+  const handle = candidate.sourceHandle ?? (source.data.nodeType === 'extension' ? 'pass' : 'dispatch');
+  if (edges.some((edge) => edge.source === source.id && edge.target === target.id && (edge.sourceHandle ?? handle) === handle)) {
+    return { ok: false, reason: '重复连线' };
+  }
+  if (wouldCreateCycle(nodes, edges, source.id, target.id)) {
+    return { ok: false, reason: '会形成环（军团内部必须是 DAG）' };
+  }
+  return { ok: true };
+}
+
+/// 军团内容限制：只允许 subagent/extension 节点（供放置过滤）。
+export const SQUAD_NODE_KINDS: ReadonlySet<NodeKind> = new Set(['subagent', 'extension']);
+
+/// 军团内部校验（镜像 Rust validate_squad）：节点类型、成员数、边规则、指挥唯一、DAG。
+export function validateSquadDraft(name: string, nodes: SandboxNode[], edges: SandboxEdge[]): string[] {
+  const errors: string[] = [];
+  if (nodes.length > 48) errors.push(`军团 ${name} 节点数超过 48 上限`);
+  if (edges.length > 96) errors.push(`军团 ${name} 边数超过 96 上限`);
+  let members = 0;
+  const ids = new Set<string>();
+  for (const node of nodes) {
+    if (ids.has(node.id)) errors.push(`军团 ${name} 节点 id 重复：${node.id}`);
+    ids.add(node.id);
+    if (!SQUAD_NODE_KINDS.has(node.data.nodeType)) {
+      errors.push(`军团 ${name} 只允许 子智能体/扩展 节点（${node.data.nodeType} 非法）`);
+      continue;
+    }
+    if (node.data.nodeType === 'subagent') {
+      members += 1;
+      const agent = node.data.agent?.trim() ?? '';
+      if (!agent) errors.push(`军团 ${name} 成员 ${node.id} 缺少 agent 类型名`);
+      else if (agent.length > 64 || !/^[A-Za-z0-9_-]+$/.test(agent)) {
+        errors.push(`军团 ${name} 成员 ${node.id} 的 agent 名必须为字母/数字/-/_`);
+      }
+    }
+    if (node.data.nodeType === 'extension' && !node.data.extension?.target?.trim()) {
+      errors.push(`军团 ${name} 扩展节点 ${node.id} 缺少 target`);
+    }
+  }
+  if (members === 0) errors.push(`军团 ${name} 没有成员子智能体`);
+  if (members > 12) errors.push(`军团 ${name} 成员数超过 12 上限`);
+  for (const edge of edges) {
+    const check = isSquadConnectionAllowed(nodes, edges.filter((item) => item.id !== edge.id), edge);
+    if (!check.ok && check.reason !== '重复连线') errors.push(`军团 ${name} 边 ${edge.id}：${check.reason}`);
+  }
+  return errors;
+}
+
+/// 军团内部树状排列：指挥置顶行，dispatch 成员第二层，孤立成员同行排布，扩展挂到成员右侧。
+/// BFS 层级 + 每行均匀横排——简单确定性布局，不引第三方布局库。
+export function layoutSquadTree(nodes: SandboxNode[], edges: SandboxEdge[]): SandboxNode[] {
+  const GAP_X = 240;
+  const GAP_Y = 150;
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const depth = new Map<string, number>();
+  const coordinator = squadCoordinatorId(nodes, edges);
+  // dispatch 图 BFS 定层；扩展与孤儿节点后置。
+  const roots = coordinator ? [coordinator] : nodes.filter((node) => node.data.nodeType === 'subagent').map((node) => node.id);
+  const queue: [string, number][] = roots.map((id) => [id, 0]);
+  while (queue.length) {
+    const [id, level] = queue.shift()!;
+    if (depth.has(id)) continue;
+    depth.set(id, level);
+    for (const edge of edges) {
+      if (edge.source !== id || (edge.sourceHandle ?? '') !== 'dispatch') continue;
+      queue.push([edge.target, level + 1]);
+    }
+  }
+  // 未在 dispatch 树上的成员放最后一层；扩展挂在最深成员层之下。
+  const memberDepths = nodes.filter((node) => node.data.nodeType === 'subagent').map((node) => depth.get(node.id) ?? -1);
+  const orphanLevel = memberDepths.length ? Math.max(...memberDepths, 0) + 1 : 0;
+  const extLevel = orphanLevel + 1;
+  const rows = new Map<number, SandboxNode[]>();
+  for (const node of nodes) {
+    const level = node.data.nodeType === 'extension'
+      ? extLevel
+      : (depth.get(node.id) ?? orphanLevel);
+    const row = rows.get(level) ?? [];
+    row.push(node);
+    rows.set(level, row);
+  }
+  const positioned = new Map<string, { x: number; y: number }>();
+  for (const [level, row] of rows) {
+    row.forEach((node, index) => {
+      positioned.set(node.id, { x: index * GAP_X - ((row.length - 1) * GAP_X) / 2, y: level * GAP_Y });
+    });
+  }
+  return nodes.map((node) => ({ ...node, position: positioned.get(node.id) ?? node.position }));
 }
 
 // ---- 校验与序列化 ---------------------------------------------------------------
@@ -322,6 +477,7 @@ export function validateDraft(
   nodes: SandboxNode[],
   edges: SandboxEdge[],
   known?: KnownExtensions,
+  squads?: Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>,
 ): DraftValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -376,6 +532,18 @@ export function validateDraft(
         }
         break;
       }
+      case 'squad': {
+        const name = data.squad?.trim() ?? '';
+        if (!name) errors.push(`军团 ${node.id} 缺少 squad 军团名`);
+        else if (name.length > 64 || !/^[A-Za-z0-9_-]+$/.test(name)) {
+          errors.push(`军团 ${node.id} 的军团名必须为字母/数字/-/_`);
+        }
+        if (data.scope === 'each') errors.push(`军团 ${node.id} 的 scope=每次 仅对前置要求/扩展有效`);
+        if (name && squads && !squads[name]) {
+          errors.push(`军团 ${node.id} 引用的军团 ${name} 不存在于 squads（双击节点进入编辑后重试）`);
+        }
+        break;
+      }
       case 'extension': {
         const ext = data.extension;
         if (!ext?.kind || !ext.target?.trim()) {
@@ -421,29 +589,71 @@ export function validateDraft(
   }
   // 环检测（整体）
   if (hasCycle(nodes, edges)) errors.push('规则图存在环（必须是 DAG）');
+  // 军团引用唯一性 + 内部结构（镜像 Rust validate_squads）。
+  if (squads) {
+    const referenced = new Set<string>();
+    for (const node of nodes) {
+      if (node.data.nodeType !== 'squad') continue;
+      const name = node.data.squad?.trim() ?? '';
+      if (!name) continue;
+      // Set.add 返回集合本身而非“是否新增”——必须先 has 再 add。
+      if (referenced.has(name)) errors.push(`Squad 节点重名：${name}`);
+      referenced.add(name);
+    }
+    for (const [name, draft] of Object.entries(squads)) {
+      errors.push(...validateSquadDraft(name, draft.nodes, draft.edges));
+      if (known?.agents) {
+        for (const node of draft.nodes) {
+          if (node.data.nodeType !== 'subagent') continue;
+          const agent = node.data.agent?.trim() ?? '';
+          if (agent && !known.agents.some((item) => item.name === agent && item.mode === 'subagent' && !item.hidden)) {
+            warnings.push(`军团 ${name} 成员 ${agent} 未定义或未启用（hidden/非 subagent 模式）：指挥派发时将报错`);
+          }
+        }
+      }
+    }
+  }
   return { errors, warnings };
 }
 
+const serializeNodes = (nodes: SandboxNode[]): GraphNode[] =>
+  nodes.map((node) => {
+    const { nodeType, ...data } = node.data;
+    return {
+      id: node.id,
+      type: nodeType,
+      position: { x: node.position.x, y: node.position.y },
+      data: stripEmpty(data),
+    } satisfies GraphNode;
+  });
+
+const serializeEdges = (edges: SandboxEdge[]): GraphEdge[] =>
+  edges.map((edge) => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    ...(edge.sourceHandle != null ? { sourceHandle: edge.sourceHandle } : {}),
+    targetHandle: edge.targetHandle ?? 'in',
+  }));
+
+/// 军团子图序列化：与主图同套节点/边结构，无 version/squads 嵌套。
+export function serializeSquad(nodes: SandboxNode[], edges: SandboxEdge[]): SquadGraph {
+  return { nodes: serializeNodes(nodes), edges: serializeEdges(edges) };
+}
+
 /// RF 运行时结构 → 持久化 JSON：剥离 RF 字段，`data.nodeType` → `type`。
-export function serializeGraph(nodes: SandboxNode[], edges: SandboxEdge[]): ArchitectureGraph {
+export function serializeGraph(
+  nodes: SandboxNode[],
+  edges: SandboxEdge[],
+  squads?: Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>,
+): ArchitectureGraph {
+  const squadEntries = Object.entries(squads ?? {})
+    .map(([name, draft]) => [name, serializeSquad(draft.nodes, draft.edges)] as const);
   return {
     version: 1,
-    nodes: nodes.map((node) => {
-      const { nodeType, ...data } = node.data;
-      return {
-        id: node.id,
-        type: nodeType,
-        position: { x: node.position.x, y: node.position.y },
-        data: stripEmpty(data),
-      } satisfies GraphNode;
-    }),
-    edges: edges.map((edge) => ({
-      id: edge.id,
-      source: edge.source,
-      target: edge.target,
-      ...(edge.sourceHandle != null ? { sourceHandle: edge.sourceHandle } : {}),
-      targetHandle: edge.targetHandle ?? 'in',
-    })),
+    nodes: serializeNodes(nodes),
+    edges: serializeEdges(edges),
+    ...(squadEntries.length ? { squads: Object.fromEntries(squadEntries) } : {}),
   };
 }
 
@@ -462,6 +672,8 @@ const stripEmpty = (data: GraphNodeData): GraphNodeData => {
   if (data.result) out.result = data.result;
   if (data.message?.trim()) out.message = data.message.trim();
   if (data.agent?.trim()) out.agent = data.agent.trim();
+  if (data.squad?.trim()) out.squad = data.squad.trim();
+  if (data.requirement) out.requirement = data.requirement;
   if (data.extension?.kind && data.extension.target?.trim()) {
     const ext = data.extension;
     out.extension = {
@@ -479,16 +691,33 @@ const stripEmpty = (data: GraphNodeData): GraphNodeData => {
   return out;
 };
 
-/// 持久化 JSON → 画布结构。
-export function deserializeGraph(graph: ArchitectureGraph): { nodes: SandboxNode[]; edges: SandboxEdge[] } {
+const deserializeNodes = (nodes: GraphNode[]): SandboxNode[] =>
+  nodes.map((node) => ({
+    id: node.id,
+    type: 'maestro',
+    position: node.position,
+    data: { ...node.data, nodeType: node.type },
+  }));
+
+const deserializeEdges = (edges: GraphEdge[]): SandboxEdge[] =>
+  edges.map((edge) => ({ ...edge, targetHandle: edge.targetHandle ?? 'in', type: 'maestro' }));
+
+/// 持久化 JSON → 画布结构（含军团子图：squad 节点 data.squad 引用 squads 键）。
+export function deserializeGraph(graph: ArchitectureGraph): {
+  nodes: SandboxNode[];
+  edges: SandboxEdge[];
+  squads: Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>;
+} {
+  const squads = Object.fromEntries(
+    Object.entries(graph.squads ?? {}).map(([name, squad]) => [
+      name,
+      { nodes: deserializeNodes(squad.nodes), edges: deserializeEdges(squad.edges) },
+    ]),
+  );
   return {
-    nodes: graph.nodes.map((node) => ({
-      id: node.id,
-      type: 'maestro',
-      position: node.position,
-      data: { ...node.data, nodeType: node.type },
-    })),
-    edges: graph.edges.map((edge) => ({ ...edge, targetHandle: edge.targetHandle ?? 'in', type: 'maestro' })),
+    nodes: deserializeNodes(graph.nodes),
+    edges: deserializeEdges(graph.edges),
+    squads,
   };
 }
 
@@ -504,7 +733,13 @@ export interface SandboxTemplate {
   id: string;
   label: string;
   description: string;
-  build: (seed: TemplateSeed) => { nodes: SandboxNode[]; edges: SandboxEdge[] };
+  /// `squads` 为模板携带的军团子图：键是占位军团名，插入时防重名改名并
+  /// 同步改写 squad 节点的 data.squad；子图节点/边有独立 id 空间。
+  build: (seed: TemplateSeed) => {
+    nodes: SandboxNode[];
+    edges: SandboxEdge[];
+    squads?: Record<string, { nodes: SandboxNode[]; edges: SandboxEdge[] }>;
+  };
 }
 
 const edge = (source: SandboxNode, target: SandboxNode, handle: 'out' | 'pass' | 'fail'): SandboxEdge =>
@@ -648,6 +883,21 @@ export const SANDBOX_TEMPLATES: SandboxTemplate[] = [
       const requirement = createNode('requirement', at(360, 160), { updatePlan: true, scope: 'each' });
       const action = createNode('action', at(660, 160), { result: 'block', message: '每次修改前请先 update_plan 提交当前计划。' });
       return { nodes: [trigger, requirement, action], edges: [edge(trigger, requirement, 'out'), edge(requirement, action, 'fail')] };
+    },
+  },
+  {
+    id: 'squad-team',
+    label: '示例：调研军团',
+    description: '军团节点（双击进子图）：general 指挥 派发→ explore 必选成员；可选 Skill 连军团 = 全员共享授权',
+    build: (seed) => {
+      const skill = pickSkill(seed, 'code-review');
+      const squad = createNode('squad', at(200, 180), { squad: 'research-team' });
+      const ext = createExtensionNode(at(200, 330), { kind: 'skill', name: skill, target: skill, requirement: 'optional', scope: 'run' });
+      return {
+        nodes: [squad, ext],
+        edges: [edge(ext, squad, 'pass')],
+        squads: { 'research-team': squadSkeleton() },
+      };
     },
   },
 ];

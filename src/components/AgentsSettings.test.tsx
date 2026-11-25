@@ -16,9 +16,10 @@ const mockList = (agents: AgentDefinition[]) => {
   mocks.invoke.mockImplementation(async (command: string) => {
     switch (command) {
       case 'list_agents': return structuredClone(agents);
+      case 'get_agent_defaults': return { model: null, steps: null, toolBudget: null, maxParallel: null, maxTotal: null };
+      case 'save_agent_defaults': return;
       case 'get_workspace_info': return { name: 'ws', path: 'E:/ws' };
-      case 'save_agent':
-      case 'delete_agent': return;
+      case 'save_agent': return;
       default: throw new Error(`Unexpected command ${command}`);
     }
   });
@@ -27,58 +28,92 @@ const mockList = (agents: AgentDefinition[]) => {
 beforeEach(() => mockList(builtin));
 
 describe('AgentsSettings', () => {
-  it('marks builtin agents and keeps them undeletable', async () => {
+  it('lists agents in a source-grouped picker and opens the editor on selection', async () => {
+    mockList([...builtin, custom]);
     render(<AgentsSettings preview={false} />);
-    expect(await screen.findByText('explore')).toBeInTheDocument();
-    expect(screen.getAllByText('内置')).toHaveLength(2);
-    expect(screen.getByLabelText('删除 explore')).toBeDisabled();
+    const picker = await screen.findByLabelText('选择要配置的子智能体');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'reviewer' })).toBeInTheDocument());
+    expect(screen.getByRole('group', { name: '内置' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '全局' })).toBeInTheDocument();
+
+    fireEvent.change(picker, { target: { value: 'reviewer' } });
+    expect(screen.getByLabelText('名称')).toBeDisabled();
+    expect(screen.getByText(/保存到全局作用域/)).toBeInTheDocument();
     expect(mocks.invoke).toHaveBeenCalledWith('list_agents', { scope: 'all' });
   });
 
-  it('creates a global agent with the read-only tool selection', async () => {
+  it('notes that editing a builtin agent writes a global override', async () => {
     render(<AgentsSettings preview={false} />);
-    await screen.findByText('explore');
-    fireEvent.click(screen.getByRole('button', { name: '新建' }));
+    const picker = await screen.findByLabelText('选择要配置的子智能体');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'explore' })).toBeInTheDocument());
+    fireEvent.change(picker, { target: { value: 'explore' } });
+    expect(screen.getByText(/保存会写入全局覆盖文件/)).toBeInTheDocument();
+  });
+
+  it('opens a fresh draft when the deep link carries name=null', async () => {
+    render(<AgentsSettings preview={false} focus={{ name: null, tick: 1 }} />);
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'reviewer' } });
     fireEvent.change(screen.getByLabelText('描述'), { target: { value: '代码评审' } });
+    fireEvent.change(screen.getByLabelText('工具预算（次，留空继承）'), { target: { value: '250' } });
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
       scope: 'global',
-      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', toolBudget: 100, source: 'global' }),
+      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', toolBudget: 250, source: 'global' }),
     }));
   });
 
-  it('saves an edited tool budget', async () => {
-    render(<AgentsSettings preview={false} />);
-    await screen.findByText('explore');
-    fireEvent.click(screen.getByRole('button', { name: '新建' }));
-    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'scout' } });
-    fireEvent.change(screen.getByLabelText('工具预算（次）'), { target: { value: '250' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存' }));
-
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
-      scope: 'global',
-      agent: expect.objectContaining({ name: 'scout', toolBudget: 250 }),
-    }));
-  });
-
-  it('deletes a custom agent from its own scope', async () => {
+  it('opens the focused agent from the deep link once the list loads', async () => {
     mockList([...builtin, custom]);
-    render(<AgentsSettings preview={false} />);
-    await screen.findByText('reviewer');
-    fireEvent.click(screen.getByLabelText('删除 reviewer'));
-    fireEvent.click(await screen.findByRole('button', { name: '删除' }));
-
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('delete_agent', { scope: 'global', name: 'reviewer' }));
-  });
-
-  it('keeps edits to an existing agent name-locked', async () => {
-    mockList([...builtin, custom]);
-    render(<AgentsSettings preview={false} />);
-    await screen.findByText('reviewer');
-    fireEvent.click(screen.getAllByRole('button', { name: '编辑' }).at(-1)!);
+    render(<AgentsSettings preview={false} focus={{ name: 'reviewer', tick: 1 }} />);
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('reviewer'));
     expect(screen.getByLabelText('名称')).toBeDisabled();
-    expect(screen.getByText(/保存到全局作用域/)).toBeInTheDocument();
+  });
+
+  it('saves global defaults through save_agent_defaults', async () => {
+    render(<AgentsSettings preview={false} />);
+    await screen.findByLabelText('选择要配置的子智能体');
+    fireEvent.change(screen.getByLabelText('默认轮次上限'), { target: { value: '12' } });
+    fireEvent.change(screen.getByLabelText('单 run 总额度'), { target: { value: '12' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent_defaults', {
+      defaults: expect.objectContaining({ steps: 12, maxTotal: 12 }),
+    }));
+  });
+
+  it('persists blank numeric fields as null so they inherit the global default', async () => {
+    render(<AgentsSettings preview={false} focus={{ name: null, tick: 1 }} />);
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'scout' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
+      scope: 'global',
+      agent: expect.objectContaining({ name: 'scout', steps: null, toolBudget: null }),
+    }));
+  });
+
+  it('toggles the hidden disable flag and persists it on save', async () => {
+    mockList([...builtin, custom]);
+    render(<AgentsSettings preview={false} />);
+    const picker = await screen.findByLabelText('选择要配置的子智能体');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'reviewer' })).toBeInTheDocument());
+    fireEvent.change(picker, { target: { value: 'reviewer' } });
+    const toggle = screen.getByRole('checkbox', { name: /禁用/ });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
+      scope: 'global',
+      agent: expect.objectContaining({ name: 'reviewer', hidden: true }),
+    }));
+  });
+
+  it('keeps management UI out of settings', async () => {
+    render(<AgentsSettings preview={false} />);
+    await screen.findByLabelText('选择要配置的子智能体');
+    expect(screen.queryByLabelText('搜索子智能体')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '新建' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '本地导入' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'GitHub 导入' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^删除 /)).not.toBeInTheDocument();
   });
 });

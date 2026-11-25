@@ -71,8 +71,9 @@ const CORE_USAGE: Record<string, string> = {
   'gate:after-tool': '事后关卡：触发调用执行后欠下验收——模型须先调用指定工具，否则后续实质操作与结束回复都被拦。',
   'gate:after-plan': '事后关卡：触发调用执行后欠下验收——模型须先 update_plan，否则后续实质操作与结束回复都被拦。',
   'result:block': '链路终点：硬性拦截，提示语原样返回给模型，文件不落盘、命令不执行。留空自动按上游关卡生成；{call}/{target} 占位符手动引用。',
-  'result:warn': '链路终点：拦截并以「架构警告」语气提示模型，黄色语义。留空自动按上游关卡生成；支持 {call}/{target} 占位符。',
+  'result:warn': '链路终点：拦截并以警告语气提示模型，黄色语义。留空自动按上游关卡生成；支持 {call}/{target} 占位符。',
   'result:remind': '链路终点但放行：调用照常执行，提示语拼进工具结果喂给模型——做「时刻提醒」不阻断流程。留空自动生成提醒；支持 {call} 占位符。',
+  'agent:squad': '子沙盘封装：双击进入内部编排——成员节点用 dispatch 出口连成「指挥→成员」树，扩展节点 pass 出口给单个成员装配能力。spawn_subagent(type=军团名) 时：有指挥=指挥嵌套派发成员，无指挥=全员并行。主图扩展连入 = 全员共享授权。',
 };
 
 function coreItems(): LibraryItem[] {
@@ -223,6 +224,14 @@ function coreItems(): LibraryItem[] {
       category: ['流程关卡'],
       nodeKind: 'restriction',
       seed: { denyRule: '', scope: 'session' },
+    }),
+    item({
+      id: 'agent:squad',
+      title: '🏰 智能体军团',
+      subtitle: 'subnet 子沙盘：双击进入编排指挥→成员树，spawn_subagent 按名调用',
+      keywords: '军团 子沙盘 编排 subnet squad 团队 team 指挥 成员',
+      category: ['智能体'],
+      nodeKind: 'squad',
     }),
     item({
       id: 'result:block',

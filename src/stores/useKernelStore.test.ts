@@ -44,6 +44,12 @@ it('keeps task plans per session and projects the selected session plan', () => 
   expect(useKernelStore.getState().currentPlan).toHaveLength(1);
 });
 
+it('bumps extensionsTick on extensions_changed', () => {
+  const before = useKernelStore.getState().extensionsTick;
+  useKernelStore.getState().applySideEffects({ type: 'extensions_changed', sequence: 99 } as never);
+  expect(useKernelStore.getState().extensionsTick).toBe(before + 1);
+});
+
 it('marks a subagent cancelled when the finish event says so', () => {
   const trace = { id: 'sa-1', runId: 1, sessionId: 1, agent: 'explore', description: 'd', prompt: 'p',
     status: 'running', summary: '', error: null, content: '', reasoning: '', toolCount: 0,

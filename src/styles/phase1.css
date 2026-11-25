@@ -590,10 +590,18 @@ button:disabled {
 .right-split > .resizable-handle { width: 100%; height: 100%; flex: none; }
 .split-divider[data-dragging="true"] span { background: var(--color-primary); }
 .agents-settings { display: flex; flex-direction: column; gap: 12px; }
+.agents-section-title { margin: 14px 0 6px; color: var(--color-foreground-subtle); font-size: var(--text-ui-caption); font-weight: 600; }
+.agents-picker { display: grid; gap: 4px; margin: 4px 0 10px; color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
+.agents-picker select { width: 100%; padding: 6px 8px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-input); color: var(--color-foreground); font-size: var(--text-ui-caption); }
 .agents-toolbar { display: flex; align-items: center; gap: 8px; }
 .agents-search { display: flex; align-items: center; gap: 6px; flex: 1; height: 30px; padding: 0 8px; border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-foreground-subtlest); }
 .agents-search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--color-foreground); font-size: var(--text-ui-caption); outline: none; }
 .agents-count { color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
+.agents-filter { height: 30px; padding: 0 8px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-input); color: var(--color-foreground); font-size: var(--text-ui-caption); }
+.agents-bulkbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--color-primary-soft, var(--color-border)); border-radius: var(--radius-md); background: var(--color-panel-alt); }
+.agents-bulkbar-count { color: var(--color-foreground); font-size: var(--text-ui-caption); font-weight: 600; margin-right: 4px; }
+.agents-bulkbar .button-ghost { display: inline-flex; align-items: center; gap: 4px; }
+.agents-bulkbar-danger { color: var(--color-error, #f87171) !important; }
 .agents-list { display: grid; gap: 6px; }
 .agent-card { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-lg); background: var(--color-card); }
 .agent-card > div { min-width: 0; flex: 1; }
@@ -604,6 +612,11 @@ button:disabled {
 .agent-source[data-source="builtin"] { color: var(--color-primary); }
 .agent-card .icon-button:disabled { opacity: 0.4; cursor: not-allowed; }
 .agent-icon { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: var(--color-hover); }
+.agent-check { width: 14px; height: 14px; flex-shrink: 0; accent-color: var(--color-primary); cursor: pointer; }
+.agent-card.agent-disabled { opacity: 0.55; }
+.agent-card.agent-disabled strong { text-decoration: line-through; }
+.agent-disabled-badge { display: inline-flex; align-items: center; height: 16px; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--color-error-soft, #ef444422); color: var(--color-error, #f87171); font-size: var(--text-ui-xs); vertical-align: middle; }
+.agent-disabled-toggle { display: flex !important; flex-direction: row; align-items: center; gap: 8px; }
 .agent-editor { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-panel-alt); }
 .agent-editor label { display: grid; gap: 4px; color: var(--color-foreground-subtle); font-size: var(--text-ui-sm); }
 .agent-editor input, .agent-editor textarea, .agent-editor select { width: 100%; padding: 6px 8px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-input); color: var(--color-foreground); font-size: var(--text-ui-caption); }

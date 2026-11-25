@@ -51,11 +51,15 @@ export interface GraphNodeData {
   extension?: ExtensionData;
   /** 仅 subagent 节点：绑定的子智能体类型名（AgentDefinition.name）。 */
   agent?: string;
+  /** 仅 squad 节点：引用的军团名（squads 键）。 */
+  squad?: string;
+  /** 仅军团内成员（subagent）节点：必选/可选（默认 required）。 */
+  requirement?: ExtensionRequirement;
 }
 
 export interface GraphNode {
   id: string;
-  type: 'trigger' | 'requirement' | 'restriction' | 'action' | 'extension' | 'subagent';
+  type: 'trigger' | 'requirement' | 'restriction' | 'action' | 'extension' | 'subagent' | 'squad';
   position: GraphPosition;
   data: GraphNodeData;
 }
@@ -68,10 +72,19 @@ export interface GraphEdge {
   targetHandle?: string;
 }
 
+/** 军团内部子图（Houdini subnet）：仅 subagent/extension 节点。
+ * subagent 出边 sourceHandle="dispatch" 声明指挥→成员调度；extension --pass--> 成员 声明装配授权。 */
+export interface SquadGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 export interface ArchitectureGraph {
   version: number;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /** 智能体军团（subnet 子沙盘）：squad 节点 data.squad 引用这里的键。 */
+  squads?: Record<string, SquadGraph>;
 }
 
 export interface ArchitectureGraphView {

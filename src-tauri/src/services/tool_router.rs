@@ -46,6 +46,29 @@ pub struct SubagentGrant {
     pub body: Option<String>,
 }
 
+/// 军团运行时（spawn_subagent(type=squad) 解析产物）：指挥态嵌套派发，
+/// 并行态全员 fan-out；成员级与军团级授权已按 required 注入 Skill 正文。
+#[derive(Debug, Clone)]
+pub struct ResolvedSquad {
+    /// 指挥成员的 agent 类型；None = 并行军团（members 全员并行派生）。
+    pub coordinator: Option<String>,
+    /// 军团内 Extension → 指挥的装配授权（与成员 grants 同语义）。
+    pub coordinator_grants: Vec<SubagentGrant>,
+    /// 可派成员：指挥态 = dispatch 边目标；并行态 = 全部成员。
+    pub members: Vec<ResolvedSquadMember>,
+    /// 主图 Extension → Squad 的军团级授权（指挥与全部成员共享）。
+    pub squad_grants: Vec<SubagentGrant>,
+}
+
+/// 军团成员：agent 类型 + 必选性 + 军团内装配授权。
+#[derive(Debug, Clone)]
+pub struct ResolvedSquadMember {
+    pub agent: String,
+    pub required: bool,
+    /// 军团内 Extension → 该成员的装配授权。
+    pub grants: Vec<SubagentGrant>,
+}
+
 /// What `execute` produces: bounded text for the model plus, for workspace
 /// writes, the before/after contents the UI diffs in the tool row.
 pub struct ToolOutcome {
@@ -359,8 +382,23 @@ impl ToolRouter {
         let Some(graph) = graph else { return Vec::new() };
         let trusted = self.trusted_project_root(workspace_root).await;
         let maestro = self.extensions.maestro_dir();
-        let plugins = self
-            .extensions
+        let plugins = self.resolved_plugins(workspace_root).await;
+        let bindings = crate::domain::subagent_bindings(&graph, agent, &plugins);
+        bindings
+            .into_iter()
+            .take(8)
+            .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+            .collect()
+    }
+
+    /// 插件清单 → domain `ResolvedPlugin` 映射（subagent_grants / squad_plan 共用）。
+    async fn resolved_plugins(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, ResolvedPlugin> {
+        let trusted = self.trusted_project_root(workspace_root).await;
+        let maestro = self.extensions.maestro_dir();
+        self.extensions
             .plugins
             .manifests(maestro, trusted.as_deref())
             .into_iter()
@@ -377,25 +415,83 @@ impl ToolRouter {
                     },
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let bindings = crate::domain::subagent_bindings(&graph, agent, &plugins);
-        bindings
-            .into_iter()
-            .take(8)
-            .map(|binding| {
-                // 必选 Skill 正文预注入（与 architecture_brief 同口径 ≤8KB）。
-                let body = if binding.kind == ExtensionKind::Skill && binding.required {
-                    self.extensions
-                        .skills
-                        .body(&binding.target, maestro, trusted.as_deref())
-                        .ok()
-                        .map(|text| text.chars().take(8192).collect::<String>())
-                } else {
-                    None
-                };
-                SubagentGrant { binding, body }
-            })
             .collect()
+    }
+
+    /// 军团编排解析：`squads[name]` → 指挥/成员/各级装配授权（插件已展开）。
+    /// spawn_subagent 解析 subagent_type 时 agent 定义未命中再走这里。
+    pub async fn squad_plan(
+        &self,
+        workspace_root: Option<&Path>,
+        squad: &str,
+    ) -> Option<crate::domain::SquadPlan> {
+        let (graph, error) = {
+            let state = self.architecture.lock().await;
+            (state.graph.clone(), state.error.clone())
+        };
+        if error.is_some() {
+            return None;
+        }
+        let graph = graph?;
+        let plugins = self.resolved_plugins(workspace_root).await;
+        crate::domain::squad_plan(&graph, squad, &plugins)
+    }
+
+    /// BoundExtension → SubagentGrant：required Skill 附 ≤8KB 预注入正文。
+    fn grant_with_body(
+        &self,
+        binding: crate::domain::BoundExtension,
+        maestro: &Path,
+        trusted: Option<&Path>,
+    ) -> SubagentGrant {
+        let body = if binding.kind == ExtensionKind::Skill && binding.required {
+            self.extensions
+                .skills
+                .body(&binding.target, maestro, trusted)
+                .ok()
+                .map(|text| text.chars().take(8192).collect::<String>())
+        } else {
+            None
+        };
+        SubagentGrant { binding, body }
+    }
+
+    /// 军团运行时解析：指挥/成员/各级装配授权（required Skill 正文已注入）。
+    /// 成员/孙级派发不允许再走这里（agent_loop 以 resolve_squad=false 递归）。
+    pub async fn squad_runtime(
+        &self,
+        workspace_root: Option<&Path>,
+        squad: &str,
+    ) -> Option<ResolvedSquad> {
+        let plan = self.squad_plan(workspace_root, squad).await?;
+        let trusted = self.trusted_project_root(workspace_root).await;
+        let maestro = self.extensions.maestro_dir();
+        Some(ResolvedSquad {
+            coordinator: plan.coordinator,
+            coordinator_grants: plan
+                .coordinator_grants
+                .into_iter()
+                .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                .collect(),
+            members: plan
+                .members
+                .into_iter()
+                .map(|member| ResolvedSquadMember {
+                    agent: member.agent,
+                    required: member.required,
+                    grants: member
+                        .grants
+                        .into_iter()
+                        .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                        .collect(),
+                })
+                .collect(),
+            squad_grants: plan
+                .squad_grants
+                .into_iter()
+                .map(|binding| self.grant_with_body(binding, &maestro, trusted.as_deref()))
+                .collect(),
+        })
     }
 
     /// Restriction 的检查体：write_file 的新内容、apply_patch 的模拟结果、
@@ -772,12 +868,33 @@ impl ToolRouter {
                 "required": ["path"]
             }),
         });
-        let subagent_names: Vec<String> = subagents.iter().map(|agent| agent.name.clone()).collect();
-        let subagent_catalogue = subagents
+        let mut subagent_names: Vec<String> = subagents.iter().map(|agent| agent.name.clone()).collect();
+        // 军团名并入同一 spawn enum（catalogue 注明「军团」）；与 agent 同名
+        // 时 agent 定义优先（squad_plan 只在 agent 未命中时才被查询）。
+        let squad_names: Vec<String> = {
+            let state = self.architecture.lock().await;
+            state
+                .graph
+                .as_ref()
+                .map(|graph| graph.squads.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for name in &squad_names {
+            if !subagent_names.contains(name) {
+                subagent_names.push(name.clone());
+            }
+        }
+        let mut subagent_catalogue = subagents
             .iter()
             .map(|agent| if agent.description.trim().is_empty() { agent.name.clone() } else { format!("{}（{}）", agent.name, agent.description) })
             .collect::<Vec<_>>()
             .join("；");
+        if !squad_names.is_empty() {
+            if !subagent_catalogue.is_empty() {
+                subagent_catalogue.push('；');
+            }
+            subagent_catalogue.push_str(&format!("军团：{}", squad_names.join("、")));
+        }
         tools.push(ToolSpec {
             name: "spawn_subagent".into(),
             description: format!("启动一个只读研究子智能体，并行读取/分析代码并返回摘要（不写文件、不执行命令）。description 是短标题，prompt 是具体研究任务。可用：{subagent_catalogue}"),
@@ -1377,6 +1494,52 @@ impl ToolRouter {
             }
             line.push_str("。该要求在子智能体内部校验，不由你代调；收尾未完成会在结果中标注装配违例。");
             lines.push(line);
+        }
+        // 军团编排段：squads 声明的并行军团/指挥派发契约——spawn_subagent
+        // 以军团名为 type 时按内部图执行，成员授权由军团内连线决定。
+        if !graph.squads.is_empty() {
+            let resolved: std::collections::BTreeMap<String, ResolvedPlugin> = plugins
+                .iter()
+                .map(|(name, manifest)| {
+                    (
+                        name.clone(),
+                        ResolvedPlugin {
+                            kind: match manifest.kind {
+                                PluginKind::Skill => ExtensionKind::Skill,
+                                PluginKind::Mcp => ExtensionKind::Mcp,
+                            },
+                            target: manifest.target.clone(),
+                            tool: manifest.tool.clone(),
+                        },
+                    )
+                })
+                .collect();
+            for name in graph.squads.keys() {
+                let Some(plan) = crate::domain::squad_plan(&graph, name, &resolved) else { continue };
+                match &plan.coordinator {
+                    Some(coordinator) => {
+                        let required: Vec<&str> = plan.members.iter().filter(|m| m.required).map(|m| m.agent.as_str()).collect();
+                        let optional: Vec<&str> = plan.members.iter().filter(|m| !m.required).map(|m| m.agent.as_str()).collect();
+                        let mut line = format!(
+                            "- 智能体军团 {name}：spawn_subagent(type={name}) 会启动指挥 {coordinator}，由其内部循环继续派发成员"
+                        );
+                        if !required.is_empty() {
+                            line.push_str(&format!("（必选：{}）", required.join("、")));
+                        }
+                        if !optional.is_empty() {
+                            line.push_str(&format!("（可选：{}）", optional.join("、")));
+                        }
+                        line.push_str("。成员只读并返回摘要给指挥；必选成员未实际派发会在结果中标注编排违例。");
+                        lines.push(line);
+                    }
+                    None => {
+                        lines.push(format!(
+                            "- 智能体军团 {name}：spawn_subagent(type={name}) 会并行派生全部成员（{}），各自返回摘要合并为一条结果。",
+                            plan.members.iter().map(|m| m.agent.as_str()).collect::<Vec<_>>().join("、")
+                        ));
+                    }
+                }
+            }
         }
         if required_extensions(&graph).is_empty() {
             lines.push("- 图中包含前置要求（Requirement）与禁止内容（Restriction）约束：命中触发器时按连线顺序校验。".into());

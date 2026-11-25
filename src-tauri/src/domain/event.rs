@@ -75,6 +75,9 @@ pub enum EventData {
     WorkspaceTrusted {
         path: String,
     },
+    /// MCP server 运行状态变化（启动恢复逐服务回调、手动启停）——扩展页应
+    /// 重新拉取 `list_mcp_servers`。无载荷：内容无关，仅作刷新提示。
+    ExtensionsChanged,
     /// Streamed answer text.
     Content {
         #[serde(rename = "runId")]

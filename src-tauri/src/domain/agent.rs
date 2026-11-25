@@ -14,6 +14,14 @@ fn default_source() -> AgentSource {
     AgentSource::Builtin
 }
 
+/// 批量操作的目标项（scope+name）；set_hidden 时以 effective() 的
+/// def.source 定位实际文件，scope 仅作前端卡片身份标识。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentItemRef {
+    pub scope: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDefinition {
@@ -49,6 +57,23 @@ fn default_mode() -> String { "subagent".into() }
 pub const DEFAULT_SUBAGENT_TOOL_BUDGET: u32 = 100;
 /// Upper bound applied to a configured budget to catch absurd values.
 pub const MAX_SUBAGENT_TOOL_BUDGET: u32 = 500;
+
+/// Global defaults for every subagent field; a `None` field on an
+/// `AgentDefinition` falls back here before the built-in constant. Stored at
+/// `~/.maestro/agents.json` — the settings UI edits it so imported agent packs
+/// need no per-agent tuning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SubagentDefaults {
+    /// Falls back to the session model when unset.
+    pub model: Option<String>,
+    pub steps: Option<u32>,
+    pub tool_budget: Option<u32>,
+    /// Per-round parallel spawns (clamped 1-4 at resolution).
+    pub max_parallel: Option<u32>,
+    /// Total spawn allowance per run (clamped 1-16 at resolution).
+    pub max_total: Option<u32>,
+}
 
 impl AgentDefinition {
     pub fn builtin(name: &str) -> Option<Self> {

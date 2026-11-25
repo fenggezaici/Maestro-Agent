@@ -60,6 +60,7 @@
 .palette-restriction { border-left: 2px solid #fb7185; }
 .palette-action { border-left: 2px solid #ef4444; }
 .palette-subagent { border-left: 2px solid #f472b6; }
+.palette-squad { border-left: 2px solid #fb923c; }
 .palette-template { border-left: 2px solid #c084fc; }
 .palette-card { position: relative; }
 .palette-card-add {
@@ -517,6 +518,14 @@
 .maestro-node.kind-action { border-top: 2px solid #ef4444; }
 .maestro-node.kind-extension { border-top: 2px solid #a78bfa; }
 .maestro-node.kind-subagent { border-top: 2px solid #f472b6; }
+.maestro-node.kind-squad { border-top: 2px solid #fb923c; }
+.maestro-node.kind-squad { cursor: pointer; }
+.maestro-node-squadmeta {
+  margin-top: 4px;
+  font-size: 9px;
+  color: #fdba74;
+  letter-spacing: 0.03em;
+}
 
 .maestro-node-status {
   font-size: 9px;
@@ -584,13 +593,26 @@
   height: 9px !important;
   border-radius: 50% !important;
   border: 2px solid var(--color-popover) !important;
-  transition: transform var(--duration-fast), box-shadow var(--duration-fast);
+  transition: box-shadow var(--duration-fast);
 }
-.maestro-handle:hover { transform: scale(1.35); }
+/* 透明外圈扩大命中区（13px 芯 → ~21px 可点）；伪元素命中归属 handle 本体 */
+.maestro-handle::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+}
+/* hover 禁用 transform——RF 用 translate(±50%) 定位端点，scale 覆盖定位会跳位漂移。
+   改用零位移的光圈反馈。 */
+.maestro-handle:hover,
+.react-flow__handle.connectionindicator {
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.22) !important;
+}
 .maestro-handle.in { background: #94a3b8 !important; }
 .maestro-handle.out { background: #f59e0b !important; }
 .maestro-handle.pass { background: #22c55e !important; }
 .maestro-handle.fail { background: #ef4444 !important; }
+.maestro-handle.dispatch { background: #c084fc !important; }
 .maestro-handle-tag {
   position: absolute;
   right: 8px;
@@ -600,16 +622,28 @@
 }
 .maestro-handle-tag.tag-pass { color: #4ade80; }
 .maestro-handle-tag.tag-fail { color: #f87171; }
+.maestro-handle-tag.tag-dispatch { color: #d8b4fe; }
 
 /* 边 */
 .maestro-edge { stroke-width: 1.6; }
 .maestro-edge.edge-default { stroke: #64748b; }
 .maestro-edge.edge-fail { stroke: #ef4444; }
 .maestro-edge.edge-warn { stroke: #f59e0b; }
+.maestro-edge.edge-dispatch { stroke: #c084fc; }
 .maestro-edge.selected { stroke: var(--color-primary); stroke-width: 2.2; }
 .maestro-edge-dot { fill: #22d3ee; }
 .maestro-edge-dot.dot-fail { fill: #f87171; }
 .maestro-edge-dot.dot-warn { fill: #fbbf24; }
+.maestro-edge-dot.dot-dispatch { fill: #d8b4fe; }
+
+/* 军团子沙盘面包屑 */
+.squad-crumb {
+  font-size: 11px;
+  font-weight: 600;
+  color: #fdba74;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
 
 /* ---- 右侧属性面板 ---- */
 .sandbox-props {

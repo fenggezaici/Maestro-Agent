@@ -1,8 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from './ui/dialog';
 import * as Slider from '@radix-ui/react-slider';
 import { Bot, BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
-import AgentsSettings from './AgentsSettings';
+import AgentsSettings, { type AgentFocus } from './AgentsSettings';
 import LlmSettingsForm from './LlmSettingsForm';
 import ConfirmDialog from './ConfirmDialog';
 import { Button, Choice } from './ui';
@@ -13,9 +13,10 @@ import { hasProviderCredential, readLlmSettings, selectLlmProvider } from '../se
 
 type Section = 'general' | 'appearance' | 'models' | 'shortcuts' | 'agents';
 
-export default function SettingsPanel({ open, onOpenChange, preview, preferences, onPreferences, onModelsChanged }: {
+export default function SettingsPanel({ open, onOpenChange, preview, preferences, onPreferences, onModelsChanged, agentFocus }: {
   open: boolean; onOpenChange: (open: boolean) => void; preview: boolean;
   preferences: UiPreferences; onPreferences: (value: UiPreferences) => void; onModelsChanged: () => void;
+  agentFocus?: AgentFocus | null;
 }) {
   const [section, setSection] = useState<Section>('general');
   const [customs, setCustoms] = useState(readCustomProviders);
@@ -31,6 +32,9 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
   const text = labels(preferences.language);
   const sections = [{ id: 'general', icon: Globe2 }, { id: 'appearance', icon: Palette }, { id: 'models', icon: BrainCircuit }, { id: 'agents', icon: Bot }, { id: 'shortcuts', icon: Keyboard }] as const;
   const update = (patch: Partial<UiPreferences>) => onPreferences({ ...preferences, ...patch });
+
+  // 扩展面板「编辑 / 新建子智能体」深链：打开设置时直接落到 agents 分区。
+  useEffect(() => { if (agentFocus) setSection('agents'); }, [agentFocus]);
 
   return <>
     <Dialog open={open} onOpenChange={(value) => { setCapture(null); onOpenChange(value); }}>
@@ -103,7 +107,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
             </div>
           </div>
         </div>
-        <div hidden={section !== 'agents'}><AgentsSettings preview={preview} /></div>
+        <div hidden={section !== 'agents'}><AgentsSettings preview={preview} focus={agentFocus} /></div>
         <div hidden={section !== 'shortcuts'}>
           <label className="shortcut-search"><Search size={14} /><input aria-label="搜索快捷键" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索快捷键…" /></label>
           <div className="shortcut-row"><div><strong>发送消息</strong><small>保留键 / 输入法安全</small></div><kbd>Ctrl / Cmd + Enter</kbd></div>

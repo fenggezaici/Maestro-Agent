@@ -1038,6 +1038,21 @@ impl Database {
         .await
     }
 
+    /// 异常取证：运行期不可归类于工具门禁的异常事件（如模型空轮），
+    /// 以独立 action 写入 audit，事后可直接查证。
+    pub async fn record_anomaly(&self, run_id: i64, action: String, detail: String) -> AppResult<()> {
+        self.call(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO audit (run_id, action, detail) VALUES (?1, ?2, ?3)",
+                    params![run_id, action, detail],
+                )
+                .map_err(db_error)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// 架构沙盘 Session 工具历史：`audit.action='tool_history'`，detail 为
     /// `{"tool","target"}` JSON —— 与 `tool_allowed` 展示行分开，避免迁移。
     pub async fn record_tool_history(

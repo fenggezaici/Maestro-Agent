@@ -1,87 +1,14 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState } from 'react';
 import { useT } from '../i18n';
-import { Dialog, DialogClose, DialogContent, DialogTitle } from './ui/dialog';
 import * as Tabs from '@radix-ui/react-tabs';
 import * as Switch from '@radix-ui/react-switch';
-import { ExternalLink, FolderInput, FolderOpen, GitBranch, PlugZap, Plus, Puzzle, Sparkles, Trash2, X } from 'lucide-react';
+import { Bot, ExternalLink, FolderInput, GitBranch, PlugZap, Plus, Puzzle, Search, Sparkles, Trash2, X } from 'lucide-react';
 import type { ExtensionsController } from '../hooks/useExtensions';
 import type { McpServerView, RecommendedItem, SkillView } from '../api/extensions';
-import { pickDirectory, pickFile } from '../api/dialog';
+import { agentRef, type AgentDefinition, type AgentSource } from '../api/agents';
 import { formatEnvText, parseEnvText, parseHeadersText } from '../lib/envText';
 import ConfirmDialog from './ConfirmDialog';
-import { IconButton } from './ui';
-
-interface FormField {
-  id: string;
-  label: string;
-  placeholder?: string;
-  required?: boolean;
-  textarea?: boolean;
-  browse?: 'directory' | 'file';
-  disabled?: boolean;
-  options?: { value: string; label: string; disabled?: boolean }[];
-  /// 条件显示（例如 MCP 按类型切换 stdio/远程字段）；隐藏字段不参与必填校验。
-  when?: (values: Record<string, string>) => boolean;
-}
-
-function FormDialog({ open, onOpenChange, title, hint, submitLabel, fields, canBrowse = false, initialValues, onSubmit }: {
-  open: boolean; onOpenChange: (open: boolean) => void; title: string; hint?: string;
-  submitLabel: string;
-  canBrowse?: boolean;
-  fields: FormField[];
-  initialValues?: Record<string, string>;
-  onSubmit: (values: Record<string, string>) => Promise<string | null>;
-}) {
-  const defaults = () => ({
-    ...Object.fromEntries(fields.filter((field) => field.options?.length).map((field) => [field.id, field.options![0].value])),
-    ...initialValues,
-  });
-  const [values, setValues] = useState<Record<string, string>>(defaults);
-  const [error, setError] = useState<string | null>(null);
-  const [pending, setPending] = useState(false);
-  useEffect(() => { if (open) setValues(defaults()); }, [open]);
-  const visible = fields.filter((field) => !field.when || field.when(values));
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (pending) return;
-    setPending(true);
-    const message = await onSubmit(values);
-    setPending(false);
-    if (message) { setError(message); return; }
-    setValues(defaults()); setError(null); onOpenChange(false);
-  }
-  return <Dialog open={open} onOpenChange={(value) => { setError(null); onOpenChange(value); }}>
-    <DialogContent variant="form" className="project-dialog">
-        <DialogTitle asChild><h3>{title}</h3></DialogTitle>
-        {hint && <p className="dialog-hint">{hint}</p>}
-        <form onSubmit={(event) => void submit(event)}>
-          {visible.map((field) => <div key={field.id}>
-            <label htmlFor={`ext-${field.id}`}>{field.label}{field.required !== false && !field.options ? ' *' : ''}</label>
-            {field.options
-              ? <select id={`ext-${field.id}`} value={values[field.id] ?? field.options[0]?.value ?? ''} disabled={field.disabled}
-                onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))}>
-                {field.options.map((option) => <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>)}
-              </select>
-              : field.textarea
-                ? <textarea id={`ext-${field.id}`} rows={3} value={values[field.id] ?? ''} disabled={field.disabled} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />
-                : <div className="field-with-browse">
-                  <input id={`ext-${field.id}`} autoComplete="off" spellCheck={false} value={values[field.id] ?? ''} disabled={field.disabled} onChange={(e) => setValues((v) => ({ ...v, [field.id]: e.target.value }))} placeholder={field.placeholder} />
-                  {field.browse && <IconButton label={field.browse === 'directory' ? '浏览目录' : '浏览文件'} disabled={!canBrowse}
-                    onClick={async () => {
-                      const picked = field.browse === 'directory' ? await pickDirectory() : await pickFile(['json']);
-                      if (picked) setValues((v) => ({ ...v, [field.id]: picked }));
-                    }}><FolderOpen size={14} /></IconButton>}
-                </div>}
-          </div>)}
-          {error && <p role="alert" className="settings-form-error">{error}</p>}
-          <div className="dialog-actions">
-            <DialogClose asChild><button type="button" className="button-ghost">取消</button></DialogClose>
-            <button type="submit" className="button-approve" disabled={pending || visible.some((f) => f.required !== false && !f.options && !(values[f.id] ?? '').trim())}>{submitLabel}</button>
-          </div>
-        </form>
-    </DialogContent>
-  </Dialog>;
-}
+import FormDialog from './ui/FormDialog';
 
 function SkillList({ c }: { c: ExtensionsController }) {
   const [dialog, setDialog] = useState<'create' | 'local' | 'github' | null>(null);
@@ -218,6 +145,121 @@ function McpRow({ c, server, onEdit }: { c: ExtensionsController; server: McpSer
   </article>;
 }
 
+const AGENT_SOURCE_LABEL: Record<AgentSource, string> = { builtin: '内置', global: '全局', project: '项目' };
+
+function AgentList({ c, onConfigureAgent }: { c: ExtensionsController; onConfigureAgent?: (name: string | null) => void }) {
+  const [dialog, setDialog] = useState<'local' | 'github' | null>(null);
+  const [deleting, setDeleting] = useState<AgentDefinition | null>(null);
+  const [bulkDelete, setBulkDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
+  // 勾选键 = `${source}:${name}`，与卡片 key 一致；已删项随列表刷新自然脱落。
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const keyOf = (agent: AgentDefinition) => `${agent.source ?? 'global'}:${agent.name}`;
+  const needle = query.trim().toLowerCase();
+  const visible = c.agents.filter((agent) =>
+    (filter === 'all' || (filter === 'disabled') === agent.hidden)
+    && `${agent.name} ${agent.description}`.toLowerCase().includes(needle));
+  const selectedAgents = c.agents.filter((agent) => selected.has(keyOf(agent)));
+  const bulkBusy = c.pending === 'bulk-agents';
+  const disabledCount = c.agents.filter((agent) => agent.hidden).length;
+
+  const toggle = (key: string) => setSelected((current) => {
+    const next = new Set(current);
+    if (next.has(key)) { next.delete(key); } else { next.add(key); }
+    return next;
+  });
+  const selectVisible = () => setSelected(new Set(visible.map(keyOf)));
+  const bulkHidden = (hidden: boolean) => {
+    void c.setAgentsHidden(selectedAgents.map(agentRef), hidden).then((message) => {
+      if (!message) setSelected(new Set());
+      setDeleteError(message);
+    });
+  };
+  const deletable = selectedAgents.filter((agent) => agent.source !== 'builtin');
+  const skippedBuiltin = selectedAgents.length - deletable.length;
+
+  return <section aria-label="子智能体列表" className="extension-section">
+    <div className="extension-section-heading">
+      <h4><Bot size={14} />子智能体（Subagents）</h4>
+      <div className="extension-actions">
+        <button type="button" className="button-ghost" onClick={() => onConfigureAgent?.(null)}><Plus size={13} />新建</button>
+        <button type="button" className="button-ghost" onClick={() => setDialog('local')}><FolderInput size={13} />本地导入</button>
+        <button type="button" className="button-ghost" onClick={() => setDialog('github')}><GitBranch size={13} />GitHub 导入</button>
+      </div>
+    </div>
+    <div className="agents-toolbar">
+      <label className="agents-search"><Search size={13} /><input aria-label="搜索子智能体" placeholder="搜索子智能体…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+      <select className="agents-filter" aria-label="按启用状态筛选" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
+        <option value="all">全部（{c.agents.length}）</option>
+        <option value="enabled">仅启用</option>
+        <option value="disabled">已禁用（{disabledCount}）</option>
+      </select>
+      <span className="agents-count">子智能体 {visible.length}</span>
+    </div>
+    {selected.size > 0 && (
+      <div className="agents-bulkbar" role="toolbar" aria-label="批量操作">
+        <span className="agents-bulkbar-count">已选 {selectedAgents.length}</span>
+        <button type="button" className="button-ghost" onClick={selectVisible}>全选当前筛选</button>
+        <button type="button" className="button-ghost" disabled={bulkBusy} onClick={() => bulkHidden(true)}>禁用</button>
+        <button type="button" className="button-ghost" disabled={bulkBusy} onClick={() => bulkHidden(false)}>启用</button>
+        <button type="button" className="button-ghost agents-bulkbar-danger" disabled={bulkBusy || deletable.length === 0}
+          title={deletable.length === 0 ? '所选均为内置，不可删除（可禁用）' : undefined}
+          onClick={() => setBulkDelete(true)}><Trash2 size={12} />删除</button>
+        <button type="button" className="icon-button" aria-label="清除选择" onClick={() => setSelected(new Set())}><X size={13} /></button>
+      </div>
+    )}
+    {c.agents.length === 0 && <p className="sidebar-empty">{c.loading ? '加载中…' : '暂无子智能体。新建或批量导入角色包（如 agency-agents-zh）。'}</p>}
+    {c.agents.length > 0 && visible.length === 0 && <p className="sidebar-empty">没有匹配的子智能体。</p>}
+    {deleteError && <p role="alert" className="settings-form-error">{deleteError}</p>}
+    {c.agentImportSummary && <p className="import-summary">{c.agentImportSummary}</p>}
+    <div className="agents-list">{visible.map((agent) => {
+      const key = keyOf(agent);
+      return <div className={`agent-card${agent.hidden ? ' agent-disabled' : ''}`} key={key}>
+        <input type="checkbox" className="agent-check" aria-label={`选择 ${agent.name}`}
+          checked={selected.has(key)} onChange={() => toggle(key)} />
+        <span className="agent-icon" style={{ color: agent.color ?? undefined }}><Bot size={15} /></span>
+        <div><strong>{agent.name}</strong><span className="agent-source" data-source={agent.source ?? 'global'}>{AGENT_SOURCE_LABEL[agent.source ?? 'global']}</span>
+          {agent.hidden && <span className="agent-disabled-badge">已禁用</span>}
+          <p>{agent.description || '（无描述）'}</p><small>{agent.tools.length} 个工具 · {agent.model ?? '继承默认'} · {agent.steps ?? c.agentDefaults?.steps ?? 8} 轮 · {agent.toolBudget ?? c.agentDefaults?.toolBudget ?? 100} 次预算</small></div>
+        <Switch.Root aria-label={`启用 ${agent.name}`} className="settings-switch" checked={!agent.hidden} disabled={bulkBusy}
+          title={agent.hidden ? '启用后可被 spawn_subagent 派发' : '禁用后从派发枚举与沙盘物料中隐藏'}
+          onCheckedChange={(enable) => void c.setAgentsHidden([agentRef(agent)], !enable).then((message) => setDeleteError(message))}><Switch.Thumb /></Switch.Root>
+        <button type="button" className="button-ghost" disabled={!onConfigureAgent} title={onConfigureAgent ? '在「设置 → 子智能体」中配置' : undefined} onClick={() => onConfigureAgent?.(agent.name)}>编辑</button>
+        <button type="button" className="icon-button" aria-label={`删除 ${agent.name}`} disabled={agent.source === 'builtin' || c.pending === `delete-agent-${agent.name}`} title={agent.source === 'builtin' ? '内置子智能体不可删除；可禁用' : undefined} onClick={() => setDeleting(agent)}><Trash2 size={13} /></button>
+      </div>;
+    })}</div>
+    <p className="agent-editor-note">「编辑 / 新建」会打开「设置 → 子智能体」完成具体配置；禁用 = hidden，从派发枚举与沙盘物料中隐藏。</p>
+    <FormDialog open={dialog === 'local'} onOpenChange={(o) => !o && setDialog(null)} title="从本地目录导入子智能体"
+      hint="递归导入目录中的 .md 智能体文件到 ~/.maestro/agents（兼容 agency-agents-zh：文件名作 slug，中文角色名归位描述）；同名跳过。" submitLabel="导入" canBrowse={!!c.real}
+      fields={[{ id: 'path', label: '本地目录', placeholder: 'D:\\agents-pack', browse: 'directory' }]}
+      onSubmit={(v) => c.importAgentsDir(v.path)} />
+    <FormDialog open={dialog === 'github'} onOpenChange={(o) => !o && setDialog(null)} title="从 GitHub 导入子智能体"
+      hint="浅克隆仓库并递归导入全部 .md 智能体定义，例如 https://github.com/jnMetaCode/agency-agents-zh。" submitLabel="导入"
+      fields={[{ id: 'repo', label: '仓库地址', placeholder: 'https://github.com/owner/repo' }]}
+      onSubmit={(v) => c.importAgentsGithub(v.repo)} />
+    <ConfirmDialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)} title="删除子智能体"
+      description={deleting ? `删除 ${deleting.name}（${AGENT_SOURCE_LABEL[deleting.source ?? 'global']}作用域）？对应 .md 定义会被移除，不可撤销。` : ''}
+      onConfirm={() => {
+        if (!deleting) return;
+        const target = deleting;
+        setDeleting(null);
+        void c.deleteAgent(target).then((message) => setDeleteError(message));
+      }} />
+    <ConfirmDialog open={bulkDelete} onOpenChange={(open) => !open && setBulkDelete(false)} title={`批量删除 ${deletable.length} 个子智能体`}
+      description={`将删除：${deletable.slice(0, 8).map((agent) => agent.name).join('、')}${deletable.length > 8 ? ` 等 ${deletable.length} 项` : ''}。对应 .md 定义会被移除，不可撤销。${skippedBuiltin > 0 ? `（已选中的 ${skippedBuiltin} 个内置项自动跳过）` : ''}`}
+      onConfirm={() => {
+        const items = deletable.map(agentRef);
+        setBulkDelete(false);
+        void c.deleteAgents(items).then((message) => {
+          if (!message) setSelected(new Set());
+          setDeleteError(message);
+        });
+      }} />
+  </section>;
+}
+
 function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: React.ReactNode; items: RecommendedItem[]; c: ExtensionsController; empty: string }) {
   return <section aria-label={title} className="extension-section">
     <div className="extension-section-heading"><h4>{icon}{title}</h4></div>
@@ -236,14 +278,15 @@ function DiscoverGrid({ title, icon, items, c, empty }: { title: string; icon: R
   </section>;
 }
 
-export default function ExtensionsView({ controller: c }: { controller: ExtensionsController }) {
+export default function ExtensionsView({ controller: c, onConfigureAgent }: { controller: ExtensionsController; onConfigureAgent?: (name: string | null) => void }) {
   const t = useT();
   return <section aria-label="扩展工作区" className="extensions-view">
-    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">{t.workspaceCapabilities}</p><h3>{t.extensions}</h3><p>Skills 与 MCP 的完整生命周期管理</p></div></header>
+    <header className="extensions-heading"><span className="welcome-icon"><Puzzle size={26} strokeWidth={1.2} /></span><div><p className="eyebrow">{t.workspaceCapabilities}</p><h3>{t.extensions}</h3><p>Skills、子智能体与 MCP 的完整生命周期管理</p></div></header>
     {c.loadError && <p role="alert" className="settings-form-error extensions-load-error">部分扩展数据加载失败：{c.loadError}（若涉及 mcp.json，请检查 ~/.maestro/mcp.json 是否为合法 JSON）</p>}
     <Tabs.Root defaultValue="skills" className="extensions-tabs"><Tabs.List aria-label="扩展分类">
       <Tabs.Trigger value="skills">技能</Tabs.Trigger>
       <Tabs.Trigger value="mcp">MCP 服务</Tabs.Trigger>
+      <Tabs.Trigger value="agents">子智能体</Tabs.Trigger>
       <Tabs.Trigger value="discover">发现</Tabs.Trigger>
       <Tabs.Trigger value="config">配置</Tabs.Trigger>
     </Tabs.List>
@@ -252,6 +295,9 @@ export default function ExtensionsView({ controller: c }: { controller: Extensio
       </Tabs.Content>
       <Tabs.Content value="mcp">
         <McpList c={c} />
+      </Tabs.Content>
+      <Tabs.Content value="agents">
+        <AgentList c={c} onConfigureAgent={onConfigureAgent} />
       </Tabs.Content>
       <Tabs.Content value="discover">
         <div className="discover-columns">

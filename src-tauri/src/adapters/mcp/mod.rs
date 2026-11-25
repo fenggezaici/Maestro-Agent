@@ -624,8 +624,10 @@ impl McpManager {
 
     /// Startup restore: start every configured server the user has not
     /// explicitly disabled. Failures stay per-server in `errors` and never
-    /// block the app.
-    pub async fn start_enabled(&self) {
+    /// block the app. `on_done` fires after each server's start attempt
+    /// resolves (success or failure) so the caller can push a UI refresh —
+    /// restore runs in the background and the page may already be open.
+    pub async fn start_enabled(&self, on_done: &(dyn Fn(&str) + Sync)) {
         let names: Vec<String> = match self.load() {
             Ok(file) => file
                 .mcp_servers
@@ -637,6 +639,7 @@ impl McpManager {
         };
         for name in names {
             let _ = self.start(&name).await;
+            on_done(&name);
         }
     }
 
@@ -920,7 +923,7 @@ mod tests {
         assert!(file.mcp_servers["fs"].trust);
 
         // start_enabled skips disabled entries without spawning anything.
-        manager.start_enabled().await;
+        manager.start_enabled(&|_| {}).await;
         assert!(!manager.list_servers().await.unwrap()[0].running);
     }
 
@@ -948,7 +951,12 @@ mod tests {
         manager.upsert_server("off", config(false)).unwrap();
         manager.disable("off").await.unwrap();
 
-        manager.start_enabled().await;
+        // on_done 逐服务回调：成功的、失败的都各触发一次（失败行也要重绘
+        // 显示错误）；disabled 服务连尝试都不发生，不回调。
+        let done = std::sync::Mutex::new(Vec::<String>::new());
+        manager.start_enabled(&|name| done.lock().unwrap().push(name.to_string())).await;
+        assert_eq!(done.lock().unwrap().as_slice(), ["on"], "on_done 只覆盖被尝试的服务");
+
         let views = manager.list_servers().await.unwrap();
         let on = views.iter().find(|view| view.name == "on").unwrap();
         let off = views.iter().find(|view| view.name == "off").unwrap();

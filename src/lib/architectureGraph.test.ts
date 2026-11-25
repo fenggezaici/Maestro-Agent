@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   createExtensionNode, createNode, deserializeGraph, isConnectionAllowed,
-  autoActionMessage, nodeSummary, remapIds, sampleGraph, serializeGraph, traceNodeStatus, validateDraft,
+  autoActionMessage, isSquadConnectionAllowed, layoutSquadTree, nodeSummary, remapIds, sampleGraph,
+  serializeGraph, squadSkeleton, traceNodeStatus, validateDraft, validateSquadDraft,
   SANDBOX_TEMPLATES,
   type SandboxEdge, type SandboxNode,
 } from './architectureGraph';
@@ -268,5 +269,150 @@ describe('subagent 装配节点', () => {
     const back = deserializeGraph(graph);
     expect(back.nodes[0].data.nodeType).toBe('subagent');
     expect(back.nodes[0].data.agent).toBe('explore');
+  });
+});
+
+describe('squad 军团（subnet 子沙盘）', () => {
+  const member = (agent: string, optional = false) =>
+    createNode('subagent', at, optional ? { agent, requirement: 'optional' } : { agent });
+  const squadOf = (name: string) => createNode('squad', at, { squad: name });
+
+  it('主图：squad 只接受扩展 pass 入边，自身无出边', () => {
+    const sq = squadOf('team-1');
+    const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
+    const trigger = createNode('trigger', at, { action: 'any' });
+    const action = createNode('action', at, { result: 'block' });
+    const nodes = [sq, ext, trigger, action];
+    expect(isConnectionAllowed(nodes, [], { source: ext.id, target: sq.id, sourceHandle: 'pass' }).ok).toBe(true);
+    expect(isConnectionAllowed(nodes, [], { source: ext.id, target: sq.id, sourceHandle: 'fail' }).ok).toBe(false);
+    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: sq.id, sourceHandle: 'out' }).ok).toBe(false);
+    expect(isConnectionAllowed(nodes, [], { source: sq.id, target: action.id, sourceHandle: 'pass' }).ok).toBe(false);
+  });
+
+  it('军团内：成员 dispatch 出口连成员，指挥唯一且不可被指向', () => {
+    const c = member('cto');
+    const m1 = member('explore');
+    const m2 = member('reviewer');
+    const nodes = [c, m1, m2];
+    expect(isSquadConnectionAllowed(nodes, [], { source: c.id, target: m1.id, sourceHandle: 'dispatch' }).ok).toBe(true);
+    // 成员 pass/普通出口被拒
+    expect(isSquadConnectionAllowed(nodes, [], { source: c.id, target: m1.id, sourceHandle: 'pass' }).ok).toBe(false);
+    const edges: SandboxEdge[] = [{ id: 'd1', source: c.id, target: m1.id, sourceHandle: 'dispatch', targetHandle: 'in' }];
+    // 第二指挥被拒
+    expect(isSquadConnectionAllowed(nodes, edges, { source: m1.id, target: m2.id, sourceHandle: 'dispatch' }).ok).toBe(false);
+    // 指挥不可被 dispatch 指向
+    expect(isSquadConnectionAllowed(nodes, edges, { source: c.id, target: c.id, sourceHandle: 'dispatch' }).ok).toBe(false);
+  });
+
+  it('军团内：扩展只能 pass→成员；非成员目标与其它节点类型被拒', () => {
+    const m = member('explore');
+    const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
+    const ext2 = createExtensionNode(at, { kind: 'skill', name: 's2', target: 's2', requirement: 'required' });
+    const nodes = [m, ext, ext2];
+    expect(isSquadConnectionAllowed(nodes, [], { source: ext.id, target: m.id, sourceHandle: 'pass' }).ok).toBe(true);
+    expect(isSquadConnectionAllowed(nodes, [], { source: ext.id, target: m.id, sourceHandle: 'fail' }).ok).toBe(false);
+    expect(isSquadConnectionAllowed(nodes, [], { source: ext.id, target: ext2.id, sourceHandle: 'pass' }).ok).toBe(false);
+  });
+
+  it('validateSquadDraft：成员数/节点类型/孤儿检测', () => {
+    // 无成员
+    expect(validateSquadDraft('t', [createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' })], []).some((e) => e.includes('没有成员'))).toBe(true);
+    // 非法节点类型（trigger 不能进军团）
+    expect(validateSquadDraft('t', [member('a'), createNode('trigger', at, { action: 'any' })], []).some((e) => e.includes('只允许'))).toBe(true);
+    // 缺 agent（空串会被 createNode 默认值兜住，用空格触发空校验）
+    expect(validateSquadDraft('t', [member(' ')], []).some((e) => e.includes('缺少 agent'))).toBe(true);
+    // 合法：指挥 + 成员 + 装配
+    const c = member('cto');
+    const m = member('explore');
+    const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
+    const edges: SandboxEdge[] = [
+      { id: 'd', source: c.id, target: m.id, sourceHandle: 'dispatch', targetHandle: 'in' },
+      { id: 'b', source: ext.id, target: m.id, sourceHandle: 'pass', targetHandle: 'in' },
+    ];
+    expect(validateSquadDraft('t', [c, m, ext], edges)).toEqual([]);
+  });
+
+  it('serialize/deserialize 往返保留 squads 与成员 requirement', () => {
+    const sq = squadOf('team-1');
+    const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
+    const mainEdges: SandboxEdge[] = [{ id: 'ge', source: ext.id, target: sq.id, sourceHandle: 'pass', targetHandle: 'in' }];
+    const c = member('cto');
+    const m = member('explore', true);
+    const squadEdges: SandboxEdge[] = [{ id: 'd', source: c.id, target: m.id, sourceHandle: 'dispatch', targetHandle: 'in' }];
+    const graph = serializeGraph([sq, ext], mainEdges, { 'team-1': { nodes: [c, m], edges: squadEdges } });
+    expect(graph.squads?.['team-1'].nodes).toHaveLength(2);
+    expect(graph.squads?.['team-1'].edges[0].sourceHandle).toBe('dispatch');
+    expect(graph.squads?.['team-1'].nodes[1].data.requirement).toBe('optional');
+    const back = deserializeGraph(graph);
+    expect(back.squads['team-1'].nodes[1].data.requirement).toBe('optional');
+    expect(back.squads['team-1'].edges[0].sourceHandle).toBe('dispatch');
+  });
+
+  it('validateDraft：squad 节点缺名/引用缺失/重名', () => {
+    const missing = squadOf('  ');
+    expect(validateDraft([missing], [], SEED, {}).errors.some((e) => e.includes('缺少 squad'))).toBe(true);
+    const ghost = squadOf('nope');
+    expect(validateDraft([ghost], [], SEED, {}).errors.some((e) => e.includes('不存在于 squads'))).toBe(true);
+    const dup = [squadOf('team-1'), squadOf('team-1')];
+    expect(validateDraft(dup, [], SEED, { 'team-1': { nodes: [member('a')], edges: [] } }).errors.some((e) => e.includes('重名'))).toBe(true);
+  });
+
+  it('layoutSquadTree：指挥置顶、成员居中、扩展底层', () => {
+    const c = member('cto');
+    const m1 = member('explore');
+    const m2 = member('reviewer');
+    const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
+    const edges: SandboxEdge[] = [
+      { id: 'd1', source: c.id, target: m1.id, sourceHandle: 'dispatch', targetHandle: 'in' },
+      { id: 'd2', source: c.id, target: m2.id, sourceHandle: 'dispatch', targetHandle: 'in' },
+      { id: 'b1', source: ext.id, target: m1.id, sourceHandle: 'pass', targetHandle: 'in' },
+    ];
+    const laid = layoutSquadTree([ext, m2, c, m1], edges);
+    const y = (id: string) => laid.find((n) => n.id === id)!.position.y;
+    expect(y(c.id)).toBeLessThan(y(m1.id));
+    expect(y(m1.id)).toBe(y(m2.id));
+    expect(y(m1.id)).toBeLessThan(y(ext.id));
+  });
+
+  it('squad-team 预置模板：主图 squad + 可选共享扩展，子图指挥 dispatch 必选成员', () => {
+    const built = SANDBOX_TEMPLATES.find((t) => t.id === 'squad-team')!.build(SEED);
+    const squad = built.nodes.find((n) => n.data.nodeType === 'squad');
+    expect(squad?.data.squad).toBe('research-team');
+    // 主图：可选 skill 扩展 pass → squad（全员共享授权演示）。
+    const ext = built.nodes.find((n) => n.data.nodeType === 'extension');
+    expect(ext?.data.extension?.requirement).toBe('optional');
+    const shared = built.edges.find((e) => e.target === squad!.id);
+    expect(shared?.source).toBe(ext!.id);
+    expect(shared?.sourceHandle).toBe('pass');
+    // 子图：general 指挥 + explore 必选成员，dispatch 连线。
+    const sub = built.squads?.['research-team'];
+    expect(sub).toBeDefined();
+    const agents = sub!.nodes.filter((n) => n.data.nodeType === 'subagent').map((n) => n.data.agent).sort();
+    expect(agents).toEqual(['explore', 'general']);
+    expect(sub!.edges).toHaveLength(1);
+    expect(sub!.edges[0].sourceHandle).toBe('dispatch');
+    const coordinator = sub!.nodes.find((n) => n.id === sub!.edges[0].source);
+    expect(coordinator?.data.agent).toBe('general');
+    // 生成的子图本身能通过军团校验（零配置可跑）。
+    expect(validateSquadDraft('research-team', sub!.nodes, sub!.edges)).toEqual([]);
+  });
+
+  it('squadSkeleton：新军团预置 CTO 骨架，可直接序列化往返', () => {
+    const skeleton = squadSkeleton();
+    expect(skeleton.nodes).toHaveLength(2);
+    expect(skeleton.edges).toHaveLength(1);
+    const dispatch = skeleton.edges[0];
+    expect(dispatch.sourceHandle).toBe('dispatch');
+    const coordinator = skeleton.nodes.find((n) => n.id === dispatch.source)!;
+    const member = skeleton.nodes.find((n) => n.id === dispatch.target)!;
+    expect(coordinator.data.agent).toBe('general');
+    expect(member.data.agent).toBe('explore');
+    expect(member.data.requirement).toBe('required');
+    // 骨架自身通过军团校验 + 序列化往返不丢结构。
+    expect(validateSquadDraft('team-x', skeleton.nodes, skeleton.edges)).toEqual([]);
+    const graph = serializeGraph([], [], { 'team-x': { nodes: skeleton.nodes, edges: skeleton.edges } });
+    const back = deserializeGraph(graph);
+    expect(back.squads['team-x'].nodes).toHaveLength(2);
+    expect(back.squads['team-x'].edges[0].sourceHandle).toBe('dispatch');
   });
 });

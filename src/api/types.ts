@@ -195,6 +195,7 @@ export type KernelEvent = { sequence: number } & (
   | { type: 'workspace_changed' }
   | { type: 'workspace_trust_required'; path: string; assets: string[] }
   | { type: 'workspace_trusted'; path: string }
+  | { type: 'extensions_changed' }
   | { type: 'tool_call'; runId: number; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string; subagentId?: string }
   | { type: 'subagent_started'; runId: number; subagent: SubagentView }
   | { type: 'subagent_tool'; runId: number; subagentId: string; tool: string; phase: 'started' | 'awaiting_approval' | 'finished' | 'failed' | 'blocked'; detail: string }

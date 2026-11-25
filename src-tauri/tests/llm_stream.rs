@@ -5,7 +5,7 @@ use std::{
 
 use maestro_lib::{
     adapters::llm::{ChatConfig, Provider},
-    domain::{ChatMessage, EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView},
+    domain::{ChatMessage, EventData, KernelEvent, Mode, RunStatus, RunView, SessionDetail, SessionView, ToolPhase},
     services::{agent_loop::conversation, kernel::Kernel},
 };
 use serde_json::Value;
@@ -173,6 +173,94 @@ async fn provider_reasoning_then_truncated_then_ok() -> (String, tokio::task::Jo
     (url, task)
 }
 
+/// 读完整条请求（headers 结束 + Content-Length 字节）才允许回包——
+/// 大请求体（长上下文、多轮历史）分多段到达，静默等待式读法会提前
+/// 断供，reqwest 可能把响应前残余上传误报为发送错误。
+async fn consume_request(socket: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(count)) => count,
+        };
+        request.extend_from_slice(&buffer[..count]);
+        if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                return;
+            }
+        }
+    }
+}
+
+async fn write_sse(socket: &mut tokio::net::TcpStream, body: &str) -> bool {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(header.as_bytes()).await.is_ok() && socket.write_all(body.as_bytes()).await.is_ok()
+}
+
+/// 依次给每个连接回 bodies[i]（超出后重复最后一个），用于多轮响应场景。
+async fn provider_sequence(bodies: Vec<&'static str>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut attempt = 0usize;
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let _ = socket.set_nodelay(true);
+            consume_request(&mut socket).await;
+            let body = bodies[attempt.min(bodies.len() - 1)];
+            attempt += 1;
+            if !write_sse(&mut socket, body).await {
+                return;
+            }
+        }
+    });
+    (url, task)
+}
+
+/// 每次请求都回同一个 body 的假 provider；按请求数返回 attempts 计数。
+async fn provider_repeating(body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = socket.set_nodelay(true);
+            consume_request(&mut socket).await;
+            if !write_sse(&mut socket, body).await {
+                return;
+            }
+        }
+    });
+    (url, attempts, task)
+}
+
+/// 首个连接回「无名 tool-call 碎片 + finish_reason: tool_calls」，后续连接回正文。
+async fn provider_nameless_fragments_then_text() -> (String, tokio::task::JoinHandle<()>) {
+    provider_sequence(vec![
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先去读文件\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c9\",\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\ndata: [DONE]\n\n",
+    ])
+    .await
+}
+
 fn config(base_url: String) -> ChatConfig {
     ChatConfig {
         api_key: "test-secret".into(),
@@ -262,15 +350,164 @@ async fn retries_mid_stream_when_only_reasoning_has_flown() {
 }
 
 #[tokio::test]
-async fn reasoning_deltas_are_coalesced_into_one_chunk() {
-    let (url, _request, server) = provider(
-        200,
-        vec![
-            (0, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n"),
-            (0, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}\n\n"),
-            (0, "data: [DONE]\n\n"),
-        ],
+async fn nameless_tool_fragments_nudge_the_model_instead_of_silent_completion() {
+    // vLLM/DSML 长上下文缺陷复现：provider 流出发了工具调用碎片却始终
+    // 缺 function.name → 全部丢弃。空轮应触发追问而不是静默完成；
+    // 追问后第二轮 provider 回正文，run 带正文完成。
+    let (url, server) = provider_nameless_fragments_then_text().await;
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(|_| {}),
     )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "do work".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(runs[0].output.contains("Recovered"), "{}", runs[0].output);
+    kernel.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn persistent_empty_turns_finish_with_a_visible_marker() {
+    // 追问耗尽仍零正文零可解析调用 → 以用户可见标记收尾，绝不静默。
+    let (url, attempts, server) = provider_repeating(concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"…\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    )).await;
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(|_| {}),
+    )
+    .await
+    .unwrap();
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "do work".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(runs[0].output.contains("模型本轮未产生可见输出"), "{}", runs[0].output);
+    // 初始请求 + 两次追问续跑。
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    kernel.shutdown().await.unwrap();
+    server.abort();
+}
+
+const LIST_DIR_CALL: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]}}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+#[tokio::test]
+async fn doom_loop_blocks_then_aborts_repeated_identical_calls() {
+    // 模型每轮原样重发同一调用：1–2 次静默执行、第 3 次执行+警告、
+    // 第 4–5 次被拦截（不执行）、第 6 次硬终止——真实执行恰好 3 次。
+    let (url, attempts, server) = provider_repeating(LIST_DIR_CALL).await;
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        dir.clone(),
+        Arc::new(move |event| captured.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    kernel.set_workspace_root(Some(dir)).await;
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "loop it".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(runs[0].output.contains("检测到工具调用停滞"), "{}", runs[0].output);
+    // 六轮请求：第 6 轮的 pre-pass 触发 abort。
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 6);
+    // 仅 streak 1–3 真实执行（streak 3 附警告）；4–6 被拦截无 ToolCall 事件。
+    let list_dir_finished = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(&event.data, EventData::ToolCall { tool, phase: ToolPhase::Finished, .. } if tool == "list_dir"))
+        .count();
+    assert_eq!(list_dir_finished, 3);
+    kernel.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn alternating_call_arguments_reset_the_doom_streak() {
+    // 字节不同的参数即不同签名：A,A,B,正文——无停滞标记，三个调用全执行。
+    let (url, server) = provider_sequence(vec![
+        LIST_DIR_CALL,
+        LIST_DIR_CALL,
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\": \\\".\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+    ])
+    .await;
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let kernel = Kernel::open(
+        ":memory:".into(),
+        dir.clone(),
+        Arc::new(move |event| captured.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    kernel.set_workspace_root(Some(dir)).await;
+    let session = kernel.create_session(None).await.unwrap();
+    kernel
+        .start_model(session.id, "loop it".into(), config(url))
+        .await
+        .unwrap();
+    idle(&kernel).await;
+    let runs = kernel.list_runs().await.unwrap();
+    assert_eq!(runs[0].status, RunStatus::Completed, "{:?}", runs[0].error);
+    assert!(!runs[0].output.contains("检测到工具调用停滞"), "{}", runs[0].output);
+    assert!(runs[0].output.contains("done"), "{}", runs[0].output);
+    let list_dir_finished = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(&event.data, EventData::ToolCall { tool, phase: ToolPhase::Finished, .. } if tool == "list_dir"))
+        .count();
+    assert_eq!(list_dir_finished, 3);
+    kernel.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn reasoning_deltas_are_coalesced_into_one_chunk() {
+    // 首轮纯 reasoning 零正文触发空轮追问；第二轮回正文使 run 收尾。
+    let (url, server) = provider_sequence(vec![
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+    ])
     .await;
     let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = events.clone();
@@ -297,7 +534,7 @@ async fn reasoning_deltas_are_coalesced_into_one_chunk() {
         })
         .collect();
     assert_eq!(chunks, vec!["think more".to_string()]);
-    server.await.unwrap();
+    server.abort();
     kernel.shutdown().await.unwrap();
 }
 
@@ -341,7 +578,7 @@ async fn real_http_sse_streams_before_completion_and_persists_with_rust_plan_pro
     assert!(body["messages"][0]["content"]
         .as_str()
         .unwrap()
-        .contains("你处于只读计划模式"));
+        .contains("你处于计划模式"));
     assert!(body["messages"][0]["content"]
         .as_str()
         .unwrap()
@@ -461,7 +698,7 @@ async fn anthropic_messages_sse_and_usage_are_adapted_without_mixing_system_role
     let system_blocks = body["system"].as_array().unwrap();
     assert!(system_blocks
         .iter()
-        .any(|block| block["text"].as_str().unwrap().contains("只读计划模式")));
+        .any(|block| block["text"].as_str().unwrap().contains("你处于计划模式")));
     assert_eq!(
         system_blocks.last().unwrap()["cache_control"]["type"],
         "ephemeral"

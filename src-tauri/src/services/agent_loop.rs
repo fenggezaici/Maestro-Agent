@@ -2,7 +2,7 @@
 //! adapter streams normalized `StreamEvent`s over a channel; this service
 //! relays them to the kernel as typed domain events, executes tool calls via
 //! the kernel's authorized path, and feeds results back for the next turn.
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
 
 use futures_util::future::join_all;
 
@@ -13,9 +13,9 @@ use crate::{
     domain::{
         AppResult, ChatMessage, ContextCompaction, ExtensionKind, Mode, RunMessage, RunMetrics,
         RunStatus, RunView, SessionDetail, SubagentStatus, SubagentTokenKind, SubagentView,
-        ToolCallView, ToolPhase, ToolSpec,
+        ToolCallSpec, ToolCallView, ToolPhase, ToolSpec,
     },
-    services::{kernel::Kernel, tool_router::SubagentGrant},
+    services::{kernel::Kernel, tool_router::{ResolvedSquad, SubagentGrant}},
 };
 
 /// Safety cap for one run; can be raised with MAESTRO_MAX_TOOL_ROUNDS.
@@ -23,6 +23,48 @@ fn max_tool_rounds() -> usize {
     std::env::var("MAESTRO_MAX_TOOL_ROUNDS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| *value >= 8).unwrap_or(64)
 }
 const MAX_TOOL_RESULT_BYTES: usize = 65536;
+
+/// 停滞检测：同一工具调用（名称 + 参数字节完全一致）连续出现时的渐进处置。
+/// 口径与 OpenCode DOOM_LOOP 一致——字节级精确匹配，不做 JSON 规范化；
+/// 交错模式（A,B,A,B）不触发。三级渐进：
+/// - streak == DOOM_WARN（3）：照常执行，结果尾部追加「请说明原因/改变策略」
+/// - streak 4–5：拦截不执行，合成 Err 结果喂回模型（error-as-observation）
+/// - streak >= DOOM_ABORT（6）：硬终止本轮 run（可见标记 + 审计）
+const DOOM_WARN: u32 = 3;
+const DOOM_BLOCK: u32 = 4;
+const DOOM_ABORT: u32 = 6;
+
+#[derive(Default)]
+struct DoomGuard {
+    signature: String,
+    streak: u32,
+}
+
+impl DoomGuard {
+    /// 记录一次调用并返回其当前连续计数；签名不同则重置。
+    fn observe(&mut self, call: &ToolCallSpec) -> u32 {
+        let signature = format!("{}\u{1f}{}", call.name, call.arguments);
+        if self.signature == signature {
+            self.streak += 1;
+        } else {
+            self.signature = signature;
+            self.streak = 1;
+        }
+        self.streak
+    }
+}
+
+fn doom_warn_note(streak: u32) -> String {
+    format!("\n\n【系统提示】检测到该调用已连续 {streak} 次完全相同。若是有意重试请在后续说明原因；否则请改变策略。")
+}
+
+fn doom_block_error(name: &str, streak: u32) -> String {
+    format!("该调用与此前连续 {streak} 次完全相同，已被停滞检测拦截（未执行 {name}）。请改变策略——换参数、换工具，或直接说明卡点。")
+}
+
+fn doom_abort_marker(name: &str, streak: u32) -> String {
+    format!("\n\n[检测到工具调用停滞：{name} 已连续 {streak} 次完全相同，本轮已终止。请检查策略后发送「继续」]")
+}
 
 /// 工具结果回传模型的上限截断：必须带提示——静默截断会让模型误以为拿到
 /// 完整结果（与 exec 「省略 N 字节」、read_file 截断提示同一约定）。
@@ -59,8 +101,8 @@ fn subagent_budget_hint(tool_budget: usize) -> String {
 /// A child that stops producing progress must not hold the parent turn forever.
 /// The default lives in `domain::DEFAULT_SUBAGENT_TOOL_BUDGET`; definitions may
 /// override it via `tool_budget`.
-fn subagent_tool_budget(definition: &crate::domain::AgentDefinition) -> usize {
-    definition.tool_budget.unwrap_or(crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET).clamp(1, crate::domain::MAX_SUBAGENT_TOOL_BUDGET) as usize
+fn subagent_tool_budget(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> usize {
+    definition.tool_budget.or(defaults.tool_budget).unwrap_or(crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET).clamp(1, crate::domain::MAX_SUBAGENT_TOOL_BUDGET) as usize
 }
 
 fn subagent_timeout() -> Duration {
@@ -723,12 +765,41 @@ fn child_session_id(parent: Option<&str>, subagent_id: &str) -> String {
     format!("{}-sub-{subagent_id}", parent.unwrap_or("maestro"))
 }
 
-fn max_parallel_subagents() -> usize {
+/// 每轮并行上限：~/.maestro/agents.json > env MAESTRO_MAX_SUBAGENTS > 2（范围 1-4）。
+fn resolve_max_parallel(defaults: &crate::domain::SubagentDefaults) -> usize {
+    if let Some(value) = defaults.max_parallel {
+        return (value as usize).clamp(1, 4);
+    }
     std::env::var("MAESTRO_MAX_SUBAGENTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| (1..=4).contains(value))
         .unwrap_or(2)
+}
+
+/// Run 级子智能体总额度（含军团成员/孙级），防扇出：
+/// agents.json > env MAESTRO_MAX_TOTAL_SUBAGENTS > 8（范围 1-16）。
+fn resolve_max_total(defaults: &crate::domain::SubagentDefaults) -> usize {
+    if let Some(value) = defaults.max_total {
+        return (value as usize).clamp(1, 16);
+    }
+    std::env::var("MAESTRO_MAX_TOTAL_SUBAGENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(8)
+}
+
+/// steps 解析链：definition → 全局默认 → 8（0 视为未设置）。
+fn resolve_steps(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> u32 {
+    definition.steps.or(defaults.steps).filter(|value| *value > 0).unwrap_or(8)
+}
+
+/// 预算原子扣减：到 0 返回 false（fetch_update 失败时不写回，语义精确）。
+fn try_spawn_budget(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
+        .is_ok()
 }
 
 /// 装配契约段：拼进子系统提示——必选/可选条目 + 必选 Skill 正文预注入。
@@ -806,6 +877,117 @@ fn pending_grants_reminder(pending: &[SubagentGrant]) -> String {
     )
 }
 
+/// 指挥系统提示追加：军团编排契约——成员 enum、必选派发、只读语义。
+fn squad_dispatch_prompt(squad: &ResolvedSquad, defaults: &crate::domain::SubagentDefaults) -> String {
+    let required: Vec<&str> = squad
+        .members
+        .iter()
+        .filter(|member| member.required)
+        .map(|member| member.agent.as_str())
+        .collect();
+    let optional: Vec<&str> = squad
+        .members
+        .iter()
+        .filter(|member| !member.required)
+        .map(|member| member.agent.as_str())
+        .collect();
+    format!(
+        "\n【军团编排】你是本军团的指挥：可用 spawn_subagent 向成员派发只读研究任务（同一轮最多 {} 个，本 run 总名额有限）。必选成员（收尾前必须实际派发）：{}。可选成员：{}。成员只读并返回摘要作为证据；不要试图派发成员之外的类型。",
+        resolve_max_parallel(defaults),
+        if required.is_empty() { "无".into() } else { required.join("、") },
+        if optional.is_empty() { "无".into() } else { optional.join("、") },
+    )
+}
+
+fn pending_members_reminder(pending: &[String]) -> String {
+    format!(
+        "【军团编排】必选成员尚未派发：{}。请继续调用 spawn_subagent（subagent_type=成员名）完成派发后才能收尾。",
+        pending.join("、")
+    )
+}
+
+/// 欠账提醒合并：装配必选 + 必派成员——子循环两处提醒入口共用。
+fn pending_reminder(grants: &[SubagentGrant], members: &[String]) -> String {
+    let mut lines = Vec::new();
+    if !members.is_empty() {
+        lines.push(pending_members_reminder(members));
+    }
+    if !grants.is_empty() {
+        lines.push(pending_grants_reminder(grants));
+    }
+    lines.join("\n")
+}
+
+/// 并行军团：无指挥——一次 spawn 调用 fan-out 全部成员，结果合并为一条。
+/// 每个成员照常走 run_subagent（预算、装配、取消全继承）。
+#[allow(clippy::too_many_arguments)]
+async fn run_squad_parallel(
+    kernel: Arc<Kernel>,
+    config: &ChatConfig,
+    session_id: i64,
+    run_id: i64,
+    squad: &ResolvedSquad,
+    prompt: &str,
+    description: &str,
+    parent_cancel: watch::Receiver<bool>,
+    spawn_budget: Arc<AtomicUsize>,
+) -> AppResult<String> {
+    if squad.members.is_empty() {
+        return Err("军团没有成员子智能体".into());
+    }
+    // 两段式：先把每个成员的派发参数/授权存进 jobs，再统一建 future（借用 jobs 内部数据）。
+    let mut jobs: Vec<(String, String, String, String, Vec<SubagentGrant>)> = Vec::new();
+    for member in &squad.members {
+        let member_id = next_subagent_id(run_id);
+        let member_desc = format!("{description}·{}", member.agent);
+        kernel.emit_spawn(run_id, &member_id, ToolPhase::Started, &member_desc).await;
+        kernel.record_spawn(run_id, &member_id, &member_desc).await;
+        let mut grants = member.grants.clone();
+        grants.extend(squad.squad_grants.clone());
+        let arguments = serde_json::json!({
+            "subagent_type": member.agent,
+            "description": member_desc,
+            "prompt": prompt,
+        })
+        .to_string();
+        jobs.push((member_id, member.agent.clone(), member_desc, arguments, grants));
+    }
+    let futures: Vec<_> = jobs
+        .iter()
+        .map(|(member_id, _, _, arguments, grants)| {
+            Box::pin(run_subagent(
+                kernel.clone(),
+                config,
+                session_id,
+                run_id,
+                member_id.clone(),
+                arguments,
+                parent_cancel.clone(),
+                spawn_budget.clone(),
+                false,
+                grants.clone(),
+            ))
+        })
+        .collect();
+    let results = join_all(futures).await;
+    let mut merged = String::new();
+    for ((member_id, agent, member_desc, _, _), result) in jobs.into_iter().zip(results) {
+        kernel
+            .emit_spawn(
+                run_id,
+                &member_id,
+                if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed },
+                &member_desc,
+            )
+            .await;
+        merged.push_str(&format!(
+            "【{agent}】\n{}\n\n",
+            result.unwrap_or_else(|error| error)
+        ));
+    }
+    Ok(merged.trim_end().to_string())
+}
+
 /// 一次成功的子工具调用是否核销该必选绑定。
 fn grant_satisfied(grant: &SubagentGrant, name: &str, arguments_json: &str) -> bool {
     let binding = &grant.binding;
@@ -835,6 +1017,12 @@ async fn run_subagent(
     subagent_id: String,
     arguments_json: &str,
     mut parent_cancel: watch::Receiver<bool>,
+    // 全 run 子智能体总额度（含成员/孙级）——每个真实子循环入口各扣 1。
+    spawn_budget: Arc<AtomicUsize>,
+    // 成员/孙级递归传 false：军团成员只引用 agent 定义，禁止军团套军团。
+    resolve_squad: bool,
+    // 军团级/成员级图谱补充授权（并入本调用 grants）。
+    extra_grants: Vec<SubagentGrant>,
 ) -> AppResult<String> {
     let arguments: serde_json::Value =
         serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -850,25 +1038,71 @@ async fn run_subagent(
         .map(|agent| agent.name.as_str())
         .collect::<Vec<_>>()
         .join("、");
-    let definition = available.into_iter().find(|agent| agent.name == subagent_type)
-        .or_else(|| crate::domain::AgentDefinition::builtin(&subagent_type))
-        .ok_or_else(|| format!("未知子智能体类型：{subagent_type}；可用：{names}"))?;
+    let run_root = kernel.run_workspace_root(run_id).await;
+    // 解析顺序：agent 定义优先，未命中再查军团（同名时 agent 胜出）。
+    let agent_def = available
+        .iter()
+        .find(|agent| agent.name == subagent_type)
+        .cloned()
+        .or_else(|| crate::domain::AgentDefinition::builtin(&subagent_type));
+    let squad = if resolve_squad && agent_def.is_none() {
+        kernel.squad_runtime(run_root.as_deref(), &subagent_type).await
+    } else {
+        None
+    };
+    if let Some(squad) = &squad {
+        if squad.coordinator.is_none() {
+            // 并行军团：无指挥——本调用 fan-out 全部成员，结果合并为一条。
+            return run_squad_parallel(
+                kernel, config, session_id, run_id, squad, &prompt, &description,
+                parent_cancel, spawn_budget,
+            )
+            .await;
+        }
+    }
+    let (definition, squad) = match (agent_def, squad) {
+        (Some(definition), _) => (definition, None),
+        (None, Some(squad)) => {
+            let coordinator = squad.coordinator.clone().unwrap_or_default();
+            let definition = available
+                .iter()
+                .find(|agent| agent.name == coordinator)
+                .cloned()
+                .or_else(|| crate::domain::AgentDefinition::builtin(&coordinator))
+                .ok_or_else(|| format!("军团 {subagent_type} 的指挥 {coordinator} 未在子智能体定义中（可用：{names}）"))?;
+            (definition, Some(squad))
+        }
+        (None, None) => {
+            return Err(format!("未知子智能体类型：{subagent_type}；可用：{names}"));
+        }
+    };
     if definition.hidden || definition.mode != "subagent" {
         return Err(format!("子智能体 {subagent_type} 未启用：hidden 或 mode 不是 subagent"));
     }
+    // 每个真实子循环入口各扣 1 份 run 总额度（军团成员/孙级同样计）。
+    if !try_spawn_budget(&spawn_budget) {
+        return Err("本 run 子智能体总额度已用完（可在「设置 → 子智能体」或经 MAESTRO_MAX_TOTAL_SUBAGENTS 调整）".into());
+    }
+    // 全局默认（~/.maestro/agents.json）：per-agent 留空字段的第二级回退。
+    let defaults = kernel.agent_defaults()?;
     let child_config = ChatConfig {
         api_key: config.api_key.clone(), base_url: config.base_url.clone(),
-        model: definition.model.clone().unwrap_or_else(|| config.model.clone()),
+        model: definition.model.clone().or_else(|| defaults.model.clone()).unwrap_or_else(|| config.model.clone()),
         provider: config.provider, reasoning: config.reasoning.clone(),
         max_output: config.max_output,
         context_window: config.context_window,
         session: Some(child_session_id(config.session.as_deref(), &subagent_id)),
     };
     let provider = kernel.llm_provider(&child_config);
-    let run_root = kernel.run_workspace_root(run_id).await;
     // 沙盘装配：Extension → Subagent 绑定给该类型子智能体授权扩展能力
     // （Skill 预注入 + mcp__/load_skill 进白名单），required 在子循环内强制真实调用。
-    let grants = kernel.subagent_grants(run_root.as_deref(), &definition.name).await;
+    let mut grants = kernel.subagent_grants(run_root.as_deref(), &definition.name).await;
+    grants.extend(extra_grants);
+    if let Some(squad) = &squad {
+        // 军团级授权全员生效（含指挥）；指挥独享军团内 ext→指挥 的装配绑定。
+        grants.extend(squad.squad_grants.clone());
+        grants.extend(squad.coordinator_grants.clone());
+    }
     // 空白名单 = 全放行（既有语义）；装配只在非空白名单上扩权，不得误收窄。
     let base_open = definition.tools.is_empty();
     let mut allowed = definition.tools.clone();
@@ -905,15 +1139,51 @@ async fn run_subagent(
         }
         tools.push(spec);
     }
+    if let Some(squad) = &squad {
+        // 指挥的派发工具：enum 收窄为 dispatch 边连出的成员（编排即声明）。
+        let member_names: Vec<String> = squad.members.iter().map(|member| member.agent.clone()).collect();
+        let required: Vec<&str> = squad.members.iter().filter(|m| m.required).map(|m| m.agent.as_str()).collect();
+        let optional: Vec<&str> = squad.members.iter().filter(|m| !m.required).map(|m| m.agent.as_str()).collect();
+        tools.push(ToolSpec {
+            name: "spawn_subagent".into(),
+            description: format!(
+                "向军团成员派发只读研究任务并回收摘要（不写文件、不执行命令）。description 是短标题，prompt 是具体任务。必选成员：{}；可选：{}。",
+                if required.is_empty() { "无".into() } else { required.join("、") },
+                if optional.is_empty() { "无".into() } else { optional.join("、") },
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "subagent_type": { "type": "string", "enum": member_names, "description": "军团成员类型" },
+                    "description": { "type": "string" },
+                    "prompt": { "type": "string" }
+                },
+                "required": ["description", "prompt"]
+            }),
+        });
+    }
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
-    let tool_budget = subagent_tool_budget(&definition);
+    let tool_budget = subagent_tool_budget(&definition, &defaults);
+    let dispatch_prompt = squad.as_ref().map(|squad| squad_dispatch_prompt(squad, &defaults)).unwrap_or_default();
     let system_prompt = format!("{}
-{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(tool_budget), subagent_assembly_prompt(&grants));
+{}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(tool_budget), subagent_assembly_prompt(&grants), dispatch_prompt);
     // 必选装配：子循环内逐轮强制，全部真实调用后才允许收尾。
     let mut pending_grants: Vec<SubagentGrant> = grants
         .into_iter()
         .filter(|grant| grant.binding.required && grant.binding.missing.is_none())
         .collect();
+    // 指挥态：必选成员未实际派发前同样不许收尾（与装配核销同套机制）。
+    let mut pending_members: Vec<String> = squad
+        .as_ref()
+        .map(|squad| {
+            squad
+                .members
+                .iter()
+                .filter(|member| member.required)
+                .map(|member| member.agent.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut messages = vec![ChatMessage::text("system", system_prompt), ChatMessage::text("user", prompt.clone())];
 
     kernel.start_subagent(SubagentView {
@@ -965,8 +1235,14 @@ async fn run_subagent(
         let mut decode_tokens = 0u64;
         let mut last_input_tokens = None;
         let mut tool_count = 0usize;
+        // 空轮提醒只发一次：网关丢弃工具调用或模型空响应时给一次自愈
+        // 机会，再空则带诊断收尾而不是静默返回空报告。
+        let mut empty_reminded = false;
+        // 停滞检测：与父循环同口径——同名同参连续调用软警告→拦截→
+        // 硬终止，防止子智能体在小预算内反复相同调用空转。
+        let mut doom = DoomGuard::default();
         let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
-        for _ in 0..definition.steps.unwrap_or(8) {
+        for _ in 0..resolve_steps(&definition, &defaults) {
             if tool_count >= tool_budget {
                 return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{tool_budget} 次），已返回部分结论")), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
@@ -1047,11 +1323,45 @@ async fn run_subagent(
                 }
             }
             if outcome.tool_calls.is_empty() {
-                // 必选装配未清：不收尾，附装配提醒续跑（步数上限兜底）——
+                // 必选装配/必派成员未清：不收尾，附提醒续跑（步数上限兜底）——
                 // 与父级「正文已给但调用必须真实发生」同一口径。
-                if !pending_grants.is_empty() {
-                    messages.push(ChatMessage::text("user", pending_grants_reminder(&pending_grants)));
+                if !pending_grants.is_empty() || !pending_members.is_empty() {
+                    messages.push(ChatMessage::text("user", pending_reminder(&pending_grants, &pending_members)));
                     continue;
+                }
+                // 空轮/丢调用异常：完成一轮却零可见正文，或调用被丢弃——
+                // 提醒一次仍空则以诊断内容收尾，父级不再拿到空报告。
+                if text.trim().is_empty() {
+                    if !empty_reminded {
+                        empty_reminded = true;
+                        kernel
+                            .audit_turn_anomaly(
+                                run_id,
+                                format!(
+                                    "subagent={} finish_reason={} content_bytes={} dropped_tool_calls={}",
+                                    subagent_id,
+                                    outcome.finish_reason.as_deref().unwrap_or("none"),
+                                    text.len(),
+                                    outcome.dropped_tool_calls
+                                ),
+                            )
+                            .await;
+                        messages.push(ChatMessage::text(
+                            "user",
+                            "【系统提示】上一轮没有产生任何可见回复或可执行的工具调用。请直接以文本给出最终结论。",
+                        ));
+                        continue;
+                    }
+                    let content = format!(
+                        "子智能体未产生可见输出（finish_reason: {}{}）",
+                        outcome.finish_reason.as_deref().unwrap_or("unknown"),
+                        if outcome.dropped_tool_calls > 0 {
+                            format!("，丢弃 {} 个工具调用碎片", outcome.dropped_tool_calls)
+                        } else {
+                            String::new()
+                        }
+                    );
+                    return ChildOutcome { status: SubagentStatus::Completed, content, error: None, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                 }
                 return ChildOutcome { status: SubagentStatus::Completed, content: text, error: None, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
@@ -1068,15 +1378,110 @@ async fn run_subagent(
             let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
             let mut runnable: Vec<(String, String)> = Vec::new();
             let mut runnable_indices: Vec<usize> = Vec::new();
+            // 指挥的军团成员派发：与父循环同构——拦截 spawn 后 join_all 递归。
+            let mut member_spawns: Vec<(usize, String, crate::services::tool_router::ResolvedSquadMember, String, String)> = Vec::new();
+            // 停滞检测 pre-pass：与父循环同一阈值；Block 不执行改喂合成
+            // 错误，Abort 在本轮结果写回后带诊断收尾。
+            let mut doom_streaks: Vec<u32> = Vec::with_capacity(outcome.tool_calls.len());
+            let mut doom_abort: Option<(&str, u32)> = None;
+            for call in outcome.tool_calls.iter() {
+                let streak = doom.observe(call);
+                doom_streaks.push(streak);
+                if streak >= DOOM_ABORT && doom_abort.is_none() {
+                    doom_abort = Some((call.name.as_str(), streak));
+                }
+            }
             for (index, call) in outcome.tool_calls.iter().enumerate() {
-                if allowed_names.iter().any(|name| name == &call.name) {
+                if doom_streaks[index] >= DOOM_BLOCK {
+                    results[index] = Some(Err(doom_block_error(&call.name, doom_streaks[index])));
+                    continue;
+                }
+                if call.name == "spawn_subagent" {
+                    let Some(squad) = squad.as_ref() else {
+                        results[index] = Some(Err("本子智能体不是军团指挥，不能派发".into()));
+                        continue;
+                    };
+                    let member_type = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|value| value.get("subagent_type").and_then(|v| v.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| "explore".into());
+                    let Some(member) = squad.members.iter().find(|member| member.agent == member_type) else {
+                        results[index] = Some(Err(format!(
+                            "{member_type} 不是军团成员；可派：{}",
+                            squad.members.iter().map(|m| m.agent.as_str()).collect::<Vec<_>>().join("、")
+                        )));
+                        continue;
+                    };
+                    if member_spawns.len() >= resolve_max_parallel(&defaults) {
+                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", resolve_max_parallel(&defaults))));
+                        continue;
+                    }
+                    if !try_spawn_budget(&spawn_budget) {
+                        results[index] = Some(Err("本 run 子智能体总额度已用完".into()));
+                        continue;
+                    }
+                    let member_id = next_subagent_id(run_id);
+                    let member_desc = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|value| value.get("description").and_then(|v| v.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| "军团成员任务".into());
+                    let spawn_detail = format!("{member_type}/{member_desc}");
+                    kernel.emit_spawn(run_id, &member_id, ToolPhase::Started, &spawn_detail).await;
+                    kernel.record_spawn(run_id, &member_id, &spawn_detail).await;
+                    member_spawns.push((index, member_id, member.clone(), call.arguments.clone(), member_desc));
+                } else if allowed_names.iter().any(|name| name == &call.name) {
                     runnable.push((call.name.clone(), call.arguments.clone()));
                     runnable_indices.push(index);
                 } else {
                     results[index] = Some(Err(format!("子智能体不允许调用工具：{}", call.name)));
                 }
             }
-            tool_count += runnable.len();
+            tool_count += runnable.len() + member_spawns.len();
+            // 成员派发：Box::pin 递归 run_subagent（成员级+军团级授权并入），
+            // resolve_squad=false——成员只引用 agent 定义，禁止军团套军团。
+            if !member_spawns.is_empty() {
+                let futures: Vec<_> = member_spawns
+                    .iter()
+                    .map(|(_, member_id, member, arguments, _)| {
+                        let mut grants = member.grants.clone();
+                        if let Some(squad) = &squad {
+                            grants.extend(squad.squad_grants.clone());
+                        }
+                        Box::pin(run_subagent(
+                            kernel.clone(),
+                            config,
+                            session_id,
+                            run_id,
+                            member_id.clone(),
+                            arguments,
+                            cancel.clone(),
+                            spawn_budget.clone(),
+                            false,
+                            grants,
+                        ))
+                    })
+                    .collect();
+                let spawned = join_all(futures).await;
+                for ((index, member_id, member, _, member_desc), result) in member_spawns.into_iter().zip(spawned) {
+                    let detail = match &result {
+                        Ok(text) => text.chars().take(256).collect::<String>(),
+                        Err(error) => error.clone(),
+                    };
+                    kernel
+                        .emit_spawn(
+                            run_id,
+                            &member_id,
+                            if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed },
+                            &format!("{member_desc} · {detail}"),
+                        )
+                        .await;
+                    // 必选成员核销：派发成功即计（与装配核销同口径）。
+                    if result.is_ok() {
+                        pending_members.retain(|name| name != &member.agent);
+                    }
+                    results[index] = Some(result);
+                }
+            }
             if !runnable.is_empty() {
                 // Plan mode pins the gate to read-only regardless of the parent run's mode.
                 let executed = kernel.execute_subagent_tool_calls(run_id, &subagent_id, &runnable, Some(Mode::Plan)).await;
@@ -1088,11 +1493,14 @@ async fn run_subagent(
                     results[index] = Some(result);
                 }
             }
-            for (call, result) in outcome.tool_calls.iter().zip(results) {
-                let (text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+            for (index, (call, result)) in outcome.tool_calls.iter().zip(results).enumerate() {
+                let (mut text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
                     Ok(value) => (bounded_result_text(&value), false),
                     Err(error) => (format!("子智能体工具失败：{error}"), true),
                 };
+                if doom_streaks[index] == DOOM_WARN && !is_error {
+                    text.push_str(&doom_warn_note(doom_streaks[index]));
+                }
                 messages.push(ChatMessage {
                     role: "tool".into(),
                     content: text,
@@ -1104,10 +1512,21 @@ async fn run_subagent(
                     is_error,
                 });
             }
-            // 必选装配逐轮跟进：只要还没真实调用完，每一轮都提醒——
+            // 停滞硬终止：子智能体带诊断收尾，父级能读到停滞原因。
+            if let Some((name, streak)) = doom_abort {
+                let content = format!("子智能体检测到工具调用停滞：{name} 连续 {streak} 次完全相同，已终止");
+                kernel
+                    .audit_turn_anomaly(
+                        run_id,
+                        format!("subagent={} doom_abort tool={} streak={}", subagent_id, name, streak),
+                    )
+                    .await;
+                return ChildOutcome { status: SubagentStatus::Completed, content, error: None, input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms: started.elapsed().as_millis() as u64, decode_ms, decode_tokens, last_input_tokens, tool_count };
+            }
+            // 必选装配/必派成员逐轮跟进：只要还没真实完成，每一轮都提醒——
             // 直到核销或步数/预算耗尽（耗尽时在结果尾部标注违例）。
-            if !pending_grants.is_empty() {
-                messages.push(ChatMessage::text("user", pending_grants_reminder(&pending_grants)));
+            if !pending_grants.is_empty() || !pending_members.is_empty() {
+                messages.push(ChatMessage::text("user", pending_reminder(&pending_grants, &pending_members)));
             }
         }
         elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1140,6 +1559,12 @@ async fn run_subagent(
         summary.push_str(&format!(
             "\n【装配违例】架构沙盘绑定的必选扩展未被真实调用：{}——如结论依赖这些能力，请补调后重派。",
             pending_grants.iter().map(grant_label).collect::<Vec<_>>().join("、"),
+        ));
+    }
+    if !pending_members.is_empty() {
+        summary.push_str(&format!(
+            "\n【编排违例】军团指挥未派发必选成员：{}——如结论依赖这些视角，请补齐后重派。",
+            pending_members.join("、"),
         ));
     }
     let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens).await;
@@ -1175,10 +1600,21 @@ pub(crate) async fn run(
         let max_rounds = max_tool_rounds();
         let mut last_input_tokens: Option<u64> = None;
         let mut compaction_failures = 0u32;
+        // 全 run 子智能体总额度（父级 spawn、军团成员、孙级同池扣减）——防扇出。
+        let subagent_defaults = kernel.agent_defaults()?;
+        let spawn_budget = Arc::new(AtomicUsize::new(resolve_max_total(&subagent_defaults)));
         // 事后验收追问上限：模型无视欠账连续收尾时避免死循环，2 次后放行。
         // 会话级欠账仍在——下一轮首个实质调用照样被 Layer-B 拦。
         let mut post_nudges = 0u32;
         const POST_NUDGE_LIMIT: u32 = 2;
+        // 空轮追问上限：provider 完成一轮却零正文零可解析调用（网关丢弃
+        // 工具调用等瞬时异常）时追问自愈；耗尽后以可见标记收尾。
+        let mut empty_nudges = 0u32;
+        const EMPTY_NUDGE_LIMIT: u32 = 2;
+        // 停滞检测：同名同参调用连续出现时软警告→拦截→硬终止，
+        // 防止模型对同一失败调用原样重试烧完整个 max_rounds 预算。
+        let mut doom = DoomGuard::default();
+        let mut doom_block_audited = false;
         for _round in 0..max_rounds {
             if kernel.is_cancelled(run.id).await {
                 return Ok(false);
@@ -1264,10 +1700,54 @@ pub(crate) async fn run(
                 }
                 // 长度截断的回复与正常完成不可区分是误导性的——
                 // finish_reason 透出后向用户标记（DSH 同款语义）。
-                if let Some(reason) = outcome.finish_reason.as_deref() {
-                    if matches!(reason, "length" | "max_tokens" | "model_context_window_exceeded") {
-                        kernel.token(run.id, "\n\n[输出达到生成长度上限（max_tokens），回复已被截断]".into()).await;
+                let truncated = outcome
+                    .finish_reason
+                    .as_deref()
+                    .is_some_and(|reason| matches!(reason, "length" | "max_tokens" | "model_context_window_exceeded"));
+                if truncated {
+                    kernel.token(run.id, "\n\n[输出达到生成长度上限（max_tokens），回复已被截断]".into()).await;
+                }
+                // 空轮/丢调用异常：完成一轮却零可见正文，或 provider 报告了
+                // 工具调用（finish_reason=tool_calls / 碎片被丢弃）却一个都
+                // 没解析出来——先追问给模型自愈机会，耗尽后以用户可见标记
+                // 收尾，绝不静默完成。
+                let calls_lost = outcome.dropped_tool_calls > 0
+                    || outcome.finish_reason.as_deref() == Some("tool_calls");
+                if !truncated && (outcome.content.trim().is_empty() || calls_lost) {
+                    if empty_nudges < EMPTY_NUDGE_LIMIT {
+                        empty_nudges += 1;
+                        kernel
+                            .audit_turn_anomaly(
+                                run.id,
+                                format!(
+                                    "finish_reason={} content_bytes={} dropped_tool_calls={}",
+                                    outcome.finish_reason.as_deref().unwrap_or("none"),
+                                    outcome.content.len(),
+                                    outcome.dropped_tool_calls
+                                ),
+                            )
+                            .await;
+                        messages.push(ChatMessage::text(
+                            "user",
+                            "【系统提示】上一轮没有产生任何可见回复或可执行的工具调用。请直接以文本给出答复；如需调用工具，请重新发起。",
+                        ));
+                        continue;
                     }
+                    let dropped_note = if outcome.dropped_tool_calls > 0 {
+                        format!("，丢弃 {} 个工具调用碎片", outcome.dropped_tool_calls)
+                    } else {
+                        String::new()
+                    };
+                    kernel
+                        .token(
+                            run.id,
+                            format!(
+                                "\n\n[模型本轮未产生可见输出或可执行的工具调用（finish_reason: {}{}）。可能是网关格式异常——请重试或更换模型/网关]",
+                                outcome.finish_reason.as_deref().unwrap_or("unknown"),
+                                dropped_note
+                            ),
+                        )
+                        .await;
                 }
                 return Ok(true);
             }
@@ -1288,10 +1768,35 @@ pub(crate) async fn run(
             let mut normal_indices: Vec<usize> = Vec::new();
             let mut spawns = Vec::new();
             let mut asks = Vec::new();
+            // 停滞检测 pre-pass：按序计数同名同参连续调用。
+            // Warn 照常执行（结果尾部附警告）；Block 不执行改喂合成错误；
+            // Abort 记录后在本轮消息落库后硬终止。
+            let mut doom_streaks: Vec<u32> = Vec::with_capacity(outcome.tool_calls.len());
+            let mut doom_abort: Option<(&str, u32)> = None;
+            for call in outcome.tool_calls.iter() {
+                let streak = doom.observe(call);
+                doom_streaks.push(streak);
+                if streak >= DOOM_ABORT && doom_abort.is_none() {
+                    doom_abort = Some((call.name.as_str(), streak));
+                }
+            }
             for (index, call) in outcome.tool_calls.iter().enumerate() {
+                if doom_streaks[index] >= DOOM_BLOCK {
+                    results[index] = Some(Err(doom_block_error(&call.name, doom_streaks[index])));
+                    if !doom_block_audited {
+                        doom_block_audited = true;
+                        kernel
+                            .audit_turn_anomaly(
+                                run.id,
+                                format!("doom_block tool={} streak={}", call.name, doom_streaks[index]),
+                            )
+                            .await;
+                    }
+                    continue;
+                }
                 if call.name == "spawn_subagent" {
-                    if spawns.len() >= max_parallel_subagents() {
-                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", max_parallel_subagents())));
+                    if spawns.len() >= resolve_max_parallel(&subagent_defaults) {
+                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", resolve_max_parallel(&subagent_defaults))));
                         continue;
                     }
                     let description = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
@@ -1317,7 +1822,18 @@ pub(crate) async fn run(
                 results[index] = Some(result);
             }
             let spawned = join_all(spawns.iter().map(|(_, subagent_id, arguments, _)| {
-                run_subagent(kernel.clone(), &config, run.session_id, run.id, subagent_id.clone(), arguments, cancel.clone())
+                run_subagent(
+                    kernel.clone(),
+                    &config,
+                    run.session_id,
+                    run.id,
+                    subagent_id.clone(),
+                    arguments,
+                    cancel.clone(),
+                    spawn_budget.clone(),
+                    true,
+                    Vec::new(),
+                )
             })).await;
             for ((index, subagent_id, _, description), result) in spawns.into_iter().zip(spawned) {
                 let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
@@ -1330,11 +1846,14 @@ pub(crate) async fn run(
                     results[index] = Some(result);
                 }
             }
-            for (call, result) in outcome.tool_calls.iter().zip(results) {
-                let (text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+            for (index, (call, result)) in outcome.tool_calls.iter().zip(results).enumerate() {
+                let (mut text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
                     Ok(text) => (text, false),
                     Err(error) => (format!("工具调用失败：{error}"), true),
                 };
+                if doom_streaks[index] == DOOM_WARN && !is_error {
+                    text.push_str(&doom_warn_note(doom_streaks[index]));
+                }
                 messages.push(ChatMessage {
                     role: "tool".into(),
                     content: bounded_result_text(&text),
@@ -1366,6 +1885,15 @@ pub(crate) async fn run(
                 next_seq += new_messages.len() as i64;
                 saved_upto = messages.len();
                 let _ = kernel.save_run_messages(new_messages).await;
+            }
+            // 停滞硬终止：模型无视警告与拦截仍原样重发同一调用——
+            // 可见标记 + 审计，run 完成（停滞上下文已落库，「继续」可见）。
+            if let Some((name, streak)) = doom_abort {
+                kernel
+                    .audit_turn_anomaly(run.id, format!("doom_abort tool={name} streak={streak}"))
+                    .await;
+                kernel.token(run.id, doom_abort_marker(name, streak)).await;
+                return Ok(true);
             }
         }
         // Tool budget exhausted — give the model one final no-tools turn to
@@ -1637,6 +2165,31 @@ mod tests {
     }
 
     #[test]
+    fn doom_guard_counts_only_consecutive_identical_calls() {
+        let call = |name: &str, args: &str| ToolCallSpec {
+            id: "c".into(),
+            name: name.into(),
+            arguments: args.into(),
+        };
+        let mut doom = DoomGuard::default();
+        assert_eq!(doom.observe(&call("list_dir", r#"{"path":"."}"#)), 1);
+        assert_eq!(doom.observe(&call("list_dir", r#"{"path":"."}"#)), 2);
+        assert_eq!(doom.observe(&call("list_dir", r#"{"path":"."}"#)), 3);
+        // 换参数即重置——不跨不同调用累加。
+        assert_eq!(doom.observe(&call("list_dir", r#"{"path":"src"}"#)), 1);
+        // 换工具同样重置。
+        assert_eq!(doom.observe(&call("read_file", r#"{"path":"."}"#)), 1);
+        // 交错模式（A,B,A,B）永不触发。
+        for _ in 0..10 {
+            doom.observe(&call("a", "{}"));
+            assert_eq!(doom.observe(&call("b", "{}")), 1);
+        }
+        // 空白参数也算有效签名。
+        assert_eq!(doom.observe(&call("pwd", "")), 1);
+        assert_eq!(doom.observe(&call("pwd", "")), 2);
+    }
+
+    #[test]
     fn provider_usage_gates_compaction_with_an_output_reserve() {
         let messages = vec![ChatMessage::text("user", "hi")];
         let window = Some(200_000);
@@ -1840,12 +2393,34 @@ mod tests {
     #[test]
     fn subagent_tool_budget_defaults_and_clamps() {
         let mut definition = crate::domain::AgentDefinition::builtin("explore").unwrap();
-        assert_eq!(subagent_tool_budget(&definition), crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET as usize);
+        let empty = crate::domain::SubagentDefaults::default();
+        assert_eq!(subagent_tool_budget(&definition, &empty), crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET as usize);
         definition.tool_budget = Some(0);
-        assert_eq!(subagent_tool_budget(&definition), 1);
+        assert_eq!(subagent_tool_budget(&definition, &empty), 1);
         definition.tool_budget = Some(9999);
-        assert_eq!(subagent_tool_budget(&definition), crate::domain::MAX_SUBAGENT_TOOL_BUDGET as usize);
+        assert_eq!(subagent_tool_budget(&definition, &empty), crate::domain::MAX_SUBAGENT_TOOL_BUDGET as usize);
         definition.tool_budget = Some(60);
-        assert_eq!(subagent_tool_budget(&definition), 60);
+        assert_eq!(subagent_tool_budget(&definition, &empty), 60);
+    }
+
+    #[test]
+    fn subagent_defaults_form_the_middle_fallback_tier() {
+        let mut definition = crate::domain::AgentDefinition::builtin("explore").unwrap();
+        let defaults = crate::domain::SubagentDefaults { model: None, steps: Some(12), tool_budget: Some(42), max_parallel: Some(3), max_total: Some(9) };
+        // 未设置字段回退到全局默认；已设置字段（steps=Some(8)）agent 胜出。
+        assert_eq!(resolve_steps(&definition, &defaults), 8);
+        assert_eq!(subagent_tool_budget(&definition, &defaults), 42);
+        definition.steps = None;
+        assert_eq!(resolve_steps(&definition, &defaults), 12);
+        assert_eq!(resolve_max_parallel(&defaults), 3);
+        assert_eq!(resolve_max_total(&defaults), 9);
+        // 全局默认也未设置时回退内置；env 仅作未设置项的兜底。
+        let empty = crate::domain::SubagentDefaults::default();
+        assert_eq!(resolve_max_parallel(&empty), 2);
+        assert_eq!(resolve_max_total(&empty), 8);
+        // 文件值超界时 clamp，而不是透传。
+        let wild = crate::domain::SubagentDefaults { max_parallel: Some(99), max_total: Some(0), ..Default::default() };
+        assert_eq!(resolve_max_parallel(&wild), 4);
+        assert_eq!(resolve_max_total(&wild), 1);
     }
 }

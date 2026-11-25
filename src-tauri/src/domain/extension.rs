@@ -29,6 +29,9 @@ pub struct SkillImportOutcome {
     pub error: Option<String>,
 }
 
+/// Agent 批量导入复用同构三态结果（status: imported/skipped/failed）。
+pub type AgentImportOutcome = SkillImportOutcome;
+
 /// A `/<name>` prompt template stored as Markdown under `commands/`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

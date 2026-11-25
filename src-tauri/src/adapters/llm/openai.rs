@@ -97,6 +97,9 @@ impl LlmProvider for OpenAiProvider {
 #[derive(Default)]
 pub(crate) struct OpenAiParser {
     tool_calls: BTreeMap<u64, ToolCallSpec>,
+    /// 已解析但缺 `function.name` 而被 drain 丢弃的碎片数——网关把调用
+    /// 打成残缺 delta（vLLM/DSML 长上下文缺 START token 等）时据此取证。
+    dropped: usize,
     saw_finish: bool,
     inside_think: bool,
     think_buf: String,
@@ -104,6 +107,55 @@ pub(crate) struct OpenAiParser {
     /// DeepSeek/OpenAI 要求历史只带 content）。
     content: String,
     finish_reason: Option<String>,
+}
+
+/// 把一条工具调用片段并入 index 键控累积表。name 依次回退
+/// `/function/name` → 顶层 `name` → `function` 裸字符串（部分网关
+/// 打平结构）；`append_args=true` 用于流式 arguments 分片（逐段追加），
+/// `false` 用于终帧完整调用（只补空缺，防止与已流式片段重复拼接）。
+/// 返回本片段的可见文本（首个 name 或新增 args），供打点用。
+fn merge_call(
+    tool_calls: &mut BTreeMap<u64, ToolCallSpec>,
+    call: &Value,
+    position: usize,
+    append_args: bool,
+) -> String {
+    let index = call
+        .get("index")
+        .and_then(|i| i.as_u64())
+        .unwrap_or(position as u64);
+    let acc = tool_calls.entry(index).or_default();
+    let mut text = String::new();
+    if let Some(id) = call.get("id").and_then(|i| i.as_str()).filter(|id| !id.is_empty()) {
+        if acc.id.is_empty() {
+            acc.id = id.into();
+        }
+    }
+    let name = call
+        .pointer("/function/name")
+        .and_then(|n| n.as_str())
+        .or_else(|| call.get("name").and_then(|n| n.as_str()))
+        .or_else(|| call.get("function").and_then(|f| f.as_str()));
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        if acc.name.is_empty() {
+            acc.name = name.into();
+            text.push_str(name);
+        }
+    }
+    let args = call
+        .pointer("/function/arguments")
+        .and_then(|a| a.as_str())
+        .or_else(|| call.get("arguments").and_then(|a| a.as_str()));
+    if let Some(args) = args.filter(|a| !a.is_empty()) {
+        if append_args {
+            acc.arguments.push_str(args);
+            text.push_str(args);
+        } else if acc.arguments.is_empty() {
+            acc.arguments.push_str(args);
+            text.push_str(args);
+        }
+    }
+    text
 }
 
 impl OpenAiParser {
@@ -207,26 +259,35 @@ impl FrameParser for OpenAiParser {
             {
                 // DSH isTokenDelta 口径：name 出现或 arguments 非空的 tool-call
                 // delta 视为可见生成输出，是首 token/decode 窗口的打点边界。
-                let mut visible = false;
                 let mut delta_text = String::new();
-                for call in calls {
-                    let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                    let acc = self.tool_calls.entry(index).or_default();
-                    if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
-                        acc.id = id.into();
-                    }
-                    if let Some(name) = call.pointer("/function/name").and_then(|n| n.as_str()) {
-                        acc.name = name.into();
-                        visible = true;
-                        delta_text.push_str(name);
-                    }
-                    if let Some(args) = call.pointer("/function/arguments").and_then(|a| a.as_str()) {
-                        acc.arguments.push_str(args);
-                        visible |= !args.is_empty();
-                        delta_text.push_str(args);
-                    }
+                for (position, call) in calls.iter().enumerate() {
+                    delta_text.push_str(&merge_call(&mut self.tool_calls, call, position, true));
                 }
-                if visible {
+                if !delta_text.is_empty() {
+                    events.push(StreamEvent::ToolCallDelta(delta_text));
+                }
+            }
+            // 旧版单调用格式：delta.function_call{name,arguments} → index 0。
+            if let Some(call) = choice
+                .pointer("/delta/function_call")
+                .filter(|call| call.is_object())
+            {
+                let text = merge_call(&mut self.tool_calls, call, 0, true);
+                if !text.is_empty() {
+                    events.push(StreamEvent::ToolCallDelta(text));
+                }
+            }
+            // 部分网关在终帧把完整调用放在 message.tool_calls（而非 delta）——
+            // delta 为空时整体采用，非空时 merge_call 只补缺位、不重复拼接。
+            if let Some(calls) = choice
+                .pointer("/message/tool_calls")
+                .and_then(|calls| calls.as_array())
+            {
+                let mut delta_text = String::new();
+                for (position, call) in calls.iter().enumerate() {
+                    delta_text.push_str(&merge_call(&mut self.tool_calls, call, position, false));
+                }
+                if !delta_text.is_empty() {
                     events.push(StreamEvent::ToolCallDelta(delta_text));
                 }
             }
@@ -249,10 +310,15 @@ impl FrameParser for OpenAiParser {
     }
 
     fn drain_tool_calls(&mut self) -> Vec<ToolCallSpec> {
-        std::mem::take(&mut self.tool_calls)
+        let (ready, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut self.tool_calls)
             .into_values()
-            .filter(|call| !call.name.is_empty())
-            .collect()
+            .partition(|call| !call.name.is_empty());
+        self.dropped = dropped.len();
+        ready
+    }
+
+    fn dropped_tool_call_count(&self) -> usize {
+        self.dropped
     }
 
     fn take_content(&mut self) -> String {
@@ -308,6 +374,56 @@ mod tests {
         assert!(events.contains(&StreamEvent::Reasoning("推理一".into())));
         assert!(events.contains(&StreamEvent::Reasoning("段".into())));
         assert!(events.contains(&StreamEvent::Token("正文".into())));
+    }
+
+    #[test]
+    fn message_level_tool_calls_are_adopted() {
+        // 部分网关把完整调用放在终帧 message.tool_calls（而非 delta）。
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想了一下\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"message\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut parser = OpenAiParser::default();
+        feed(&mut parser, wire.as_bytes());
+        let calls = parser.drain_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn legacy_function_call_and_flat_names_are_parsed() {
+        // 旧版 delta.function_call 与打平的 name/arguments 同样归并。
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"dir\"}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"function_call\":{\"arguments\":\"\\\":\\\"x\\\"}\"}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"name\":\"grep_files\",\"arguments\":\"{\\\"q\\\":\\\"y\\\"}\"}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut parser = OpenAiParser::default();
+        feed(&mut parser, wire.as_bytes());
+        let calls = parser.drain_tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[0].arguments, "{\"dir\":\"x\"}");
+        assert_eq!(calls[1].name, "grep_files");
+        assert_eq!(calls[1].arguments, "{\"q\":\"y\"}");
+    }
+
+    #[test]
+    fn nameless_fragments_are_dropped_and_counted() {
+        // 只来了 arguments 没有 name 的碎片：不执行，但计数用于异常取证。
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c9\",\"function\":{\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut parser = OpenAiParser::default();
+        feed(&mut parser, wire.as_bytes());
+        assert!(parser.drain_tool_calls().is_empty());
+        assert_eq!(parser.dropped_tool_call_count(), 1);
     }
 
     #[test]

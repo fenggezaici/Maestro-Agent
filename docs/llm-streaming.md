@@ -67,3 +67,22 @@ Rust 集成测试使用本地 OpenAI 兼容服务，覆盖真实 HTTP、先后�
 - sends `Accept-Encoding: identity` so an intermediate compression layer cannot corrupt the stream.
 
 If the same failure repeats at the same point, check the gateway/proxy or network before increasing retries.
+
+## 空轮（empty turn）语义
+
+模型完成一轮却零可见正文、零可解析工具调用时，run **不再静默完成**：
+
+- 工具调用捕获覆盖三种 wire 形状——`delta.tool_calls`（标准，含打平的 `name`/`arguments` 回退）、`delta.function_call`（旧版单调用）、终帧 `message.tool_calls`（部分网关放置完整调用）。已累积 id/args 但始终缺 `function.name` 的碎片被丢弃并计数（`TurnOutcome.dropped_tool_calls`）。
+- 空轮（content 为空）或丢调用（`finish_reason: tool_calls`/`dropped_tool_calls > 0` 却零调用）→ 注入合成追问「请直接以文本回答，或重新发起工具调用」续跑，封顶 2 次（vLLM/DSML 长上下文间歇丢调用可自愈）。
+- 追问耗尽仍为空 → 输出用户可见标记（含 finish_reason 与丢弃碎片数），run 以 completed 收尾但绝不无提示。
+- `length`/`max_tokens` 截断仍走原截断标记直接完成，不追问。
+- 每次空轮写 `audit` 表 `turn_empty` 行（finish_reason + content 字节数 + 丢弃碎片数），事后可直接取证；子智能体循环同款兜底（提醒一次后带诊断结论收尾，父级不再拿到空报告）。
+
+## 停滞检测（doom loop）
+
+同名同参工具调用（`name + arguments` 字节级签名，与 OpenCode 同口径；交错模式不触发）**连续**出现时渐进处置——防止模型对同一失败调用原样重试烧完整个工具预算：
+
+- 第 3 次（`DOOM_WARN`）：照常执行，结果尾部追加「请说明原因或改变策略」；
+- 第 4–5 次（`DOOM_BLOCK`）：**拦截不执行**，合成错误结果喂回模型（error-as-observation），首次拦截写审计；
+- 第 6 次（`DOOM_ABORT`）：硬终止本轮 run——可见标记 + `doom_abort` 审计行，run 以 completed 收尾（停滞上下文已落库，「继续」时模型能看到完整记录）。
+- 主循环与子智能体循环同口径；架构沙盘的必调义务天然不受影响——义务按「工具名 + 目标」匹配，不同 skill/文件/MCP 工具是不同签名，且前 3 次真实执行已满足义务。

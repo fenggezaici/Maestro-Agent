@@ -187,6 +187,9 @@ pub struct TurnOutcome {
     pub thinking: Option<serde_json::Value>,
     /// Provider stop/finish reason (`stop`, `length`, `end_turn`, `max_tokens`…).
     pub finish_reason: Option<String>,
+    /// Tool-call fragments the provider streamed but the parser could not
+    /// reconcile (e.g. missing function name) — zero when nothing was dropped.
+    pub dropped_tool_calls: usize,
     /// Last input-token usage the provider reported on this turn. Feeds the
     /// compaction trigger (provider usage is authoritative over char
     /// estimates: it counts system prompt, tool schemas and framing).
@@ -200,9 +203,11 @@ impl TurnOutcome {
     }
 
     fn completed(parser: &mut dyn FrameParser) -> Self {
+        let tool_calls = parser.drain_tool_calls();
         Self {
             done: true,
-            tool_calls: parser.drain_tool_calls(),
+            dropped_tool_calls: parser.dropped_tool_call_count(),
+            tool_calls,
             content: parser.take_content(),
             thinking: parser.take_thinking(),
             finish_reason: parser.finish_reason(),
@@ -244,6 +249,11 @@ pub(crate) trait FrameParser: Send {
     /// never seen (truncated stream).
     fn finish(&mut self) -> AppResult<Vec<StreamEvent>>;
     fn drain_tool_calls(&mut self) -> Vec<ToolCallSpec>;
+    /// 最近一次 drain 丢弃的残缺碎片数（累积了 id/args 但始终缺 name）——
+    /// 网关发出无法归并的调用时据此区分「模型没发」与「发了没解析出来」。
+    fn dropped_tool_call_count(&self) -> usize {
+        0
+    }
     /// Streamed assistant text accumulated this attempt; taken when the turn
     /// completes so the caller can replay it into `messages`.
     fn take_content(&mut self) -> String;

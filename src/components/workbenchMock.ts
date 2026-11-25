@@ -78,15 +78,21 @@ export function usePreviewExtensions(): ExtensionsController {
     ] },
     { name: 'github', command: '', args: [], transport: 'http', url: 'https://api.githubcopilot.com/mcp/', headerKeys: ['Authorization'], timeoutMs: null, env: {}, disabled: false, autoStart: false, trust: false, running: false, toolCount: 0, error: null, tools: [] },
   ]);
+  const [agents, setAgents] = useState<AgentDefinition[]>([
+    { name: 'explore', description: '只读代码调研：并行查找文件、证据路径与风险', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, toolBudget: 100, hidden: false, color: '#8B5CF6', source: 'builtin' },
+    { name: 'general', description: '只读分析总结：整理多来源信息并给出结论', category: '研究', mode: 'subagent', prompt: '', tools: ['read_file', 'list_dir', 'load_skill'], steps: 8, toolBudget: 100, hidden: false, color: '#22D3EE', source: 'builtin' },
+    { name: 'reviewer', description: '项目级代码评审示例', category: '质量', mode: 'subagent', prompt: '', tools: ['read_file'], steps: 6, toolBudget: 80, hidden: false, color: '#F59E0B', source: 'global' },
+  ]);
   const [pending, setPending] = useState<string | null>(null);
   const noop = async () => null;
   return {
-    skills, servers, plugins: [],
+    skills, servers, plugins: [], agents,
+    agentDefaults: { model: null, steps: null, toolBudget: null, maxParallel: null, maxTotal: null },
     recommendedSkills: previewRecommended.filter((i) => i.kind === 'skill'),
     recommendedMcps: previewRecommended.filter((i) => i.kind === 'mcp'),
     mcpConfigText: '{\n  "mcpServers": {\n    "filesystem": { "command": "npx", "args": ["-y", "server-fs"] }\n  }\n}',
     loading: false, pending, loadError: null,
-    importSummary: null, real: false, hasWorkspace: true,
+    importSummary: null, agentImportSummary: null, real: false, hasWorkspace: true,
     installErrors: {}, isInstalled: () => false,
     refresh: async () => {},
     createSkill: async (name, description, scope = 'global') => { setSkills((items) => [...items, { name, description, source: scope, path: `~/.maestro/skills/${name}/SKILL.md` }]); return null; },
@@ -102,5 +108,17 @@ export function usePreviewExtensions(): ExtensionsController {
     },
     removeMcpServer: async (name) => { setServers((items) => items.filter((item) => item.name !== name)); return null; },
     installRecommended: noop,
+    deleteAgent: async (agent) => { setAgents((items) => items.filter((item) => !(item.name === agent.name && item.source === agent.source))); return null; },
+    importAgentsDir: noop, importAgentsGithub: noop,
+    setAgentsHidden: async (items, hidden) => {
+      const names = new Set(items.map((item) => item.name));
+      setAgents((list) => list.map((item) => names.has(item.name) ? { ...item, hidden } : item));
+      return null;
+    },
+    deleteAgents: async (items) => {
+      const keys = new Set(items.map((item) => `${item.scope}:${item.name}`));
+      setAgents((list) => list.filter((item) => !keys.has(`${item.source ?? 'global'}:${item.name}`)));
+      return null;
+    },
   };
 }

@@ -208,6 +208,8 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [reviewOpen, setReviewOpen] = useState(() => restoredPanel?.reviewOpen === true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsVersion, setSettingsVersion] = useState(0);
+  // 扩展面板「编辑 / 新建子智能体」深链目标：{name:null} 表示新建草稿。
+  const [agentFocus, setAgentFocus] = useState<{ name: string | null; tick: number } | null>(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
@@ -725,7 +727,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
         {navigation === 'agents' && planSteps.length > 0 && <TaskPlanPanel steps={planSteps} running={planRunning} variant="card" />}
         {navigation === 'activity' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading dashboard…</div>}>
           <ActivityDashboard data={dashboardData} projectName={activityScopes.find((scope) => scope.id === activityScope)?.name ?? '全部项目'} scopes={activityScopes} scope={activityScope} onScopeChange={setActivityScope} onBack={() => setNavigation('agents')} loading={!preview && !liveDashboard && !activityError} error={activityError} />
-        </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} />
+        </Suspense> : navigation === 'extensions' ? <ExtensionsView controller={extensions} onConfigureAgent={(name) => { setAgentFocus({ name, tick: Date.now() }); setSettingsOpen(true); }} />
           : navigation === 'sandbox' ? <Suspense fallback={<div role="status" className="dashboard-loading">Loading sandbox…</div>}><ArchitectureSandbox preview={preview} extensions={extensions} trace={c.architectureTrace ?? null} /></Suspense> : navigation === 'automations' ? <div className="automation-page"><span className="welcome-icon"><Zap size={27} strokeWidth={1.25} /></span><h3>Your agents, on autopilot.</h3><p>定时执行重复性任务，让专注留给更重要的工作。</p><div className="automation-placeholder"><Clock3 size={19} /><div><strong>Scheduled agents</strong><p>自动任务尚未接入后端，本次重构仅展示入口。</p></div><span className="soon-label">Coming soon</span></div><button className="button-ghost" onClick={() => setNavigation('agents')}>返回 Agents<ArrowUpRight size={14} /></button></div>
           : <>
             <ChatStream historyRef={history} runs={c.runs} loadingSession={c.loadingSession}
@@ -773,7 +775,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
       </main>
       } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} subagents={sessionSubagents} activeSubagentId={activeSubagentId} onActiveSubagent={setActiveSubagentId} onCancelSubagent={cancelSubagent} reasoningDisplay={preferences.reasoningDisplay} light={theme === 'light'} onOpenWorkspaceFile={openWorkspaceFile} /> : null} />
     </div>
-    <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} />
+    <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} agentFocus={agentFocus} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}
       files={paletteFiles} filesLoading={!preview && paletteOpen && workspace.loading}
       onSelectSession={(id) => { setNavigation('agents'); c.selectSession(id); }}

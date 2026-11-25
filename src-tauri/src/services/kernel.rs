@@ -193,6 +193,11 @@ pub struct Kernel {
     full_access_sessions: StdMutex<HashSet<i64>>,
     /// Provider API keys at rest (DPAPI on Windows); the webview never persists them.
     credentials: CredentialStore,
+    /// 弱自引用：`set_workspace_root` 触发后台 MCP 补恢复需要 'static Kernel。
+    self_ref: std::sync::OnceLock<std::sync::Weak<Kernel>>,
+    /// 上次 MCP 恢复所见到的工作区根——root 变更时幂等补跑一次恢复
+    ///（启动恢复时 root 尚未就位，工作区相对命令的解析不同）。
+    mcp_restored_for: Mutex<Option<PathBuf>>,
 }
 
 impl Kernel {
@@ -226,7 +231,10 @@ impl Kernel {
             approval_rules: StdMutex::new(HashMap::new()),
             full_access_sessions: StdMutex::new(HashSet::new()),
             credentials,
+            self_ref: std::sync::OnceLock::new(),
+            mcp_restored_for: Mutex::new(None),
         });
+        let _ = kernel.self_ref.set(Arc::downgrade(&kernel));
         // 全局架构规则不依赖工作区，启动即装载（项目规则随 set_workspace_root 生效）。
         kernel.router.reload_architecture().await;
         kernel.emit_locked(&mut *kernel.state.lock().await, EventData::Ready);
@@ -244,7 +252,18 @@ impl Kernel {
     /// Startup restore for MCP servers the user left enabled. Failures stay
     /// per-server and never block the app.
     pub async fn start_enabled_mcp(&self) {
-        self.extensions().mcp.start_enabled().await;
+        self.extensions()
+            .mcp
+            .start_enabled(&|_| self.emit_extensions_changed())
+            .await;
+    }
+
+    /// MCP 状态变化的内容无关刷新提示：try_lock 争用时可丢——下一次
+    /// 状态变更会再发一次，事件本身不携带数据。
+    fn emit_extensions_changed(&self) {
+        if let Ok(mut state) = self.state.try_lock() {
+            self.emit_locked(&mut state, EventData::ExtensionsChanged);
+        }
     }
 
     /// Resolve the LLM adapter for this run's provider.
@@ -263,7 +282,22 @@ impl Kernel {
                 assets: status.assets,
             });
         }
-        self.router.set_workspace_root(root).await;
+        self.router.set_workspace_root(root.clone()).await;
+        // 启动恢复发生时 root 尚未就位——工作区相对命令的解析不同，恢复时
+        // 失败的 spawn 在手动重勾时反而能成。root 变更时后台幂等补跑一次
+        //（running 中的服务早退，不阻塞本调用）。
+        if let Some(path) = root {
+            let mut restored = self.mcp_restored_for.lock().await;
+            if restored.as_ref() != Some(&path) {
+                *restored = Some(path);
+                drop(restored);
+                if let Some(kernel) = self.self_ref.get().and_then(|weak| weak.upgrade()) {
+                    tauri::async_runtime::spawn(async move {
+                        kernel.start_enabled_mcp().await;
+                    });
+                }
+            }
+        }
     }
 
     /// `Some` when the root carries project `.maestro/` assets the user has
@@ -1919,6 +1953,16 @@ impl Kernel {
         self.router.subagent_grants(run_root, agent).await
     }
 
+    /// 军团运行时解析：squads[name] → 指挥/成员/各级装配授权。
+    /// spawn_subagent 的 type 在 agent 定义未命中时走这里；成员/孙级不查。
+    pub async fn squad_runtime(
+        &self,
+        run_root: Option<&std::path::Path>,
+        squad: &str,
+    ) -> Option<crate::services::tool_router::ResolvedSquad> {
+        self.router.squad_runtime(run_root, squad).await
+    }
+
     /// Run 末欠账查询：会话历史中仍挂着未验收的事后义务（optional 义务也计入——
     /// 它不拦调用但会追问）。非空时向画布发 pending trace 让节点亮琥珀色。
     pub async fn architecture_outstanding(
@@ -2254,6 +2298,38 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
         crate::adapters::agents::delete(self.router.extensions().maestro_dir(), workspace.as_deref(), &scope, &name)
     }
 
+    /// 批量启用/禁用（hidden 即禁用语义）；逐项三态，单项失败不阻断其余。
+    /// set_hidden 按 effective() 的 def.source 定位实际文件（item.scope 仅作卡片身份）。
+    pub async fn set_agents_hidden(&self, items: Vec<crate::domain::AgentItemRef>, hidden: bool) -> AppResult<Vec<crate::domain::AgentImportOutcome>> {
+        let workspace = self.router.workspace_root().await;
+        Ok(crate::adapters::agents::set_hidden(self.router.extensions().maestro_dir(), workspace.as_deref(), &items, hidden))
+    }
+
+    /// 批量删除：逐项三态；builtin 记 failed。
+    pub async fn delete_agents(&self, items: Vec<crate::domain::AgentItemRef>) -> AppResult<Vec<crate::domain::AgentImportOutcome>> {
+        let workspace = self.router.workspace_root().await;
+        Ok(crate::adapters::agents::delete_many(self.router.extensions().maestro_dir(), workspace.as_deref(), &items))
+    }
+
+    /// 批量导入本地目录 Agent ——写入全局 ~/.maestro/agents，不经工作区 scope。
+    pub async fn import_agents_dir(&self, path: String) -> AppResult<Vec<crate::domain::AgentImportOutcome>> {
+        crate::adapters::agents::import_from_dir(self.router.extensions().maestro_dir(), &path)
+    }
+
+    /// 浅克隆 GitHub 仓库后批量导入 Agent（agency-agents-zh 类格式转换）。
+    pub async fn import_agents_github(&self, repo_url: String) -> AppResult<Vec<crate::domain::AgentImportOutcome>> {
+        crate::adapters::agents::import_from_github(self.router.extensions().maestro_dir(), &repo_url).await
+    }
+
+    /// 全局子智能体默认（~/.maestro/agents.json）；每次 spawn 读取——文件仅数百字节。
+    pub fn agent_defaults(&self) -> AppResult<crate::domain::SubagentDefaults> {
+        crate::adapters::agents::load_defaults(self.router.extensions().maestro_dir())
+    }
+
+    pub async fn save_agent_defaults(&self, defaults: crate::domain::SubagentDefaults) -> AppResult<()> {
+        crate::adapters::agents::save_defaults(self.router.extensions().maestro_dir(), &defaults)
+    }
+
     pub async fn run_change_summary(&self, run_id: i64) -> AppResult<crate::domain::RunChangeSummary> {
         // Keep DB-side files/state, but report net additions/deletions over the
         // merged per-path diff (first before → last after) so the summary card
@@ -2543,6 +2619,15 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
             &mut state,
             EventData::Reasoning { run_id, token },
         );
+    }
+
+    /// 空轮取证：模型以零正文零调用完成一轮时落 `turn_empty` 审计行，
+    /// 携带 finish_reason 与丢弃碎片数——下次同类问题可直接查证。
+    pub(crate) async fn audit_turn_anomaly(&self, run_id: i64, detail: String) {
+        let _ = self
+            .database
+            .record_anomaly(run_id, "turn_empty".into(), detail)
+            .await;
     }
 
     pub(crate) async fn token(&self, run_id: i64, token: String) {
@@ -2945,9 +3030,10 @@ mod tests {
                 Ok(TurnOutcome {
                     done: true,
                     tool_calls: Vec::new(),
-                    content: String::new(),
+                    content: "Hello 世界".into(),
                     thinking: None,
                     finish_reason: None,
+                    dropped_tool_calls: 0,
                     input_tokens: None,
                 })
             })
@@ -4550,16 +4636,18 @@ mod tests {
             .await;
         let (id, _rx) = seed_run_mode(&kernel, Mode::Confirm).await;
         let worker = kernel.clone();
+        // whoami 在 Windows(System32) 与 Unix 上都是 PATH 常驻二进制；
+        // echo 依赖 Git usr\bin，纯 PowerShell 环境解析不到。
         let call = tokio::spawn(async move {
             worker
-                .execute_model_tool(id, "run_command", r#"{"command":"echo approved-run"}"#)
+                .execute_model_tool(id, "run_command", r#"{"command":"whoami"}"#)
                 .await
         });
         wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
         kernel.resolve_approval(id, ApprovalDecision::AllowOnce, CommandScope::Prefix, None).await.unwrap();
         let output = call.await.unwrap().unwrap();
         assert!(output.contains("exit code 0"), "{output}");
-        assert!(output.contains("approved-run"), "{output}");
+        assert!(output.trim().len() > "exit code 0".len(), "{output}");
         kernel.finish(id, RunStatus::Completed, None).await;
         kernel.shutdown().await.unwrap();
     }

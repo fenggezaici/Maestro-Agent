@@ -36,6 +36,9 @@ export interface KernelStore {
   /// Bumped on every `workspace_changed` kernel event — workspace views
   /// subscribe and refresh their tree/preview without polling.
   workspaceTick: number;
+  /// Bumped on every `extensions_changed` kernel event — the extensions page
+  /// re-pulls MCP server state (startup restore completes per-server).
+  extensionsTick: number;
   /// Untrusted `.maestro/` assets awaiting a trust decision (null = none).
   trustPrompt: { path: string; assets: string[] } | null;
   /** Ordered reasoning bursts and tool rows for the live run. */
@@ -209,6 +212,7 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
     pendingQuestion: null,
     compactions: [],
     workspaceTick: 0,
+    extensionsTick: 0,
     trustPrompt: null,
     liveTimeline: {},
     stoppingRunId: null,
@@ -314,6 +318,9 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
       }
       if (event.type === 'workspace_changed') {
         set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
+      }
+      if (event.type === 'extensions_changed') {
+        set((s) => ({ extensionsTick: s.extensionsTick + 1 }));
       }
       if (event.type === 'workspace_trust_required') {
         set({ trustPrompt: { path: event.path, assets: event.assets } });
