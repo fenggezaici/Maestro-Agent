@@ -19,38 +19,54 @@ pub struct OpenAiProvider;
 
 /// OpenAI wire format: assistant tool_calls become function objects; tool
 /// results travel as `role: "tool"` messages with `tool_call_id`.
+/// OpenAI 的 tool 角色不支持图像——tool 消息携带的 images 折叠进紧随的
+/// 合成 user 消息（业界标准做法）；文本里已附"[图像见下条消息]"指引。
 fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| {
-            if let Some(calls) = &message.tool_calls {
-                json!({
-                    "role": "assistant",
-                    "content": if message.content.is_empty() { Value::Null } else { message.content.clone().into() },
-                    "tool_calls": calls.iter().map(|call| json!({
-                        "id": call.id, "type": "function",
-                        "function": { "name": call.name, "arguments": call.arguments },
-                    })).collect::<Vec<_>>(),
-                })
-            } else if message.role == "tool" {
-                json!({
-                    "role": "tool",
-                    "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": message.content,
-                })
-            } else if message.role == "user" && message.images.as_ref().is_some_and(|v| !v.is_empty()) {
-                let mut content = vec![json!({ "type": "text", "text": message.content })];
-                for url in message.images.iter().flatten() {
-                    if url.starts_with("data:") && url.len() < 3_500_000 {
-                        content.push(json!({ "type": "image_url", "image_url": { "url": url } }));
-                    }
-                }
-                json!({ "role": "user", "content": content })
-            } else {
-                json!({ "role": message.role, "content": message.content })
-            }
-        })
-        .collect()
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        let wire = if let Some(calls) = &message.tool_calls {
+            json!({
+                "role": "assistant",
+                "content": if message.content.is_empty() { Value::Null } else { message.content.clone().into() },
+                "tool_calls": calls.iter().map(|call| json!({
+                    "id": call.id, "type": "function",
+                    "function": { "name": call.name, "arguments": call.arguments },
+                })).collect::<Vec<_>>(),
+            })
+        } else if message.role == "tool" {
+            json!({
+                "role": "tool",
+                "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
+                "content": message.content,
+            })
+        } else if message.role == "user" && message.images.as_ref().is_some_and(|v| !v.is_empty()) {
+            json!({ "role": "user", "content": openai_user_content(&message.content, message.images.as_deref().unwrap_or(&[])) })
+        } else {
+            json!({ "role": message.role, "content": message.content })
+        };
+        out.push(wire);
+        // tool 消息携带图像：OpenAI tool 角色无图像语义，折叠为紧随的合成
+        // user 消息——对话形状改变如实反映在 wire 层，模型经文本指引理解。
+        if message.role == "tool" && message.images.as_ref().is_some_and(|v| !v.is_empty()) {
+            out.push(json!({
+                "role": "user",
+                "content": openai_user_content("[以上工具结果附带的图像]", message.images.as_deref().unwrap_or(&[])),
+            }));
+        }
+    }
+    out
+}
+
+/// user 消息 content 数组：文本块 + 图像块（data URL 超 3.5MB 字符串上限的
+/// 静默丢弃——深层兜底，正常路径的压缩管线远在阈值之下）。
+fn openai_user_content(text: &str, images: &[String]) -> Vec<Value> {
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    for url in images {
+        if url.starts_with("data:") && url.len() < 3_500_000 {
+            content.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
+    }
+    content
 }
 
 impl LlmProvider for OpenAiProvider {
@@ -344,6 +360,39 @@ mod tests {
             }
         }
         events
+    }
+
+    #[test]
+    fn tool_result_images_fold_into_synthetic_user_message() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: "[图像 100×80 已编码注入]".into(),
+            tool_call_id: Some("call_1".into()),
+            name: Some("read_file".into()),
+            tool_calls: None,
+            images: Some(vec!["data:image/png;base64,AAAA".into()]),
+            thinking: None,
+            is_error: false,
+        }];
+        let wire = openai_messages(&messages);
+        assert_eq!(wire.len(), 2, "tool 文本 + 合成 user 图像消息");
+        assert_eq!(wire[0]["role"], "tool");
+        assert_eq!(wire[1]["role"], "user");
+        let parts = wire[1]["content"].as_array().expect("user 内容须为分块数组");
+        assert!(parts.iter().any(|part| part["type"] == "image_url"
+            && part["image_url"]["url"] == "data:image/png;base64,AAAA"));
+        assert!(parts.iter().any(|part| part["type"] == "text"));
+    }
+
+    #[test]
+    fn tool_result_without_images_stays_single_message() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: "plain".into(),
+            tool_call_id: Some("call_1".into()),
+            name: None, tool_calls: None, images: None, thinking: None, is_error: false,
+        }];
+        assert_eq!(openai_messages(&messages).len(), 1);
     }
 
     #[test]

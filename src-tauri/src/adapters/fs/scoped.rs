@@ -406,6 +406,20 @@ pub fn read_file_full(root: &Path, rel: &str) -> AppResult<String> {
     String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本文件".to_string())
 }
 
+/// 图像工具结果的二进制读取：与文本同一套边界（sensitive denylist、
+/// scoped 解析、大小上限），cap 由调用方按媒体管线语义给定（20MiB）。
+pub fn read_binary_scoped(root: &Path, rel: &str, cap: u64) -> AppResult<Vec<u8>> {
+    if is_sensitive_path(rel) {
+        return Err(sensitive_denied());
+    }
+    let file = scoped_path(root, rel)?;
+    let meta = std::fs::metadata(&file).map_err(|_| "文件不可读".to_string())?;
+    if meta.len() > cap {
+        return Err(format!("文件超过 {}MiB 图像上限", cap / 1024 / 1024));
+    }
+    std::fs::read(&file).map_err(|_| "文件不可读".to_string())
+}
+
 /// Resolve a workspace-relative write target. The parent directory must
 /// already exist inside `root` (writes never create directories or escape
 /// through symlinked parents); an existing target must canonicalize inside

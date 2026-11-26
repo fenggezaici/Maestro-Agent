@@ -73,6 +73,9 @@ pub struct ResolvedSquadMember {
 /// writes, the before/after contents the UI diffs in the tool row.
 pub struct ToolOutcome {
     pub text: String,
+    /// 图像工具结果（data URL，与 ChatMessage.images 同格式）——目前仅
+    /// read_file 读图产生；空向量表示纯文本结果。
+    pub images: Vec<String>,
     pub write: Option<fs::WriteReport>,
     /// Validated task-tracker steps from `update_plan`; the kernel emits them
     /// as a `task_plan_updated` event for the UI panel.
@@ -136,6 +139,9 @@ pub struct ToolRouter {
     extensions: ExtensionManager,
     credentials: crate::adapters::credentials::CredentialStore,
     workspace: Mutex<Option<PathBuf>>,
+    /// 当前 run 的视觉门控（run 启动时由 kernel 按 config 写入；单 active
+    /// run 语义与 workspace_root 一致）。false=非视觉模型→图像降级为元数据。
+    vision: Mutex<bool>,
     database: Arc<Database>,
     architecture: Mutex<ArchitectureState>,
     /// Canonical path → fingerprint the agent last observed via `read_file`
@@ -163,6 +169,7 @@ impl ToolRouter {
             extensions: ExtensionManager::new(maestro_dir.clone())?,
             credentials: crate::adapters::credentials::CredentialStore::open(&maestro_dir.join("credentials"))?,
             workspace: Mutex::new(None),
+            vision: Mutex::new(false),
             database,
             architecture: Mutex::new(ArchitectureState::default()),
             file_stamps: Mutex::new(HashMap::new()),
@@ -281,6 +288,11 @@ impl ToolRouter {
         Err(format!(
             "{tool} 已取消：{rel} 在批准期间被外部修改，请重新请求"
         ))
+    }
+
+    /// run 启动时按 config 写入视觉门控（单 active run 语义，与 workspace 一致）。
+    pub async fn set_vision_capable(&self, capable: bool) {
+        *self.vision.lock().await = capable;
     }
 
     pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
@@ -1165,6 +1177,27 @@ impl ToolRouter {
                 .ok_or_else(|| format!("{name} 需要 {key} 参数"))
         };
         let mut plan = None;
+        // 图像读取前置分流（不进 match——它是唯一产生 images 的工具路径）：
+        // 扩展名初筛后 magic bytes 由 media 管线解码核验；非视觉模型降级为
+        // 元数据文本而非注入图像（后端按 run 的 vision 门控判定）。
+        if tool == "read_file" {
+            if let Ok(rel) = arg("path", tool) {
+                if crate::adapters::media::is_image_path(rel) {
+                    let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                    let bytes = fs::read_binary_scoped(root, rel, crate::adapters::media::MAX_SOURCE_BYTES)?;
+                    if *self.vision.lock().await {
+                        let processed = crate::adapters::media::process(&bytes)?;
+                        let note = format!(
+                            "[图像 {}×{} 已编码注入（{}，{:.0} KiB）]",
+                            processed.width, processed.height, processed.media_type,
+                            processed.encoded_bytes as f64 / 1024.0
+                        );
+                        return Ok(ToolOutcome { text: note, images: vec![processed.data_url], write: None, plan });
+                    }
+                    return Ok(ToolOutcome { text: crate::adapters::media::metadata(&bytes)?, images: Vec::new(), write: None, plan });
+                }
+            }
+        }
         let (text, write) = match tool {
             "load_skill" => {
                 let name = arg("name", "load_skill")?;
@@ -1368,7 +1401,7 @@ impl ToolRouter {
             }
             _ => return Err("未注册的工具".into()),
         };
-        Ok(ToolOutcome { text, write, plan })
+        Ok(ToolOutcome { text, images: Vec::new(), write, plan })
     }
 
     /// 注入 System Prompt 的架构契约：列举必选 Skill/MCP/Plugin（带触发

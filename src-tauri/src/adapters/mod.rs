@@ -9,6 +9,7 @@ pub mod fs;
 pub mod git;
 pub mod llm;
 pub mod mcp;
+pub mod media;
 pub mod plugins;
 pub mod search;
 pub mod skills;

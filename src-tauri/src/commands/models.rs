@@ -40,6 +40,7 @@ pub async fn fetch_models(
         max_output: None,
         context_window: None,
         session: None,
+        vision_capable: false,
     })
     .await
 }

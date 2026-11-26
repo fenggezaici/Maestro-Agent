@@ -19,7 +19,7 @@ let channels: Map<string, (event: { payload: unknown }) => void>;
 
 beforeEach(() => {
   localStorage.clear();
-  localStorage.setItem(LLM_SETTINGS_KEY, JSON.stringify({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'test-model' }));
+  localStorage.setItem(LLM_SETTINGS_KEY, JSON.stringify({ apiKey: 'test-key', baseUrl: 'http://localhost:1234/v1', model: 'test-model', vision_capable: false }));
   // The live app resolves keys from the OS-protected store; the cache stands in for it here.
   setCredentialStatus(['openai', 'deepseek', 'anthropic']);
   channels = new Map();
@@ -124,7 +124,7 @@ describe('desktop IPC interface', () => {
     await ready();
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'a request' } });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], base_url: 'http://localhost:1234/v1', model: 'test-model' }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('stream_chat', { session_id: 1, messages: [{ role: 'user', content: 'a request' }], base_url: 'http://localhost:1234/v1', model: 'test-model', vision_capable: false }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeEnabled());
     expect(screen.getByLabelText('发送消息')).not.toBeDisabled();
     fireEvent.change(screen.getByLabelText('发送消息'), { target: { value: 'queued draft' } });

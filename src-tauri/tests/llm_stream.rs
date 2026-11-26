@@ -271,6 +271,7 @@ fn config(base_url: String) -> ChatConfig {
         max_output: None,
         context_window: None,
         session: None,
+        vision_capable: false,
     }
 }
 

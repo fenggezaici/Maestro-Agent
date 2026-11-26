@@ -28,6 +28,10 @@ use crate::{
     services::{agent_loop, extensions::ExtensionManager, tool_router::{ToolOutcome, ToolRouter}},
 };
 
+/// 工具执行产出的模型可见载荷：文本 + 图像 data URL 列表（目前仅
+/// read_file 读图产生）。Err 路径与此前一致——错误本就纯文本。
+type ToolPayload = (String, Vec<String>);
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -474,6 +478,8 @@ impl Kernel {
         // OpenCode gateways route/cache per conversation: keep one stable id
         // for every turn of this session.
         config.session = Some(format!("maestro-{session_id}"));
+        // 视觉门控随 run 生效：read_file 读图据此决定注入图像还是降级元数据。
+        self.router.set_vision_capable(config.vision_capable).await;
         let _command = self.commands.lock().await;
         let mode = {
             let state = self.state.lock().await;
@@ -1138,7 +1144,7 @@ impl Kernel {
         subagent_id: Option<&str>,
         tool: &str,
         reason: String,
-    ) -> AppResult<String> {
+    ) -> AppResult<ToolPayload> {
         if subagent_id.is_none() {
             let _ = self
                 .database
@@ -1475,6 +1481,7 @@ impl Kernel {
             .into_iter()
             .next()
             .unwrap_or_else(|| Err("missing tool result".into()))
+            .map(|(text, _)| text)
     }
 
     /// Execute a batch of model-requested calls that share ONE approval
@@ -1485,7 +1492,7 @@ impl Kernel {
         &self,
         run_id: i64,
         calls: &[(String, String)],
-    ) -> Vec<AppResult<String>> {
+    ) -> Vec<AppResult<ToolPayload>> {
         self.execute_tool_calls_scoped(run_id, calls, None, None).await
     }
 
@@ -1498,7 +1505,7 @@ impl Kernel {
         run_id: i64,
         calls: &[(String, String)],
         mode: Option<Mode>,
-    ) -> Vec<AppResult<String>> {
+    ) -> Vec<AppResult<ToolPayload>> {
         self.execute_tool_calls_scoped(run_id, calls, mode, None).await
     }
 
@@ -1510,7 +1517,7 @@ impl Kernel {
         subagent_id: &str,
         calls: &[(String, String)],
         mode: Option<Mode>,
-    ) -> Vec<AppResult<String>> {
+    ) -> Vec<AppResult<ToolPayload>> {
         self.execute_tool_calls_scoped(run_id, calls, mode, Some(subagent_id))
             .await
     }
@@ -1521,9 +1528,9 @@ impl Kernel {
         calls: &[(String, String)],
         mode: Option<Mode>,
         subagent_id: Option<&str>,
-    ) -> Vec<AppResult<String>> {
+    ) -> Vec<AppResult<ToolPayload>> {
         enum Gate {
-            Denied(AppResult<String>),
+            Denied(AppResult<ToolPayload>),
             Allow(ToolEffect),
             Suspended(ToolEffect, ApprovalCandidate),
         }
@@ -1734,7 +1741,7 @@ impl Kernel {
                 continue;
             }
             match &mut gates[index] {
-                Gate::Denied(result) => results.push(std::mem::replace(result, Ok(String::new()))),
+                Gate::Denied(result) => results.push(std::mem::replace(result, Ok((String::new(), Vec::new())))),
                 Gate::Suspended(effect, candidate) => {
                     // 本批已有批量决定：不再弹卡，直接套用（clone 而非 take —
                     // 同一决定对批内所有后续挂起生效，批入口负责清空）。
@@ -1768,7 +1775,7 @@ impl Kernel {
                         let mut result = self
                             .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "batch approved", *effect)
                             .await;
-                        if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                        if let (Ok((text, _)), Some(reminder)) = (&mut result, &reminder) {
                             text.push_str("\n\n");
                             text.push_str(reminder);
                         }
@@ -1828,7 +1835,7 @@ impl Kernel {
                     let mut result = self
                         .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, "user approved", *effect)
                         .await;
-                    if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                    if let (Ok((text, _)), Some(reminder)) = (&mut result, &reminder) {
                         // 放行+附言：提醒跟工具结果一起回到模型上下文。
                         text.push_str("\n\n");
                         text.push_str(reminder);
@@ -1855,7 +1862,7 @@ impl Kernel {
                     let mut result = self
                         .finish_tool(run_id, run.session_id, subagent_id, tool, arguments_json, &target, audit, *effect)
                         .await;
-                    if let (Ok(text), Some(reminder)) = (&mut result, &reminder) {
+                    if let (Ok((text, _)), Some(reminder)) = (&mut result, &reminder) {
                         text.push_str("\n\n");
                         text.push_str(reminder);
                     }
@@ -1891,7 +1898,7 @@ impl Kernel {
         has_rules: bool,
         run_root: Option<&std::path::Path>,
         user_message: &str,
-    ) -> (Option<AppResult<String>>, Option<String>) {
+    ) -> (Option<AppResult<ToolPayload>>, Option<String>) {
         if !has_rules {
             return (None, None);
         }
@@ -2155,7 +2162,7 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
         target: &str,
         audit: &str,
         effect: ToolEffect,
-    ) -> AppResult<String> {
+    ) -> AppResult<ToolPayload> {
         // A running command must stop when the user stops the run, instead of
         // waiting out its timeout: hand the exec adapter the run's cancel signal.
         let (cancel, run_root) = {
@@ -2187,9 +2194,10 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
         audit: &str,
         effect: ToolEffect,
         outcome: AppResult<ToolOutcome>,
-    ) -> AppResult<String> {
+    ) -> AppResult<ToolPayload> {
         match outcome {
             Ok(outcome) => {
+                let images = outcome.images.clone();
                 let write_counts = if let Some(report) = &outcome.write {
                     let (added, removed) = line_change_counts(&report.before, &report.after);
                     let _ = self.database.record_file_change(run_id, session_id, report.path.clone(), added, removed, report.before.clone(), report.after.clone()).await;
@@ -2264,7 +2272,7 @@ fn format_subagent_reports(traces: &[SubagentView]) -> String {
                     let mut state = self.state.lock().await;
                     self.emit_locked(&mut state, EventData::WorkspaceChanged);
                 }
-                Ok(outcome.text)
+                Ok((outcome.text, images))
             }
             Err(reason) => {
                 if subagent_id.is_none() {
@@ -3004,6 +3012,7 @@ mod tests {
             max_output: None,
             context_window: None,
             session: None,
+            vision_capable: true,
         }
     }
 

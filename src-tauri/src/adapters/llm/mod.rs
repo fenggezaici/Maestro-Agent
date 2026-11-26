@@ -54,6 +54,9 @@ pub struct ChatConfig {
     /// Stable per-conversation id. OpenCode gateways require it as
     /// `x-opencode-session` so requests can be routed/cached together.
     pub session: Option<String>,
+    /// 前端模型能力表解析出的视觉支持——后端无模型目录，图像注入
+    /// （read_file 工具结果）依此门控；非视觉模型走元数据降级。
+    pub vision_capable: bool,
 }
 
 /// Loopback hosts may keep plaintext HTTP (local Ollama and proxies).
@@ -617,6 +620,7 @@ mod tests {
             max_output: None,
             context_window: None,
             session: None,
+        vision_capable: false,
         };
         assert_eq!(
             config.validate().unwrap().as_str(),
@@ -649,6 +653,7 @@ mod tests {
             max_output: None,
             context_window: None,
             session: session.map(str::to_string),
+            vision_capable: false,
         }
     }
 

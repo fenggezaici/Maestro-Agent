@@ -47,6 +47,7 @@ pub async fn stream_chat(
     reasoning_effort: Option<String>,
     max_output: Option<u64>,
     context_window: Option<u64>,
+    vision_capable: Option<bool>,
 ) -> AppResult<i64> {
     if window.label() != "main" || app.get_webview_window("main").is_none() {
         return Err("Only the main window may start a chat".into());
@@ -67,6 +68,8 @@ pub async fn stream_chat(
         context_window,
         // The kernel stamps a stable per-session id before the run starts.
         session: None,
+        // 前端模型能力表解析（后端无模型目录）；缺省保守按无视觉处理。
+        vision_capable: vision_capable.unwrap_or(false),
     };
     kernel
         .set_workspace_root(workspace.current_root())

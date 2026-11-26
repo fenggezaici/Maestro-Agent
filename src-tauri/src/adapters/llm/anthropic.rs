@@ -26,10 +26,32 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
             "tool" => {
                 // tool_result 必须带 is_error —— 否则失败结果与成功输出在
                 // 模型眼中不可区分（Anthropic wire 契约）。
+                // 携带图像时 content 升级为 block 数组（Anthropic 原生支持
+                // tool_result 内嵌 image——与 OpenAI 的合成用户消息路径不同）。
+                let has_images = message.images.as_ref().is_some_and(|v| !v.is_empty());
+                let content = if has_images {
+                    let mut parts = Vec::new();
+                    if !message.content.is_empty() {
+                        parts.push(json!({ "type": "text", "text": message.content }));
+                    }
+                    for url in message.images.iter().flatten() {
+                        if let Some(rest) = url.strip_prefix("data:") {
+                            if let Some((media, data)) = rest.split_once(";base64,") {
+                                parts.push(json!({
+                                    "type": "image",
+                                    "source": { "type": "base64", "media_type": media, "data": data },
+                                }));
+                            }
+                        }
+                    }
+                    json!(parts)
+                } else {
+                    json!(message.content)
+                };
                 let mut block = json!({
                     "type": "tool_result",
                     "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": message.content,
+                    "content": content,
                 });
                 if message.is_error {
                     block["is_error"] = true.into();
@@ -327,5 +349,40 @@ impl FrameParser for AnthropicParser {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_message(images: Option<Vec<String>>, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some("toolu_1".into()),
+            name: None, tool_calls: None, images, thinking: None, is_error: false,
+        }
+    }
+
+    #[test]
+    fn tool_result_embeds_image_blocks_natively() {
+        let wire = anthropic_messages(&[tool_message(
+            Some(vec!["data:image/png;base64,AAAA".into()]), "[图像已编码注入]")]);
+        let blocks = wire[0]["content"].as_array().expect("分块数组");
+        let tool_result = blocks.iter().find(|b| b["type"] == "tool_result").expect("tool_result 存在");
+        let parts = tool_result["content"].as_array().expect("图像时 content 为 block 数组");
+        assert!(parts.iter().any(|p| p["type"] == "image"
+            && p["source"]["media_type"] == "image/png" && p["source"]["data"] == "AAAA"));
+        assert!(parts.iter().any(|p| p["type"] == "text"));
+        assert_eq!(wire.len(), 1, "不产合成消息——原生嵌入");
+    }
+
+    #[test]
+    fn tool_result_without_images_stays_scalar_content() {
+        let wire = anthropic_messages(&[tool_message(None, "plain")]);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        let tool_result = blocks.iter().find(|b| b["type"] == "tool_result").unwrap();
+        assert!(tool_result["content"].is_string());
     }
 }

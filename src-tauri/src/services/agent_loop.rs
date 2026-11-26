@@ -2,6 +2,10 @@
 //! adapter streams normalized `StreamEvent`s over a channel; this service
 //! relays them to the kernel as typed domain events, executes tool calls via
 //! the kernel's authorized path, and feeds results back for the next turn.
+/// 工具执行产出的模型可见载荷（与 kernel::ToolPayload 同构——跨模块
+/// 复刻别名而非导出，保持 kernel 内部类型私密）。
+type ToolPayload = (String, Vec<String>);
+
 use std::{sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
 
 use futures_util::future::join_all;
@@ -1123,6 +1127,9 @@ async fn run_subagent(
         max_output: config.max_output,
         context_window: config.context_window,
         session: Some(child_session_id(config.session.as_deref(), &subagent_id)),
+        // 继承父 run 视觉门控：子智能体模型覆盖若为非视觉模型，图像可能
+        // 抵达不支持的上游（v1 已文档化限制——建议视觉链路模型保持一致）。
+        vision_capable: config.vision_capable,
     };
     let provider = kernel.llm_provider(&child_config);
     // 沙盘装配：Extension → Subagent 绑定给该类型子智能体授权扩展能力
@@ -1406,7 +1413,7 @@ async fn run_subagent(
                 thinking: outcome.thinking.clone(),
                 is_error: false,
             });
-            let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
+            let mut results: Vec<Option<AppResult<ToolPayload>>> = vec![None; outcome.tool_calls.len()];
             let mut runnable: Vec<(String, String)> = Vec::new();
             let mut runnable_indices: Vec<usize> = Vec::new();
             // 指挥的军团成员派发：与父循环同构——拦截 spawn 后 join_all 递归。
@@ -1510,7 +1517,7 @@ async fn run_subagent(
                     if result.is_ok() {
                         pending_members.retain(|name| name != &member.agent);
                     }
-                    results[index] = Some(result);
+                    results[index] = Some(result.map(|text| (text, Vec::new())));
                 }
             }
             if !runnable.is_empty() {
@@ -1525,9 +1532,9 @@ async fn run_subagent(
                 }
             }
             for (index, (call, result)) in outcome.tool_calls.iter().zip(results).enumerate() {
-                let (mut text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                    Ok(value) => (bounded_result_text(&value), false),
-                    Err(error) => (format!("子智能体工具失败：{error}"), true),
+                let (mut text, result_images, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+                    Ok((value, images)) => (bounded_result_text(&value), images, false),
+                    Err(error) => (format!("子智能体工具失败：{error}"), Vec::new(), true),
                 };
                 if doom_streaks[index] == DOOM_WARN && !is_error {
                     text.push_str(&doom_warn_note(doom_streaks[index]));
@@ -1538,7 +1545,7 @@ async fn run_subagent(
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     tool_calls: None,
-                    images: None,
+                    images: if result_images.is_empty() { None } else { Some(result_images) },
                     thinking: None,
                     is_error,
                 });
@@ -1794,7 +1801,7 @@ pub(crate) async fn run(
             });
             // Authorization, audit and tool_call events all happen inside the
             // kernel; suspended calls share ONE approval for the whole turn.
-            let mut results: Vec<Option<AppResult<String>>> = vec![None; outcome.tool_calls.len()];
+            let mut results: Vec<Option<AppResult<ToolPayload>>> = vec![None; outcome.tool_calls.len()];
             let mut normal_calls: Vec<(String, String)> = Vec::new();
             let mut normal_indices: Vec<usize> = Vec::new();
             let mut spawns = Vec::new();
@@ -1846,7 +1853,7 @@ pub(crate) async fn run(
             }
             for (position, (index, arguments)) in asks.into_iter().enumerate() {
                 let result = if position == 0 {
-                    kernel.ask_user(run.id, &arguments, cancel.clone()).await
+                    kernel.ask_user(run.id, &arguments, cancel.clone()).await.map(|text| (text, Vec::new()))
                 } else {
                     Err("同一轮最多提出 1 个问题".into())
                 };
@@ -1869,7 +1876,7 @@ pub(crate) async fn run(
             for ((index, subagent_id, _, description), result) in spawns.into_iter().zip(spawned) {
                 let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
                 kernel.emit_spawn(run.id, &subagent_id, if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
-                results[index] = Some(result);
+                results[index] = Some(result.map(|text| (text, Vec::new())));
             }
             if !normal_calls.is_empty() {
                 let normal_results = kernel.execute_tool_calls(run.id, &normal_calls).await;
@@ -1878,9 +1885,9 @@ pub(crate) async fn run(
                 }
             }
             for (index, (call, result)) in outcome.tool_calls.iter().zip(results).enumerate() {
-                let (mut text, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
-                    Ok(text) => (text, false),
-                    Err(error) => (format!("工具调用失败：{error}"), true),
+                let (mut text, result_images, is_error) = match result.unwrap_or_else(|| Err("missing tool result".into())) {
+                    Ok((text, images)) => (text, images, false),
+                    Err(error) => (format!("工具调用失败：{error}"), Vec::new(), true),
                 };
                 if doom_streaks[index] == DOOM_WARN && !is_error {
                     text.push_str(&doom_warn_note(doom_streaks[index]));
@@ -1891,7 +1898,7 @@ pub(crate) async fn run(
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.name.clone()),
                     tool_calls: None,
-                    images: None,
+                    images: if result_images.is_empty() { None } else { Some(result_images) },
                     thinking: None,
                     is_error,
                 });
@@ -2068,6 +2075,7 @@ async fn summarize_with_model(
         max_output: Some(1024),
         context_window: None,
         session: config.session.clone(),
+        vision_capable: false,
     };
     let messages = vec![
         ChatMessage::text(

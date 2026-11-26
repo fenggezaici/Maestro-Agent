@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ApprovalDecision, ApprovalRuleView, CommandScope, QuestionAnswer } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { providerModel } from '../providerModels';
+import { resolveCapability } from '../modelCatalog';
 import { wireProvider } from '../customProviders';
 import type { LlmSettings } from '../settings';
 import type { ChatMessage, KernelEvent, Mode, RunView, Snapshot } from './types';
@@ -20,6 +21,8 @@ export const kernelApi = {
     ...(settings.reasoning ? { reasoning_effort: settings.reasoning } : {}),
     ...(providerModel(settings.provider ?? 'openai', settings.model)?.output ? { max_output: providerModel(settings.provider ?? 'openai', settings.model)!.output } : {}),
     ...(providerModel(settings.provider ?? 'openai', settings.model)?.context ? { context_window: providerModel(settings.provider ?? 'openai', settings.model)!.context } : {}),
+    // 视觉门控进后端：read_file 读图据此决定注入图像块还是降级元数据文本。
+    vision_capable: resolveCapability(settings.model, settings.provider ?? 'openai').vision,
   }),
   cancel: (runId: number) => invoke<void>('cancel_agent', { runId }),
   resolveApproval: (runId: number, decision: ApprovalDecision, commandScope?: CommandScope, feedback?: string) =>
