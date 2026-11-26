@@ -58,6 +58,9 @@ export const gitApi = {
   status: () => invoke<GitStatus | null>('git_status'),
   diff: (path: string, source: GitDiffSource) =>
     invoke<GitDiff | null>('git_diff', { path, source }),
+  /** branch:<base> / commit:<sha> 的逐文件清单；unstaged/staged 走 status。 */
+  filesOf: (source: GitDiffSource) =>
+    invoke<GitFileEntry[] | null>('git_files_of', { source }),
   log: (limit?: number, skip?: number) =>
     invoke<GitCommit[] | null>('git_log', { limit, skip }),
 };

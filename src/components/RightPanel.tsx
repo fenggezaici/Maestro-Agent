@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X, Globe } from 'lucide-react';
+import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitBranch, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X, Globe } from 'lucide-react';
 import SplitDivider, { STORAGE_KEY } from './SplitDivider';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
@@ -14,13 +14,15 @@ import type { ExplorerViewState } from './ExplorerPanel';
 import { countChanges } from './MiniDiff';
 import LightweightDiffPreview from './LightweightDiffPreview';
 import BrowserPane from './BrowserPane';
+import GitPane from './GitPane';
+import { useGitRepo } from '../hooks/useGitRepo';
 import CodeViewer from './CodeViewer';
 import TaskPlanPanel from './TaskPlanPanel';
 import SubagentTracePanel from './SubagentTracePanel';
 import type { UiPreferences } from '../uiPreferences';
 import { preloadViewer } from '../viewer/loader';
 
-export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents' | 'browser';
+export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents' | 'browser' | 'git';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
 
 interface ListNode { id: string; name: string; children: ListNode[]; leaf?: { path: string; file?: ExplorerFile } }
@@ -142,6 +144,7 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
   // Agent write/command side effects bump this tick — coalesce bursts into one
   // refresh so a long tool loop cannot keep the tree permanently "loading".
   const tick = useKernelStore((s) => s.workspaceTick);
+  const git = useGitRepo(!preview && Boolean(workspace.info?.path), tick);
   useEffect(() => {
     if (tick === 0) return;
     const timer = window.setTimeout(() => {
@@ -194,6 +197,7 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
     tasks: { label: '任务', icon: <ListTodo size={12} /> },
     subagents: { label: '子智能体', icon: <Bot size={12} /> },
     browser: { label: '浏览器', icon: <Globe size={12} /> },
+    git: { label: 'Git', icon: <GitBranch size={12} /> },
   };
   const noTabs = openTabs.length === 0;
   const [listWidth, setListWidth] = useState(() => { try { return Number(localStorage.getItem(STORAGE_KEY)) || 240; } catch { return 240; } });
@@ -244,7 +248,12 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
           </div>
         </div>
     {listTab === 'browser' && openTabs.includes('browser') ? <div className="browser-host"><BrowserPane storageKey={browserStorageKey ?? 'maestro.browser-url.local'} /></div> : null}
-    <div ref={splitRef} className="right-split" style={listTab === 'browser' ? { display: 'none' } : undefined}>
+    {listTab === 'git' && openTabs.includes('git') ? <div className="browser-host">
+      {preview
+        ? <div className="editor-empty"><GitBranch size={34} strokeWidth={1} /><h3>Git 面板</h3><p>预览模式不连接本地仓库，live 环境可用。</p></div>
+        : <GitPane git={git} fontSize={fontSize} />}
+    </div> : null}
+    <div ref={splitRef} className="right-split" style={listTab === 'browser' || listTab === 'git' ? { display: 'none' } : undefined}>
       <div className="right-list-pane">
         <div className="list-body">
           {noTabs ? <div className="right-tabs-empty"><p>点击右侧 + 添加视图</p></div> : listTab === 'explorer' ? <>
@@ -252,6 +261,16 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
               <div className="list-workspace">
                 <span className="list-workspace-name">{workspace.info?.name ?? t.workspace}</span>
                 <span className="list-workspace-meta">{workspace.info?.path ? '本地 / 只读' : '未选择工作区'}</span>
+                {git.summary?.repo && git.summary.branch && <span className="git-branch-badge workspace-branch-badge"
+                  title={git.summary.upstream ? `上游 ${git.summary.upstream}` : '无上游分支'}
+                  role="button" tabIndex={0}
+                  onClick={() => { if (!openTabs.includes('git')) onAddTab('git'); onListTabChange('git'); }}
+                  onKeyDown={(event) => { if (event.key === 'Enter') { if (!openTabs.includes('git')) onAddTab('git'); onListTabChange('git'); } }}>
+                  <GitBranch size={11} />{git.summary.branch}
+                  {(git.summary.ahead > 0 || git.summary.behind > 0) && <em className="git-ahead-behind">
+                    {git.summary.ahead > 0 && `↑${git.summary.ahead}`}{git.summary.behind > 0 && `↓${git.summary.behind}`}
+                  </em>}
+                </span>}
                 <button type="button" className="icon-button" aria-label="打开工作区" disabled={workspace.loading || workspace.refreshing}
                   onClick={async () => { const picked = await pickDirectory(); if (picked) void workspace.selectWorkspace(picked); }}><FolderOpen size={12} /></button>
                 <button type="button" className="icon-button" aria-label="刷新文件树" disabled={workspace.loading || workspace.refreshing} onClick={() => void workspace.refresh()}><RefreshCw size={12} /></button>

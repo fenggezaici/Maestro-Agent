@@ -231,7 +231,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
-  const [listTab, setListTab] = useState<ListTab>(() => restoredPanel?.listTab && ['explorer', 'changes', 'tasks', 'subagents', 'browser'].includes(restoredPanel.listTab) ? restoredPanel.listTab : 'changes');
+  const [listTab, setListTab] = useState<ListTab>(() => restoredPanel?.listTab && ['explorer', 'changes', 'tasks', 'subagents', 'browser', 'git'].includes(restoredPanel.listTab) ? restoredPanel.listTab : 'changes');
   const [openTabs, setOpenTabs] = useState<ListTab[]>(['explorer', 'changes']);
   const tasksDismissed = useRef(false);
   const [paletteOpen, setPaletteOpen] = useState(false);

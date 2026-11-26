@@ -218,6 +218,55 @@ pub async fn diff(cwd: &Path, path: &str, source: &str) -> Result<Option<GitDiff
     Ok(Some(GitDiff { diff: text, truncated, binary }))
 }
 
+/// branch 对比 / commit 详情的逐文件清单：letter 来自 --name-status、行数来自 --numstat。
+/// unstaged/staged 不走这里——status() 已覆盖。merge commit 的 git show 默认
+/// 不产生文件 diff（--cc 语义），v1 接受空列表而非引入 --diff-merges 复杂度。
+pub async fn files_of(cwd: &Path, source: &str) -> Result<Option<Vec<GitFileEntry>>, String> {
+    let Some(root) = detect_root(cwd).await? else {
+        return Ok(None);
+    };
+    let root_path = Path::new(&root);
+    let revision: String;
+    let prefix: Vec<String> = match source {
+        other if other.starts_with("branch:") => {
+            revision = format!("{}...HEAD", other.trim_start_matches("branch:"));
+            vec!["diff".into()]
+        }
+        other if other.starts_with("commit:") => {
+            revision = other.trim_start_matches("commit:").to_string();
+            vec!["show".into(), "--format=".into()]
+        }
+        _ => return Ok(None),
+    };
+    let build = |extra: &str| -> Vec<String> {
+        let mut args = prefix.clone();
+        args.push(extra.into());
+        args.push("-z".into());
+        args.push(revision.clone());
+        args
+    };
+    let status_args = build("--name-status");
+    let numstat_args = build("--numstat");
+    let status_refs: Vec<&str> = status_args.iter().map(String::as_str).collect();
+    let numstat_refs: Vec<&str> = numstat_args.iter().map(String::as_str).collect();
+    let names = run_git(root_path, &status_refs, OUTPUT_CAP_BYTES).await.unwrap_or_default();
+    let nums = run_git(root_path, &numstat_refs, OUTPUT_CAP_BYTES).await.unwrap_or_default();
+    let stats = parse_numstat(&nums);
+    let mut entries: Vec<GitFileEntry> = parse_name_status(&names)
+        .into_iter()
+        .map(|(path, letter, orig)| {
+            let mut item = entry(&path, &letter, orig);
+            if let Some((_, added, removed)) = stats.iter().find(|(stat_path, _, _)| stat_path == &path) {
+                item.added = *added;
+                item.removed = *removed;
+            }
+            item
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Some(entries))
+}
+
 pub async fn log(cwd: &Path, limit: usize, skip: usize) -> Result<Option<Vec<GitCommit>>, String> {
     let Some(root) = detect_root(cwd).await? else {
         return Ok(None);
@@ -325,6 +374,39 @@ fn parse_branch_headers(bytes: &[u8]) -> (Option<String>, Option<String>, i64, i
 }
 
 /// numstat -z：added TAB removed TAB path NUL（binary 两列为 `-` 解析为 None）。
+/// name-status -z 解析：普通条目 `<letter>\0<path>\0`；rename/copy 是
+/// `<R|C 带分数>\0<orig>\0<new>\0` 三条记录。产出 (path, letter, orig_path)。
+pub fn parse_name_status(bytes: &[u8]) -> Vec<(String, String, Option<String>)> {
+    let records: Vec<&[u8]> = bytes.split(|byte| *byte == 0).filter(|record| !record.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let letter = String::from_utf8_lossy(records[index]).into_owned();
+        let rename = letter.starts_with('R') || letter.starts_with('C');
+        if rename {
+            match (records.get(index + 1), records.get(index + 2)) {
+                (Some(orig), Some(path)) => {
+                    out.push((
+                        String::from_utf8_lossy(path).into_owned(),
+                        letter,
+                        Some(String::from_utf8_lossy(orig).into_owned()),
+                    ));
+                    index += 3;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        if let Some(path) = records.get(index + 1) {
+            out.push((String::from_utf8_lossy(path).into_owned(), letter, None));
+            index += 2;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 pub fn parse_numstat(bytes: &[u8]) -> Vec<(String, Option<i64>, Option<i64>)> {
     bytes
         .split(|byte| *byte == 0)
@@ -515,9 +597,40 @@ mod tests {
         assert_eq!(commits[0].subject, "init");
         assert_eq!(commits[0].author, "测试");
 
+        // files_of：commit 详情应列出该提交触碰的文件并带行数。
+        let commit_files = files_of(root, &format!("commit:{}", commits[0].hash)).await.unwrap().unwrap();
+        assert!(commit_files.iter().any(|file| file.path == "tracked.txt"), "{commit_files:?}");
+        let tracked_entry = commit_files.iter().find(|file| file.path == "tracked.txt").unwrap();
+        assert_eq!(tracked_entry.xy, "A");
+        assert_eq!(tracked_entry.added, Some(1));
+        // unstaged/staged 不由此查询。
+        assert!(files_of(root, "unstaged").await.unwrap().is_none());
+
         // 非 repo 目录是状态不是错误
         let plain = tempfile::tempdir().unwrap();
         assert!(!summary(plain.path()).await.unwrap().repo);
         assert!(status(plain.path()).await.unwrap().is_none());
+        assert!(files_of(plain.path(), "commit:abc").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn name_status_parses_plain_and_rename_records() {
+        let data = b"M\x00src/a.rs\x00A\x00src/b.rs\x00R100\x00old/name.rs\x00new/name.rs\x00D\x00gone.rs\x00";
+        let parsed = parse_name_status(data);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0], ("src/a.rs".to_string(), "M".to_string(), None));
+        assert_eq!(parsed[1].1, "A");
+        assert_eq!(parsed[2].0, "new/name.rs");
+        assert_eq!(parsed[2].1, "R100");
+        assert_eq!(parsed[2].2.as_deref(), Some("old/name.rs"));
+        assert_eq!(parsed[3].0, "gone.rs");
+    }
+
+    #[test]
+    fn name_status_truncated_tail_does_not_panic() {
+        // 末尾缺 path 记录：静默收尾而非越界。
+        let data = b"M\x00src/a.rs\x00A\x00";
+        let parsed = parse_name_status(data);
+        assert_eq!(parsed.len(), 1);
     }
 }

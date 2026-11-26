@@ -751,3 +751,39 @@
 .search-key-row .secret-input { display: flex; align-items: center; gap: 2px; }
 .search-key-row input { width: 180px; }
 .credential-stored-tag { margin-left: 6px; font-size: 10px; color: var(--color-primary); border: 1px solid var(--color-primary); border-radius: 4px; padding: 0 4px; }
+
+/* Git 面板（ZCode GitPane 只读子集） */
+.git-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.git-pane-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--color-border); flex-shrink: 0; }
+.git-pane-spacer { flex: 1; }
+.git-branch-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: var(--color-foreground); background: var(--color-input); border: 1px solid var(--color-border); border-radius: 6px; padding: 2px 7px; white-space: nowrap; }
+.git-branch-badge .git-ahead-behind { font-style: normal; font-weight: 500; color: var(--color-muted-foreground); margin-left: 2px; }
+.workspace-branch-badge { cursor: pointer; margin-left: 2px; }
+.workspace-branch-badge:hover { border-color: var(--color-primary); color: var(--color-primary); }
+.git-source-switch { display: flex; gap: 2px; background: var(--color-input); border: 1px solid var(--color-border); border-radius: 6px; padding: 1px; }
+.git-source-tab { border: 0; background: transparent; font-size: 11px; padding: 2px 8px; border-radius: 5px; color: var(--color-muted-foreground); cursor: pointer; }
+.git-source-tab.active { background: var(--color-background); color: var(--color-foreground); box-shadow: 0 1px 2px rgba(0,0,0,0.15); }
+.git-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 10px 16px; }
+.git-section { margin-bottom: 14px; }
+.git-section-title { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--color-muted-foreground); text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 6px; }
+.git-section-count { font-size: 10px; background: var(--color-input); border-radius: 8px; padding: 0 6px; line-height: 16px; }
+.git-change-card { border: 1px solid var(--color-border); border-radius: 7px; margin-bottom: 4px; overflow: hidden; background: var(--color-background); }
+.git-change-card.expanded { border-color: var(--color-primary); }
+.git-change-row { display: flex; align-items: center; gap: 6px; width: 100%; border: 0; background: transparent; padding: 6px 8px; font-size: 12px; color: var(--color-foreground); cursor: pointer; text-align: left; }
+.git-change-row:hover { background: var(--color-input); }
+.git-change-chevron { width: 14px; display: inline-flex; justify-content: center; color: var(--color-muted-foreground); flex-shrink: 0; }
+.git-change-row .review-file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-change-orig { font-size: 10px; color: var(--color-muted-foreground); max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-letter { font-style: normal; font-size: 10px; font-weight: 700; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; flex-shrink: 0; }
+.git-letter-m { color: var(--color-warning, #b45309); background: color-mix(in srgb, var(--color-warning, #b45309) 14%, transparent); }
+.git-letter-a { color: var(--color-diff-added); background: color-mix(in srgb, var(--color-diff-added) 14%, transparent); }
+.git-letter-d { color: var(--color-diff-removed); background: color-mix(in srgb, var(--color-diff-removed) 14%, transparent); }
+.git-letter-r, .git-letter-c { color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 14%, transparent); }
+.git-letter-u { color: var(--color-destructive); background: color-mix(in srgb, var(--color-destructive) 14%, transparent); }
+.git-letter-untracked { color: var(--color-muted-foreground); background: var(--color-input); }
+.git-change-diff { border-top: 1px solid var(--color-border); max-height: 420px; overflow-y: auto; }
+.git-diff-meta { padding: 1px 10px; font-size: 11px; color: var(--color-muted-foreground); white-space: pre; overflow-x: auto; }
+.git-diff-hunk { padding: 1px 10px; font-size: 11px; color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 8%, transparent); white-space: pre; overflow-x: auto; }
+.git-diff-meta code, .git-diff-hunk code { font-family: inherit; }
+.git-diff-empty, .git-diff-truncated, .git-rows-truncated { padding: 8px 10px; font-size: 11px; color: var(--color-muted-foreground); margin: 0; }
+.git-diff-truncated { color: var(--color-warning, #b45309); }

@@ -4,7 +4,7 @@ use tauri::{State, WebviewWindow};
 use crate::{
     adapters::{
         fs::workspace::WorkspaceService,
-        git::{self, GitCommit, GitDiff, GitStatus, GitSummary},
+        git::{self, GitCommit, GitDiff, GitFileEntry, GitStatus, GitSummary},
     },
     commands::require_main,
 };
@@ -44,6 +44,17 @@ pub async fn git_diff(
     let root = workspace.current_root().ok_or_else(missing_workspace)?;
     // path 只做 `--` 后的路径参数，绝不进 shell——无注入面。
     git::diff(&root, &path, &source).await
+}
+
+#[tauri::command]
+pub async fn git_files_of(
+    window: WebviewWindow,
+    workspace: State<'_, WorkspaceService>,
+    source: String,
+) -> Result<Option<Vec<GitFileEntry>>, String> {
+    require_main(&window)?;
+    let root = workspace.current_root().ok_or_else(missing_workspace)?;
+    git::files_of(&root, &source).await
 }
 
 #[tauri::command]

@@ -193,6 +193,7 @@ pub fn run() {
             commands::git::git_summary,
             commands::git::git_status,
             commands::git::git_diff,
+            commands::git::git_files_of,
             commands::git::git_log,
             commands::sessions::create_session,
             commands::sessions::set_session_archived,
