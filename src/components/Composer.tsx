@@ -219,7 +219,7 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
     }} className="composer">
     {slashState && <SlashPanel groups={slashGroups} index={slashIndex} onHover={setSlashIndex} onSelect={selectSlash} />}
     <LocalAttachments items={attachments} onRemove={removeAttachment} />
-    <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
+    <input ref={fileInput} type="file" hidden multiple aria-label="选择本地媒体附件" accept="image/png,image/jpeg,image/webp,image/gif,.md,.txt,.py,.ts,.tsx,.js,.jsx,.json,.rs,.toml,.yaml,.yml,.log,.sql,.sh" onChange={selectFiles} />
     <textarea ref={promptInput} aria-label="发送消息" rows={3} value={draft} onChange={(event) => {
       const value = event.target.value;
       setSlashDismissed(false);

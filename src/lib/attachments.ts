@@ -8,7 +8,6 @@ export const TEXT_INLINE_LIMIT = 64 * 1024;
 /// 与文件选择器 accept 属性同一份语义；paste/drop 没有 accept 过滤，
 /// 必须在代码里兜住不支持的类型。
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-const VIDEO_MIMES = new Set(['video/mp4', 'video/webm']);
 const TEXT_EXTENSIONS = new Set([
   '.md', '.txt', '.py', '.ts', '.tsx', '.js', '.jsx', '.json',
   '.rs', '.toml', '.yaml', '.yml', '.log', '.sql', '.sh',
@@ -22,7 +21,6 @@ function extension(name: string): string {
 
 export function attachmentKind(file: Pick<File, 'type' | 'name'>): LocalAttachment['type'] | null {
   if (IMAGE_MIMES.has(file.type)) return 'image';
-  if (VIDEO_MIMES.has(file.type)) return 'video';
   if (file.type.startsWith('text/') || TEXT_EXTENSIONS.has(extension(file.name))) return 'text';
   return null;
 }
