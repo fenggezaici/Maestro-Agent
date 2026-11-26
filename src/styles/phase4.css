@@ -787,3 +787,20 @@
 .git-diff-meta code, .git-diff-hunk code { font-family: inherit; }
 .git-diff-empty, .git-diff-truncated, .git-rows-truncated { padding: 8px 10px; font-size: 11px; color: var(--color-muted-foreground); margin: 0; }
 .git-diff-truncated { color: var(--color-warning, #b45309); }
+
+/* commit 历史 */
+.git-commit-log { display: flex; flex-direction: column; }
+.git-commit-card { border: 1px solid var(--color-border); border-radius: 7px; margin-bottom: 4px; overflow: hidden; background: var(--color-background); }
+.git-commit-card.expanded { border-color: var(--color-primary); }
+.git-commit-row { display: flex; align-items: center; gap: 7px; width: 100%; border: 0; background: transparent; padding: 6px 8px; font-size: 12px; color: var(--color-foreground); cursor: pointer; text-align: left; }
+.git-commit-row:hover { background: var(--color-input); }
+.git-commit-hash { font-size: 11px; color: var(--color-primary); flex-shrink: 0; }
+.git-commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.git-commit-meta-inline { font-size: 10px; color: var(--color-muted-foreground); white-space: nowrap; flex-shrink: 0; }
+.git-commit-refs { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.git-ref-badge { font-style: normal; font-size: 9px; font-weight: 600; padding: 0 5px; line-height: 14px; border-radius: 7px; background: var(--color-input); color: var(--color-muted-foreground); border: 1px solid var(--color-border); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-ref-badge.head { color: var(--color-primary); border-color: var(--color-primary); }
+.git-ref-badge.tag { color: var(--color-warning, #b45309); border-color: var(--color-warning, #b45309); }
+.git-commit-detail { border-top: 1px solid var(--color-border); padding: 8px 10px; }
+.git-commit-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--color-muted-foreground); margin-bottom: 8px; }
+.git-log-more { align-self: center; margin-top: 6px; }

@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, FileCode2, GitBranch, RefreshCw } from 'luci
 import { gitApi, type GitFileEntry, type GitStatus, type GitSummary } from '../api/git';
 import type { GitRepoState } from '../hooks/useGitRepo';
 import GitDiffView from './GitDiffView';
+import GitCommitLog from './GitCommitLog';
 
 /// ZCode GitPane 的只读子集：来源切换（未暂存/已暂存/与上游对比）+ 分区列表 +
 /// diff 懒加载展开。明确偏离 ZCode 的两处：不引入虚拟滚动（<200 直接渲染，
@@ -11,7 +12,7 @@ import GitDiffView from './GitDiffView';
 
 const ROW_CAP = 200;
 
-type SourceKey = 'unstaged' | 'staged' | 'branch';
+type SourceKey = 'unstaged' | 'staged' | 'branch' | 'log';
 
 interface DiffLoadState {
   loading: boolean;
@@ -37,7 +38,7 @@ function fileBasename(path: string): { base: string; dir: string } {
     : { base: path, dir: '' };
 }
 
-function ChangeRow({ entry, column, diffSource, expanded, onToggle, fontSize }: {
+export function ChangeRow({ entry, column, diffSource, expanded, onToggle, fontSize }: {
   entry: GitFileEntry; column: 'staged' | 'unstaged'; diffSource: string | null;
   expanded: boolean; onToggle: () => void; fontSize: number;
 }) {
@@ -182,16 +183,22 @@ export default function GitPane({ git, fontSize }: { git: GitRepoState; fontSize
           {key === 'unstaged' ? '未暂存' : '已暂存'}</button>)}
         {branchSource && <button type="button" role="tab" aria-selected={source === 'branch'}
           className={`git-source-tab${source === 'branch' ? ' active' : ''}`} onClick={() => setSource('branch')}>分支对比</button>}
+        <button type="button" role="tab" aria-selected={source === 'log'}
+          className={`git-source-tab${source === 'log' ? ' active' : ''}`} onClick={() => setSource('log')}>历史</button>
       </div>
       <button type="button" className="icon-button" aria-label="刷新 git 状态" disabled={loading} onClick={refresh}><RefreshCw size={12} /></button>
     </div>
     <div className="git-pane-body">
-      {source === 'branch' && branchLoading && <p className="workspace-status" role="status">正在计算分支差异…</p>}
-      {totalRows === 0 && !(source === 'branch' && branchLoading)
-        ? <p className="review-files-empty">{emptyCopy}</p>
-        : sections.map((section) => <Section key={section.title} title={section.title} entries={section.entries}
-          column={section.column} diffSource={section.diffSource}
-          expandedPath={expandedPath} onToggle={toggle} fontSize={fontSize} />)}
+      {/* GitCommitLog 保持挂载（hidden 切换）——卸载会丢失分页与展开状态。 */}
+      <div hidden={source !== 'log'}><GitCommitLog fontSize={fontSize} active={source === 'log'} /></div>
+      {source !== 'log' && <>
+        {source === 'branch' && branchLoading && <p className="workspace-status" role="status">正在计算分支差异…</p>}
+        {totalRows === 0 && !(source === 'branch' && branchLoading)
+          ? <p className="review-files-empty">{emptyCopy}</p>
+          : sections.map((section) => <Section key={section.title} title={section.title} entries={section.entries}
+            column={section.column} diffSource={section.diffSource}
+            expandedPath={expandedPath} onToggle={toggle} fontSize={fontSize} />)}
+      </>}
     </div>
   </div>;
 }
