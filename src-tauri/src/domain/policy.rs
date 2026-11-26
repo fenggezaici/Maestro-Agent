@@ -28,7 +28,7 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
     Ok(match tool {
         // task_stop 只能终止本进程拉起的后台任务，归为只读类（Plan 下也无可停任务）。
         "read_session" | "list_sessions" | "load_skill" | "list_dir" | "read_file"
-        | "glob_files" | "grep_files" | "task_output" | "task_stop"
+        | "glob_files" | "grep_files" | "repo_map" | "task_output" | "task_stop"
         | "update_plan" | "spawn_subagent" | "ask_user" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,

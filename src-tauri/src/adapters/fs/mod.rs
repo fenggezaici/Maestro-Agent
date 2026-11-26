@@ -2,6 +2,7 @@
 pub mod scoped;
 pub mod workspace;
 
+pub(crate) use scoped::walk_files as walk_source_files;
 pub use scoped::{
     apply_patch, apply_patch_multi, glob_files, grep_files, is_sensitive_path, list_dir, read_file,
     read_binary_scoped, read_file_full, read_file_lines, remove_file, scoped_path,

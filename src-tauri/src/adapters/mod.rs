@@ -11,6 +11,7 @@ pub mod llm;
 pub mod mcp;
 pub mod media;
 pub mod plugins;
+pub mod repo_map;
 pub mod search;
 pub mod skills;
 pub mod web;

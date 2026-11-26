@@ -772,7 +772,7 @@ fn validate_node_data(kind: NodeKind, node: &GraphNode, effective_after: bool) -
 // ---- 求值 ---------------------------------------------------------------------
 
 const WRITE_TOOLS: &[&str] = &["write_file", "apply_patch"];
-const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob_files", "grep_files", "read_session", "task_output"];
+const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob_files", "grep_files", "repo_map", "read_session", "task_output"];
 const PATH_READ_TOOLS: &[&str] = &["read_file", "list_dir"];
 const COMMAND_TOOLS: &[&str] = &["run_command", "task_stop"];
 const PLAN_TOOLS: &[&str] = &["update_plan", "ask_user"];
@@ -780,7 +780,7 @@ const NETWORK_TOOLS: &[&str] = &["web_fetch", "web_search"];
 /// 验收欠账期间的无害放行集：查看/规划/提问/加载技能都不构成实质动作，
 /// 不满足验收也不拦截（满足验收的调用另有 satisfies 判定放行）。
 const POST_EXEMPT: &[&str] = &[
-    "read_file", "list_dir", "glob_files", "grep_files", "read_session", "task_output",
+    "read_file", "list_dir", "glob_files", "grep_files", "repo_map", "read_session", "task_output",
     "update_plan", "ask_user", "load_skill",
 ];
 

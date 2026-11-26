@@ -38,7 +38,7 @@ type SandboxNode = Node<SandboxNodeData, 'maestro'>;
 type SandboxEdge = Edge;
 
 const KNOWN_TOOLS = [
-  'read_file', 'read_files', 'list_files', 'grep_files', 'semantic_search',
+  'read_file', 'read_files', 'list_files', 'grep_files', 'repo_map', 'semantic_search',
   'write_file', 'apply_patch', 'run_command', 'update_plan', 'load_skill',
   'spawn_subagent', 'load_agent', 'web_search', 'web_fetch', 'use_skill', 'ask_user',
 ];

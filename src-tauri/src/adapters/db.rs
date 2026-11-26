@@ -1162,6 +1162,76 @@ impl Database {
     }
 
 
+    /// repo map 缓存读取：workspace 作用域内全部行的 mtime + 符号。
+    /// 行损坏（JSON 反序列化失败）静默跳过——下次扫描会以 mtime 未变为由
+    /// 复用坏行；宁可跳过强制重解析，也不让一行坏数据哑掉整个地图。
+    pub async fn repo_map_cache(
+        &self,
+        workspace_root: &str,
+    ) -> AppResult<std::collections::HashMap<String, (i64, crate::adapters::repo_map::FileSymbols)>> {
+        let root = workspace_root.to_string();
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT path, mtime, defs_json, refs_json FROM repo_symbols WHERE workspace_root = ?1")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![root], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                })
+                .map_err(db_error)?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows.flatten() {
+                let (path, mtime, defs_json, refs_json) = row;
+                let (Ok(defs), Ok(refs)) = (
+                    serde_json::from_str::<Vec<crate::adapters::repo_map::SymbolDef>>(&defs_json),
+                    serde_json::from_str::<Vec<String>>(&refs_json),
+                ) else { continue };
+                out.insert(path, (mtime, crate::adapters::repo_map::FileSymbols { defs, refs }));
+            }
+            Ok(out)
+        }).await
+    }
+
+    /// repo map 缓存写入：单文件 upsert（解析产出即落库）。
+    pub async fn repo_map_upsert(
+        &self,
+        workspace_root: &str,
+        path: &str,
+        mtime: i64,
+        symbols: &crate::adapters::repo_map::FileSymbols,
+    ) -> AppResult<()> {
+        let root = workspace_root.to_string();
+        let rel = path.to_string();
+        let defs_json = serde_json::to_string(&symbols.defs).map_err(|error| error.to_string())?;
+        let refs_json = serde_json::to_string(&symbols.refs).map_err(|error| error.to_string())?;
+        self.call(move |connection| {
+            connection.execute(
+                "INSERT INTO repo_symbols (workspace_root, path, mtime, defs_json, refs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (workspace_root, path) DO UPDATE SET
+                   mtime = excluded.mtime, defs_json = excluded.defs_json, refs_json = excluded.refs_json",
+                params![root, rel, mtime, defs_json, refs_json],
+            ).map_err(db_error)?;
+            Ok(())
+        }).await
+    }
+
+    /// repo map 缓存清理：删除 workspace 作用域内已不存在文件的行。
+    /// live 为空时清空该 workspace 全部行（目录已无源文件）。
+    pub async fn repo_map_prune(&self, workspace_root: &str, live: &[String]) -> AppResult<()> {
+        let root = workspace_root.to_string();
+        let live_json = serde_json::to_string(live).map_err(|error| error.to_string())?;
+        self.call(move |connection| {
+            // json_each 反 join：不在 live 列表内的行删除。
+            connection.execute(
+                "DELETE FROM repo_symbols WHERE workspace_root = ?1
+                 AND path NOT IN (SELECT value FROM json_each(?2))",
+                params![root, live_json],
+            ).map_err(db_error)?;
+            Ok(())
+        }).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn record_file_change(&self, run_id: i64, session_id: i64, path: String, added: i64, removed: i64, before: String, after: String) -> AppResult<()> {
         self.call(move |connection| {
@@ -1563,9 +1633,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 20 {
+    if version > 21 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 20"
+            "Database schema {version} is newer than supported version 21"
         ));
     }
     connection
@@ -1903,6 +1973,23 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 21 {
+        // v21: repo map 符号缓存——mtime 对账增量重解析的事实源。
+        // defs/refs 存 JSON（签名与标识符集），workspace_root 作用域隔离。
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS repo_symbols (
+                   workspace_root TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   mtime INTEGER NOT NULL,
+                   defs_json TEXT NOT NULL,
+                   refs_json TEXT NOT NULL,
+                   PRIMARY KEY (workspace_root, path)
+                 );
+                 PRAGMA user_version = 21;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -1992,6 +2079,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "maestro-sqlite");
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repo_map_cache_roundtrips_and_prunes() {
+        let database = Database::open(":memory:".into()).await.unwrap();
+        let root = "D:/workspace";
+        let symbols = crate::adapters::repo_map::FileSymbols {
+            defs: vec![crate::adapters::repo_map::SymbolDef {
+                name: "execute".into(),
+                kind: "fn".into(),
+                signature: "pub fn execute()".into(),
+                line: 10,
+            }],
+            refs: vec!["execute".into(), "helper".into()],
+        };
+        database.repo_map_upsert(root, "src/a.rs", 1000, &symbols).await.unwrap();
+        database.repo_map_upsert(root, "src/b.rs", 2000, &symbols).await.unwrap();
+        // 读取还原。
+        let cache = database.repo_map_cache(root).await.unwrap();
+        assert_eq!(cache.len(), 2);
+        let (mtime, restored) = cache.get("src/a.rs").unwrap();
+        assert_eq!(*mtime, 1000);
+        assert_eq!(restored.defs[0].name, "execute");
+        assert_eq!(restored.defs[0].line, 10);
+        assert_eq!(restored.refs.len(), 2);
+        // workspace 隔离：别的 root 看不到。
+        assert!(database.repo_map_cache("D:/other").await.unwrap().is_empty());
+        // upsert 覆盖同键。
+        database.repo_map_upsert(root, "src/a.rs", 1001, &symbols).await.unwrap();
+        assert_eq!(database.repo_map_cache(root).await.unwrap().get("src/a.rs").unwrap().0, 1001);
+        // prune：b.rs 消失后只剩 a.rs。
+        database.repo_map_prune(root, &["src/a.rs".to_string()]).await.unwrap();
+        let after = database.repo_map_cache(root).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after.contains_key("src/a.rs"));
         database.shutdown().await.unwrap();
     }
 
@@ -2153,7 +2276,7 @@ mod tests {
         for column in ["reasoning_tokens", "first_token_ms", "elapsed_ms", "last_input_tokens"] {
             assert!(columns.iter().any(|name| name == column), "missing {column}");
         }
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2210,7 +2333,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(has_parts, 1, "run_parts must be created when upgrading from v12");
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2222,7 +2345,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 21)
+                    .pragma_update(None, "user_version", 22)
                     .map_err(db_error)
             })
             .await

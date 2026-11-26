@@ -133,7 +133,8 @@ pub fn list_dir(root: &Path, rel: &str) -> AppResult<String> {
 /// workspace-relative `/`-joined paths. Symlinks are never traversed —
 /// `DirEntry::file_type` reports the link itself, and collected files are
 /// re-canonicalized under `base` before being returned.
-fn walk_files(base: &Path, out: &mut Vec<String>) {
+/// repo_map 等只读索引器复用的文件遍历——junk-list 语义与 glob/grep 一致。
+pub(crate) fn walk_files(base: &Path, out: &mut Vec<String>) {
     fn visit(dir: &Path, base: &Path, visited: &mut usize, out: &mut Vec<String>) {
         let Ok(read) = std::fs::read_dir(dir) else { return };
         for entry in read.flatten() {
