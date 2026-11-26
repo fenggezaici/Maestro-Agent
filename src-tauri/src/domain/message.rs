@@ -63,8 +63,10 @@ pub struct ToolSpec {
 
 use crate::domain::error::AppResult;
 
-/// Boundary validation for messages arriving over IPC.
-pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
+/// Boundary validation for messages arriving over IPC. Returns the trailing
+/// user turn as `(prompt, images)` — history is rebuilt backend-side from the
+/// database, so only the last message's content crosses this boundary.
+pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<(String, Vec<String>)> {
     if messages.is_empty()
         || messages.len() > 129
         || messages.iter().any(|message| {
@@ -93,5 +95,7 @@ pub fn validate_messages(messages: &[ChatMessage]) -> AppResult<String> {
     if last.role != "user" || last.content.trim().is_empty() || last.content.trim().len() > 8192 {
         return Err("最后一条必须是 1–8192 UTF-8 bytes 的用户消息".into());
     }
-    Ok(last.content.trim().to_string())
+    // 图片随用户轮次上行：此前校验后只返回文本，附件在交接处被静默丢弃——
+    // 视觉门控放行的 dataURL 必须真正抵达 wire 层才有意义。
+    Ok((last.content.trim().to_string(), last.images.clone().unwrap_or_default()))
 }

@@ -186,6 +186,24 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const attachmentUrls = useRef(new Set<string>());
   const fileInput = useRef<HTMLInputElement>(null);
   useEffect(() => () => { for (const url of attachmentUrls.current) URL.revokeObjectURL(url); attachmentUrls.current.clear(); }, []);
+  // 会话重载后恢复已持久化的历史图片：内存态（本次提交写入）优先，
+  // 只为缺少图片记录的 run 从 SessionDetail.runImages 重建可见附件。
+  useEffect(() => {
+    const persisted = c.detail?.runImages;
+    if (!persisted) return;
+    setMessageAttachments((current) => {
+      const merged = { ...current };
+      for (const [key, images] of Object.entries(persisted)) {
+        const runId = Number(key);
+        if (!images.length || merged[runId]?.some((item) => item.type === 'image' && item.dataUrl)) continue;
+        const restored: LocalAttachment[] = images.map((dataUrl, index) => ({
+          id: `persisted-${runId}-${index}`, name: '图片', type: 'image', url: dataUrl, dataUrl,
+        }));
+        merged[runId] = [...(merged[runId] ?? []), ...restored];
+      }
+      return merged;
+    });
+  }, [c.detail?.runImages]);
   const composerRef = useRef<ComposerHandle>(null);
   // 视图状态按会话存活（sessionStorage）：dev 下 agent 写 src/ 会触发 vite
   // 整页 reload，持久化让 Workbench remount 后回到点击前视图，而不是落回

@@ -212,8 +212,31 @@ pub fn conversation(detail: &SessionDetail, run: &RunView, context_window: Optio
         budget -= size;
         included.push((item, output, summary, run_messages));
     }
+    // 图片回放预算：仅最近 2 个含图用户轮保留 images（每轮最多 4 张）——
+    // 单图约 1-2k token，全量回放会挤占文本预算；更早的含图轮降级为文字提示，
+    // 模型由此知道"曾经有图"而不是静默丢失。（included[0] 为最新一轮。）
+    let mut image_replay: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (item, _, _, _) in included.iter() {
+        if detail.run_images.get(&item.id).is_some_and(|images| !images.is_empty()) {
+            image_replay.insert(item.id);
+            if image_replay.len() >= 2 {
+                break;
+            }
+        }
+    }
     for (item, output, summary, run_messages) in included.into_iter().rev() {
-        messages.push(ChatMessage::text("user", item.prompt.clone()));
+        let mut prompt_text = item.prompt.clone();
+        let mut user_images: Option<Vec<String>> = None;
+        if let Some(images) = detail.run_images.get(&item.id).filter(|images| !images.is_empty()) {
+            if image_replay.contains(&item.id) {
+                user_images = Some(images.iter().take(4).cloned().collect());
+            } else {
+                prompt_text.push_str("\n[本轮曾附图片，因上下文预算未回放]");
+            }
+        }
+        let mut user_message = ChatMessage::text("user", prompt_text);
+        user_message.images = user_images;
+        messages.push(user_message);
         if !run_messages.is_empty() {
             for message in &run_messages {
                 let tool_calls = message
@@ -257,7 +280,15 @@ pub fn conversation(detail: &SessionDetail, run: &RunView, context_window: Optio
             ));
         }
     }
-    messages.push(ChatMessage::text("user", run.prompt.clone()));
+    // 当前轮图片全量携带（validate 已限 ≤8 张）——这是用户刚刚粘贴/选择的
+    // 视觉上下文，正是本轮工作的输入。
+    let mut current = ChatMessage::text("user", run.prompt.clone());
+    current.images = detail
+        .run_images
+        .get(&run.id)
+        .filter(|images| !images.is_empty())
+        .cloned();
+    messages.push(current);
     messages
 }
 
@@ -2260,6 +2291,7 @@ mod tests {
         let detail = SessionDetail {
             reasoning: Default::default(),
             parts: Default::default(),
+            run_images: Default::default(),
             session: crate::domain::SessionView {
                 id: 7,
                 title: "session".into(),
@@ -2360,6 +2392,62 @@ mod tests {
             && message.content.contains("没有最终文字输出")));
         assert!(messages.iter().any(|message| message.role == "system"
             && message.content.contains("write_file")));
+    }
+
+    #[test]
+    fn current_turn_images_reach_the_conversation() {
+        let (mut detail, current) = fixture(RunStatus::Completed, "done");
+        detail.run_images.insert(2, vec!["data:image/webp;base64,CURRENT".into()]);
+        let messages = conversation(&detail, &current, None);
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.images.as_deref(), Some(&["data:image/webp;base64,CURRENT".to_string()][..]));
+    }
+
+    #[test]
+    fn replay_keeps_only_the_two_most_recent_image_turns() {
+        let (mut detail, _current) = fixture(RunStatus::Completed, "done");
+        // 三个含图 prior（id 1/2/3）+ 当前轮 id 5：回放预算只够最近 2 个保留图片。
+        let priors: Vec<RunView> = [
+            (1, "最早一轮", 1),
+            (2, "中间一轮", 2),
+            (3, "最近一轮", 3),
+        ]
+        .into_iter()
+        .map(|(id, prompt, created_at)| RunView {
+            id,
+            session_id: 7,
+            prompt: prompt.into(),
+            mode: Mode::Code,
+            status: RunStatus::Completed,
+            output: "answer".into(),
+            error: None,
+            created_at,
+        })
+        .collect();
+        detail.runs = priors;
+        for id in [1, 2, 3] {
+            detail.run_images.insert(id, vec![format!("data:image/webp;base64,IMG{id}")]);
+        }
+        let current = RunView {
+            id: 5,
+            session_id: 7,
+            prompt: "继续".into(),
+            mode: Mode::Code,
+            status: RunStatus::Running,
+            output: String::new(),
+            error: None,
+            created_at: 5,
+        };
+        let messages = conversation(&detail, &current, None);
+        let find = |needle: &str| messages.iter().find(|m| m.content.contains(needle)).cloned();
+        let oldest = find("最早一轮").expect("最早一轮应在回放中");
+        let middle = find("中间一轮").expect("中间一轮应在回放中");
+        let newest = find("最近一轮").expect("最近一轮应在回放中");
+        assert!(oldest.images.is_none(), "最老含图轮不应回放图片");
+        assert!(oldest.content.contains("未回放"), "最老轮应有未回放提示: {}", oldest.content);
+        assert_eq!(middle.images.as_deref(), Some(&["data:image/webp;base64,IMG2".to_string()][..]));
+        assert_eq!(newest.images.as_deref(), Some(&["data:image/webp;base64,IMG3".to_string()][..]));
     }
 
     #[test]

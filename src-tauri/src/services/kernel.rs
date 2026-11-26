@@ -363,7 +363,7 @@ impl Kernel {
         };
         let run_id = self
             .database
-            .create_run_in_session(session_id, "e2e flood".into(), Mode::Auto)
+            .create_run_in_session(session_id, "e2e flood".into(), Mode::Auto, Vec::new())
             .await?;
         let kernel = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -441,28 +441,30 @@ impl Kernel {
         config: ChatConfig,
     ) -> AppResult<i64> {
         config.validate()?;
-        let prompt = crate::domain::validate_messages(&messages)?;
+        let (prompt, images) = crate::domain::validate_messages(&messages)?;
         let id = match session_id {
             Some(id) => id,
             None => self.create_session(None).await?.id,
         };
-        self.start_model(id, prompt, config).await
+        self.start_model(id, prompt, images, config).await
     }
 
     pub async fn start_model(
         self: &Arc<Self>,
         session_id: i64,
         prompt: String,
+        images: Vec<String>,
         config: ChatConfig,
     ) -> AppResult<i64> {
         config.validate()?;
-        self.start_run(session_id, prompt, config).await
+        self.start_run(session_id, prompt, images, config).await
     }
 
     async fn start_run(
         self: &Arc<Self>,
         session_id: i64,
         prompt: String,
+        images: Vec<String>,
         mut config: ChatConfig,
     ) -> AppResult<i64> {
         let prompt = prompt.trim().to_string();
@@ -485,7 +487,7 @@ impl Kernel {
         };
         let id = self
             .database
-            .create_run_in_session(session_id, prompt.clone(), mode)
+            .create_run_in_session(session_id, prompt.clone(), mode, images)
             .await?;
         self.metrics_acc.lock().unwrap().remove(&id);
         self.write_net.lock().unwrap().remove(&id);
@@ -3082,7 +3084,7 @@ mod tests {
     async fn run_guard_rejects_parallel_runs_mode_changes_and_wrong_ids() {
         let (kernel, _) = test_kernel().await;
         let (id, _rx) = seed_run(&kernel).await;
-        assert!(kernel.start_model(1, "parallel".into(), test_config()).await.is_err());
+        assert!(kernel.start_model(1, "parallel".into(), Vec::new(), test_config()).await.is_err());
         assert!(kernel.set_mode(Mode::Execute).await.is_err());
         assert!(kernel.cancel(id + 1).await.is_ok());
         assert!(kernel.authorize_tool(id, "apply_patch").await.is_err());
@@ -3102,7 +3104,7 @@ mod tests {
         *kernel.llm_resolver.lock().unwrap() = Arc::new(|_| Arc::new(StubProvider));
         let session = kernel.create_session(None).await.unwrap();
         kernel
-            .start_model(session.id, "hello".into(), test_config())
+            .start_model(session.id, "hello".into(), Vec::new(), test_config())
             .await
             .unwrap();
         wait_for_idle(&kernel).await;
@@ -3135,16 +3137,16 @@ mod tests {
             kernel.snapshot().await.last_run.unwrap().status,
             RunStatus::Cancelled
         );
-        assert!(kernel.start_model(1, "late".into(), test_config()).await.is_err());
+        assert!(kernel.start_model(1, "late".into(), Vec::new(), test_config()).await.is_err());
         assert!(kernel.set_mode(Mode::Execute).await.is_err());
     }
 
     #[tokio::test]
     async fn validates_prompts_on_the_backend() {
         let (kernel, _) = test_kernel().await;
-        assert!(kernel.start_model(1, "  ".into(), test_config()).await.is_err());
+        assert!(kernel.start_model(1, "  ".into(), Vec::new(), test_config()).await.is_err());
         assert!(kernel
-            .start_model(1, "x".repeat(8193), test_config())
+            .start_model(1, "x".repeat(8193), Vec::new(), test_config())
             .await
             .is_err());
         kernel.shutdown().await.unwrap();
@@ -3169,7 +3171,7 @@ mod tests {
     async fn seed_run_in_session(kernel: &Arc<Kernel>, session_id: i64, mode: Mode) -> i64 {
         let id = kernel
             .database
-            .create_run_in_session(session_id, "boundary".into(), mode)
+            .create_run_in_session(session_id, "boundary".into(), mode, Vec::new())
             .await
             .unwrap();
         activate_seeded_run(kernel, id, session_id, mode).await.0
@@ -3357,7 +3359,7 @@ mod tests {
         assert!(!snapshot.ready);
         assert_eq!(snapshot.active_run.unwrap().status, RunStatus::Failed);
         assert!(kernel.create_session(None).await.is_err());
-        assert!(kernel.start_model(1, "late".into(), test_config()).await.is_err());
+        assert!(kernel.start_model(1, "late".into(), Vec::new(), test_config()).await.is_err());
         assert!(kernel.authorize_tool(id, "read_session").await.is_err());
         assert!(events
             .lock()

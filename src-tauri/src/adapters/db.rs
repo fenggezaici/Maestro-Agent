@@ -91,7 +91,7 @@ impl Database {
     #[cfg(test)]
     pub async fn create_run(&self, prompt: String, mode: Mode) -> AppResult<i64> {
         let session = self.create_session().await?;
-        self.create_run_in_session(session.id, prompt, mode).await
+        self.create_run_in_session(session.id, prompt, mode, Vec::new()).await
     }
 
     #[cfg(test)]
@@ -401,6 +401,7 @@ impl Database {
         session_id: i64,
         prompt: String,
         mode: Mode,
+        images: Vec<String>,
     ) -> AppResult<i64> {
         self.call(move |connection| {
             let transaction = connection.transaction().map_err(db_error)?;
@@ -410,10 +411,15 @@ impl Database {
                  ELSE title END WHERE id = ?1", params![session_id, prompt],
             ).map_err(db_error)?;
             if changed != 1 { return Err("Session not found".into()); }
+            let images_json = if images.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&images).map_err(|error| error.to_string())?)
+            };
             transaction
                 .execute(
-                    "INSERT INTO runs (prompt, mode, status, session_id) VALUES (?1, ?2, 'running', ?3)",
-                    params![prompt, mode.as_str(), session_id],
+                    "INSERT INTO runs (prompt, mode, status, session_id, images) VALUES (?1, ?2, 'running', ?3, ?4)",
+                    params![prompt, mode.as_str(), session_id, images_json],
                 )
                 .map_err(db_error)?;
             let id = transaction.last_insert_rowid();
@@ -706,7 +712,25 @@ impl Database {
                 let rows = statement.query_map([session_id], run_message_row).map_err(db_error)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
             };
-            Ok(SessionDetail { session, runs, plans, metrics, tools, compactions, run_messages, reasoning, parts })
+            let mut run_images: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+            {
+                let mut statement = connection
+                    .prepare("SELECT id, images FROM runs WHERE session_id=?1 AND images IS NOT NULL")
+                    .map_err(db_error)?;
+                let rows = statement
+                    .query_map([session_id], |row| {
+                        let json: String = row.get(1)?;
+                        Ok((row.get::<_, i64>(0)?, serde_json::from_str::<Vec<String>>(&json).unwrap_or_default()))
+                    })
+                    .map_err(db_error)?;
+                for row in rows {
+                    let (run_id, images) = row.map_err(db_error)?;
+                    if !images.is_empty() {
+                        run_images.insert(run_id, images);
+                    }
+                }
+            }
+            Ok(SessionDetail { session, runs, plans, metrics, tools, compactions, run_messages, reasoning, parts, run_images })
         }).await
     }
 
@@ -1539,9 +1563,9 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
-    if version > 19 {
+    if version > 20 {
         return Err(format!(
-            "Database schema {version} is newer than supported version 19"
+            "Database schema {version} is newer than supported version 20"
         ));
     }
     connection
@@ -1868,6 +1892,17 @@ fn initialize(path: PathBuf) -> AppResult<Connection> {
             )
             .map_err(db_error)?;
     }
+    if version < 20 {
+        // v20: 用户轮次的图片附件此前校验后即丢弃——既不进模型也不落库。
+        // runs.images 存 dataURL JSON 数组（NULL 为无图）：回放重建、会话
+        // 重启后的缩略图恢复都以此为唯一事实源。
+        transaction
+            .execute_batch(
+                "ALTER TABLE runs ADD COLUMN images TEXT;
+                 PRAGMA user_version = 20;",
+            )
+            .map_err(db_error)?;
+    }
     transaction.execute("UPDATE plan_cards SET status = 'invalidated' WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')", []).map_err(db_error)?;
     transaction
         .execute(
@@ -2086,6 +2121,7 @@ mod tests {
                          ALTER TABLE run_metrics DROP COLUMN tool_ms;
                          ALTER TABLE run_messages DROP COLUMN thinking;
                          ALTER TABLE run_messages DROP COLUMN is_error;
+                         ALTER TABLE runs DROP COLUMN images;
                          DROP TABLE trusted_workspaces;
                          DROP TABLE approval_rules;
                          PRAGMA user_version = 13;",
@@ -2117,7 +2153,7 @@ mod tests {
         for column in ["reasoning_tokens", "first_token_ms", "elapsed_ms", "last_input_tokens"] {
             assert!(columns.iter().any(|name| name == column), "missing {column}");
         }
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2145,6 +2181,7 @@ mod tests {
                          ALTER TABLE run_metrics DROP COLUMN tool_ms;
                          ALTER TABLE run_messages DROP COLUMN thinking;
                          ALTER TABLE run_messages DROP COLUMN is_error;
+                         ALTER TABLE runs DROP COLUMN images;
                          DROP TABLE trusted_workspaces;
                          DROP TABLE approval_rules;
                          PRAGMA user_version = 12;",
@@ -2173,7 +2210,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(has_parts, 1, "run_parts must be created when upgrading from v12");
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2185,7 +2222,7 @@ mod tests {
         database
             .call(|connection| {
                 connection
-                    .pragma_update(None, "user_version", 20)
+                    .pragma_update(None, "user_version", 21)
                     .map_err(db_error)
             })
             .await
@@ -2331,7 +2368,7 @@ mod tests {
         assert_eq!(detail.runs[1].mode, Mode::Plan);
         assert_eq!(detail.plans[0].status, PlanStatus::Approved);
         let id = database
-            .create_run_in_session(1, "new code".into(), Mode::Code)
+            .create_run_in_session(1, "new code".into(), Mode::Code, Vec::new())
             .await
             .unwrap();
         assert!(id > 99);
@@ -2461,7 +2498,7 @@ mod tests {
 
         // A running run blocks archiving and project deletion.
         let run_id = database
-            .create_run_in_session(moved.id, "work".into(), Mode::Plan)
+            .create_run_in_session(moved.id, "work".into(), Mode::Plan, Vec::new())
             .await
             .unwrap();
         assert!(database.delete_project(project.id).await.is_err());
@@ -2582,13 +2619,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_images_roundtrip_through_session_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("images.sqlite3");
+        let database = Database::open(path.clone()).await.unwrap();
+        let session = database.create_session().await.unwrap();
+        let with_images = database
+            .create_run_in_session(
+                session.id,
+                "看图".into(),
+                Mode::Code,
+                vec!["data:image/webp;base64,AAA".into(), "data:image/webp;base64,BBB".into()],
+            )
+            .await
+            .unwrap();
+        let without_images = database
+            .create_run_in_session(session.id, "纯文本".into(), Mode::Code, Vec::new())
+            .await
+            .unwrap();
+        let detail = database.session_detail(session.id).await.unwrap();
+        assert_eq!(
+            detail.run_images.get(&with_images),
+            Some(&vec!["data:image/webp;base64,AAA".to_string(), "data:image/webp;base64,BBB".to_string()]),
+            "含图 run 的 images 应原样读回"
+        );
+        assert!(!detail.run_images.contains_key(&without_images), "无图 run 不应出现在 map 中");
+    }
+
+    #[tokio::test]
     async fn subagent_traces_persist_finish_and_cascade() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("traces.sqlite3");
         let database = Database::open(path.clone()).await.unwrap();
         let session = database.create_session().await.unwrap();
         let run_id = database
-            .create_run_in_session(session.id, "work".into(), Mode::Plan)
+            .create_run_in_session(session.id, "work".into(), Mode::Plan, Vec::new())
             .await
             .unwrap();
         let trace = SubagentView {
@@ -2672,7 +2737,7 @@ mod tests {
         let database = Database::open(path.clone()).await.unwrap();
         let session = database.create_session().await.unwrap();
         let run_id = database
-            .create_run_in_session(session.id, "work".into(), Mode::Plan)
+            .create_run_in_session(session.id, "work".into(), Mode::Plan, Vec::new())
             .await
             .unwrap();
         database

@@ -172,6 +172,11 @@ pub struct SessionDetail {
     /// replay keeps the exact interleaving instead of a heuristic ordering.
     #[serde(default)]
     pub parts: std::collections::HashMap<i64, Vec<RunPart>>,
+    /// Data-URL images attached to a run's user turn, keyed by run id. Lives
+    /// outside `RunView` so streaming `Status` events never carry megabytes of
+    /// base64 — the map is hydrated once with the session detail.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub run_images: std::collections::HashMap<i64, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

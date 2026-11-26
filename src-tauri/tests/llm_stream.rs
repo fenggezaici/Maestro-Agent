@@ -300,7 +300,7 @@ async fn retries_once_when_the_gateway_closes_before_the_first_chunk() {
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "retry this".into(), config(url))
+        .start_model(session.id, "retry this".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -327,7 +327,7 @@ async fn retries_mid_stream_when_only_reasoning_has_flown() {
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "retry this".into(), config(url))
+        .start_model(session.id, "retry this".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -364,7 +364,7 @@ async fn nameless_tool_fragments_nudge_the_model_instead_of_silent_completion() 
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "do work".into(), config(url))
+        .start_model(session.id, "do work".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -393,7 +393,7 @@ async fn persistent_empty_turns_finish_with_a_visible_marker() {
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "do work".into(), config(url))
+        .start_model(session.id, "do work".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -430,7 +430,7 @@ async fn doom_loop_blocks_then_aborts_repeated_identical_calls() {
     kernel.set_workspace_root(Some(dir)).await;
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "loop it".into(), config(url))
+        .start_model(session.id, "loop it".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -478,7 +478,7 @@ async fn alternating_call_arguments_reset_the_doom_streak() {
     kernel.set_workspace_root(Some(dir)).await;
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "loop it".into(), config(url))
+        .start_model(session.id, "loop it".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -520,7 +520,7 @@ async fn reasoning_deltas_are_coalesced_into_one_chunk() {
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "reason".into(), config(url))
+        .start_model(session.id, "reason".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -566,7 +566,7 @@ async fn real_http_sse_streams_before_completion_and_persists_with_rust_plan_pro
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     let id = kernel
-        .start_model(session.id, "current user question".into(), config(url))
+        .start_model(session.id, "current user question".into(), Vec::new(), config(url))
         .await
         .unwrap();
     let body = tokio::time::timeout(Duration::from_secs(3), request)
@@ -619,7 +619,7 @@ async fn http_errors_and_cancellation_finish_without_panicking() {
     .unwrap();
     let session = kernel.create_session(None).await.unwrap();
     kernel
-        .start_model(session.id, "auth failure".into(), config(url))
+        .start_model(session.id, "auth failure".into(), Vec::new(), config(url))
         .await
         .unwrap();
     idle(&kernel).await;
@@ -631,7 +631,7 @@ async fn http_errors_and_cancellation_finish_without_panicking() {
     server.await.unwrap();
     let (url, request, server) = provider(200, vec![(1500, "data: [DONE]\n\n")]).await;
     let id = kernel
-        .start_model(session.id, "cancel request".into(), config(url))
+        .start_model(session.id, "cancel request".into(), Vec::new(), config(url))
         .await
         .unwrap();
     request.await.unwrap();
@@ -686,7 +686,7 @@ async fn anthropic_messages_sse_and_usage_are_adapted_without_mixing_system_role
     settings.model = "claude-3-7-sonnet-latest".into();
     settings.reasoning = Some("medium".into());
     kernel
-        .start_model(session.id, "anthropic request".into(), settings)
+        .start_model(session.id, "anthropic request".into(), Vec::new(), settings)
         .await
         .unwrap();
     let body = tokio::time::timeout(Duration::from_secs(3), request)
@@ -748,6 +748,7 @@ fn history_is_session_scoped_and_the_current_user_message_is_inserted_once() {
     let detail = SessionDetail {
         reasoning: Default::default(),
         parts: Default::default(),
+        run_images: Default::default(),
         session: SessionView {
             id: 1,
             title: "session".into(),

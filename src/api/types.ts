@@ -154,7 +154,7 @@ export interface RunMessage {
 export interface PersistedReasoning { text: string; startedAt: number; endedAt?: number | null }
 /// Ordered timeline part persisted per run (ZCode-style message parts).
 export interface PersistedPart { kind: 'reasoning' | 'tool' | 'content'; text?: string; index?: number; startedAt: number; endedAt?: number | null }
-export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[]; reasoning?: Record<number, PersistedReasoning[]>; parts?: Record<number, PersistedPart[]> }
+export interface SessionDetail { session: SessionView; runs: RunView[]; plans: PlanCard[]; metrics?: RunMetrics[]; tools?: ToolCallView[]; compactions?: ContextCompaction[]; runMessages?: RunMessage[]; reasoning?: Record<number, PersistedReasoning[]>; parts?: Record<number, PersistedPart[]>; runImages?: Record<number, string[]> }
 
 /// Trust prompt payload — workspace carries project `.maestro/` assets that
 /// stay inert until the user grants trust.
