@@ -163,6 +163,10 @@ pub enum TriggerAction {
     Any,
     /// 本轮 Run 的用户消息包含 target_dir 关键词时，对本轮全部工具调用生效。
     Prompt,
+    /// 网络出口（web_fetch/web_search）：target_dir 复用为域名子串
+    /// （web_fetch 的求值 target 即 URL origin，子串匹配天然按域隔离）；
+    /// 留空匹配任意网络调用。
+    Network,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -772,6 +776,7 @@ const READ_TOOLS: &[&str] = &["read_file", "list_dir", "glob_files", "grep_files
 const PATH_READ_TOOLS: &[&str] = &["read_file", "list_dir"];
 const COMMAND_TOOLS: &[&str] = &["run_command", "task_stop"];
 const PLAN_TOOLS: &[&str] = &["update_plan", "ask_user"];
+const NETWORK_TOOLS: &[&str] = &["web_fetch", "web_search"];
 /// 验收欠账期间的无害放行集：查看/规划/提问/加载技能都不构成实质动作，
 /// 不满足验收也不拦截（满足验收的调用另有 satisfies 判定放行）。
 const POST_EXEMPT: &[&str] = &[
@@ -836,6 +841,9 @@ fn trigger_matches(data: &GraphNodeData, call: &PendingCall, user_message: &str)
         }
         TriggerAction::Command => {
             COMMAND_TOOLS.contains(&call.tool.as_str()) && (dir.is_empty() || call.target.contains(&dir))
+        }
+        TriggerAction::Network => {
+            NETWORK_TOOLS.contains(&call.tool.as_str()) && (dir.is_empty() || call.target.contains(&dir))
         }
         TriggerAction::Plan => PLAN_TOOLS.contains(&call.tool.as_str()),
         TriggerAction::Any => {
@@ -2219,6 +2227,44 @@ mod tests {
         assert!(evaluate(&g, &plan, &[], 1, &snapshot(), "").blocked);
         let grep = PendingCall { tool: "grep_files".into(), target: "foo".into(), content: None };
         assert!(!evaluate(&g, &grep, &[], 1, &snapshot(), "").matched);
+    }
+
+    #[test]
+    fn network_trigger_matches_egress_tools_by_domain_substring() {
+        let g = graph(
+            vec![
+                node("tn", "trigger", json!({"action":"network","targetDir":"docs.rs"})),
+                node("ta", "trigger", json!({"action":"network"})),
+                node("a", "action", json!({"result":"block","message":"stop"})),
+            ],
+            vec![
+                edge("e1", "tn", "a", Some("out")),
+                edge("e2", "ta", "a", Some("out")),
+            ],
+        );
+        // web_fetch 的求值 target 是 origin——域名子串天然按域命中。
+        let hit = PendingCall { tool: "web_fetch".into(), target: "https://docs.rs".into(), content: None };
+        assert!(evaluate(&g, &hit, &[], 1, &snapshot(), "").blocked);
+        // 空 dir 的 network 触发器匹配任意网络调用（web_search 也覆盖）。
+        let search = PendingCall { tool: "web_search".into(), target: "rust tutorial".into(), content: None };
+        assert!(evaluate(&g, &search, &[], 1, &snapshot(), "").blocked);
+        let miss = PendingCall { tool: "web_fetch".into(), target: "https://example.com".into(), content: None };
+        // example.com 不命中 docs.rs 过滤，但空 dir 触发器仍拦截——验证两器独立。
+        assert!(evaluate(&g, &miss, &[], 1, &snapshot(), "").blocked);
+        // 非网络工具永不命中。
+        let read = PendingCall { tool: "read_file".into(), target: "docs.rs".into(), content: None };
+        assert!(!evaluate(&g, &read, &[], 1, &snapshot(), "").matched);
+
+        // 单独验证域名过滤：去掉空 dir 触发器后 example.com 不拦截。
+        let g2 = graph(
+            vec![
+                node("tn", "trigger", json!({"action":"network","targetDir":"docs.rs"})),
+                node("a", "action", json!({"result":"block","message":"stop"})),
+            ],
+            vec![edge("e1", "tn", "a", Some("out"))],
+        );
+        assert!(!evaluate(&g2, &miss, &[], 1, &snapshot(), "").blocked);
+        assert!(evaluate(&g2, &hit, &[], 1, &snapshot(), "").blocked);
     }
 
     #[test]

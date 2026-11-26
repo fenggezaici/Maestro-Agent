@@ -1683,6 +1683,9 @@ fn describe_trigger(data: &crate::domain::GraphNodeData) -> String {
         crate::domain::TriggerAction::Prompt => {
             if dir == "任意目标" { "用户发送任意消息".into() } else { format!("用户输入包含 {dir}") }
         }
+        crate::domain::TriggerAction::Network => {
+            if dir == "任意目标" { "访问网络".into() } else { format!("访问 {dir} 相关网络") }
+        }
     }
 }
 

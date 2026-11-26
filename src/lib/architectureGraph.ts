@@ -54,6 +54,7 @@ export const ACTION_LABELS: Record<TriggerAction, string> = {
   plan: '提交计划',
   any: '任意工具',
   prompt: '用户输入匹配',
+  network: '网络访问',
 };
 
 export function createNode(kind: NodeKind, position: { x: number; y: number }, seed: Partial<GraphNodeData> = {}): SandboxNode {

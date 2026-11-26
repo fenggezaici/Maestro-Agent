@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 /// 架构沙盘 wire 契约（与 Rust `domain::architecture` 对应）。
 export type GraphScope = 'project' | 'global' | 'effective';
-export type TriggerAction = 'modify' | 'read' | 'command' | 'plan' | 'any' | 'prompt';
+export type TriggerAction = 'modify' | 'read' | 'command' | 'plan' | 'any' | 'prompt' | 'network';
 /** block/warn 都是拦截（warn 仅语气不同）；remind 放行并把消息拼进工具结果。 */
 export type ActionResult = 'block' | 'warn' | 'remind';
 export type ExtensionKind = 'skill' | 'mcp' | 'plugin';

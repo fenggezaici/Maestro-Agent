@@ -319,9 +319,9 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
           <Choice label="触发动作" value={String(data.action ?? 'modify')} onChange={(v) => set({ action: v as TriggerAction })}
             options={(Object.keys(ACTION_LABELS) as TriggerAction[]).map((a) => ({ value: a, label: ACTION_LABELS[a] }))} />
         </Field>
-        <Field label={data.action === 'prompt' ? '用户输入关键词' : '目标路径 / 命令子串'}>
+        <Field label={data.action === 'prompt' ? '用户输入关键词' : data.action === 'network' ? '域名子串' : '目标路径 / 命令子串'}>
           <input className="prop-input" value={String(data.targetDir ?? '')}
-            placeholder={data.action === 'prompt' ? '如：重构 / UI / 数据库；留空 = 任意输入' : 'src/ui、docs；command 填子串；留空 = 任意'}
+            placeholder={data.action === 'prompt' ? '如：重构 / UI / 数据库；留空 = 任意输入' : data.action === 'network' ? '如：docs.rs；留空 = 任意网络访问' : 'src/ui、docs；command 填子串；留空 = 任意'}
             onChange={(e) => set({ targetDir: e.target.value })} />
         </Field>
         {data.action === 'prompt' && (
