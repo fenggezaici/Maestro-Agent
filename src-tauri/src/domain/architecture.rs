@@ -449,12 +449,22 @@ pub fn validate_graph(graph: &ArchitectureGraph) -> AppResult<()> {
             return Err(format!("Trigger 节点 {} 不能作为目标", target.id));
         }
         if matches!(target_kind, NodeKind::Subagent | NodeKind::Squad) {
-            if source_kind != NodeKind::Extension {
-                return Err(format!("{:?} 节点 {} 只接受扩展节点入边", target_kind, target.id));
-            }
-            // 装配连线仅表达「授予」，fail 出口在此无意义（未满足在子循环内处理）。
-            if edge.source_handle.as_deref().is_some_and(|handle| handle != "pass") {
-                return Err(format!("扩展 → 装配终点的连线只能使用 pass 出口（边 {}）", edge.id));
+            // 两类入边：extension pass = 授权；trigger out / 条件节点 pass =
+            // 派发义务（本 run 必须真实 spawn 该类型才放行）。fail→终点无意义。
+            let handle = edge.source_handle.as_deref();
+            let ok = match source_kind {
+                NodeKind::Extension => matches!(handle, None | Some("pass")),
+                NodeKind::Trigger => matches!(handle, None | Some("out")),
+                NodeKind::Requirement | NodeKind::Restriction => {
+                    matches!(handle, None | Some("pass"))
+                }
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "{:?} 节点 {} 的入边只接受 扩展(pass)/触发器(out)/条件(pass)（边 {}）",
+                    target_kind, target.id, edge.id
+                ));
             }
         }
         if let Some(handle) = edge.target_handle.as_deref() {
@@ -869,6 +879,8 @@ struct Eval<'a> {
     ext: &'a ExtensionSnapshot,
     by_id: HashMap<&'a str, &'a GraphNode>,
     out_edges: HashMap<&'a str, Vec<&'a GraphEdge>>,
+    /// 入边索引：subagent/squad 派发义务判定（来源 kind 区分授权/义务）。
+    in_edges: HashMap<&'a str, Vec<&'a GraphEdge>>,
     memo: EvalMemo<'a>,
     /// 本次待执行调用：Restriction 检查体 + 事后满足判定共用。
     call: &'a PendingCall,
@@ -935,6 +947,34 @@ impl<'a> Eval<'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// subagent/squad 派发义务：存在非 extension 入边（trigger out / 条件
+    /// pass 连入 = 「连线即声明必须先派发」）→ 返回 (类型名, 中文标签)；
+    /// 纯 extension 入边 = 纯授权，无义务。
+    fn dispatch_obligation(&self, node: &GraphNode) -> Option<(String, &'static str)> {
+        let obliged = self
+            .in_edges
+            .get(node.id.as_str())
+            .map(|edges| {
+                edges.iter().any(|edge| {
+                    self.by_id
+                        .get(edge.source.as_str())
+                        .and_then(|source| NodeKind::parse(&source.node_type))
+                        != Some(NodeKind::Extension)
+                })
+            })
+            .unwrap_or(false);
+        if !obliged {
+            return None;
+        }
+        let data = &node.data;
+        let (name, label) = match NodeKind::parse(&node.node_type) {
+            Some(NodeKind::Squad) => (data.squad.as_deref(), "军团"),
+            _ => (data.agent.as_deref(), "子智能体"),
+        };
+        let name = name?.trim().to_string();
+        (!name.is_empty()).then_some((name, label))
     }
 
     /// scope → 历史窗口：(跳过前 N 条, 只看本轮)。
@@ -1280,8 +1320,35 @@ impl<'a> Eval<'a> {
                 (true, warn, message, trace)
             }
             NodeKind::Subagent | NodeKind::Squad => {
-                // 装配终点：求值透明——连线只声明授权/编排，不拦截、不产生 trace 步骤。
-                (false, false, None, trace)
+                match self.dispatch_obligation(node) {
+                    // 纯 extension 入边 = 纯授权：求值透明，不拦截、不产生 trace 步骤。
+                    None => (false, false, None, trace),
+                    Some((name, label)) => {
+                        // 义务窗口 = run 级；本调用本身就是满足义务的派发时
+                        // 视为已满足（any/prompt 触发链不自锁 spawn 调用本身）。
+                        let spawned = self.history_has(
+                            (0, true),
+                            |tool| tool == "spawn_subagent",
+                            |target| path_matches(&name, target),
+                        ) || (self.call.tool == "spawn_subagent"
+                            && path_matches(&name, &self.call.target));
+                        if spawned {
+                            trace.push(TraceStep { node_id: id.into(), status: TraceStatus::Passed });
+                            (false, false, None, trace)
+                        } else {
+                            trace.push(TraceStep { node_id: id.into(), status: TraceStatus::Failed });
+                            let message = node
+                                .data
+                                .message
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("先派发{label} {name} 完成调研，再继续当前操作"));
+                            (true, false, Some(message), trace)
+                        }
+                    }
+                }
             }
             NodeKind::Requirement | NodeKind::Restriction | NodeKind::Extension => {
                 let (passed, status, default_message) = self.check(node);
@@ -1766,6 +1833,7 @@ pub fn armed_obligations(
         ext: extensions,
         by_id: HashMap::new(),
         out_edges: HashMap::new(),
+        in_edges: HashMap::new(),
         memo: HashMap::new(),
         call: &dummy,
         armed: HashSet::new(),
@@ -1802,6 +1870,10 @@ pub fn evaluate(
         by_id: graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect(),
         out_edges: graph.edges.iter().fold(HashMap::new(), |mut map, edge| {
             map.entry(edge.source.as_str()).or_insert_with(Vec::new).push(edge);
+            map
+        }),
+        in_edges: graph.edges.iter().fold(HashMap::new(), |mut map, edge| {
+            map.entry(edge.target.as_str()).or_insert_with(Vec::new).push(edge);
             map
         }),
         memo: HashMap::new(),
@@ -1929,6 +2001,36 @@ pub fn evaluate(
 pub fn trigger_ancestors(graph: &ArchitectureGraph, node_id: &str) -> Vec<GraphNodeData> {
     let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in &graph.edges {
+        incoming.entry(edge.target.as_str()).or_default().push(edge.source.as_str());
+    }
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = vec![node_id];
+    while let Some(id) = queue.pop() {
+        for parent in incoming.get(id).cloned().unwrap_or_default() {
+            if visited.insert(parent) {
+                if let Some(node) = graph.nodes.iter().find(|node| node.id == parent) {
+                    if NodeKind::parse(&node.node_type) == Some(NodeKind::Trigger) {
+                        out.push(node.data.clone());
+                    }
+                    queue.push(parent);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 派发义务的上游触发上下文：只沿「非扩展来源」入边回溯——
+/// extension→终点 是授权边，其上游触发器不属于派发义务语境。
+pub fn obligation_trigger_ancestors(graph: &ArchitectureGraph, node_id: &str) -> Vec<GraphNodeData> {
+    let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &graph.edges {
+        if let Some(source) = graph.nodes.iter().find(|node| node.id == edge.source) {
+            if NodeKind::parse(&source.node_type) == Some(NodeKind::Extension) {
+                continue;
+            }
+        }
         incoming.entry(edge.target.as_str()).or_default().push(edge.source.as_str());
     }
     let mut out = Vec::new();
@@ -2825,25 +2927,45 @@ mod tests {
         // 缺 agent 名 → 拒
         let bad = graph(vec![node("s", "subagent", json!({}))], vec![]);
         assert!(validate_graph(&bad).is_err());
-        // 非扩展入边（trigger → subagent）→ 拒
-        let bad_in = graph(
-            vec![node("t", "trigger", json!({"action":"any"})), subagent_node("s", "explore")],
-            vec![edge("e1", "t", "s", Some("out"))],
+        // 义务入边：trigger out / 条件 pass → 合法（连线即声明「必须先派发」）
+        let duty = graph(
+            vec![
+                node("t", "trigger", json!({"action":"any"})),
+                node("r", "requirement", json!({"toolName":"read_file"})),
+                node("d", "restriction", json!({"denyRule":"secret"})),
+                subagent_node("s", "explore"),
+            ],
+            vec![
+                edge("e1", "t", "s", Some("out")),
+                edge("e2", "r", "s", Some("pass")),
+                edge("e3", "d", "s", Some("pass")),
+            ],
         );
-        assert!(validate_graph(&bad_in).is_err());
+        assert!(validate_graph(&duty).is_ok());
         // subagent 出边 → 拒
         let bad_out = graph(
             vec![subagent_node("s", "explore"), node("a", "action", json!({"result":"block"}))],
             vec![edge("e1", "s", "a", Some("pass"))],
         );
         assert!(validate_graph(&bad_out).is_err());
-        // fail 出口接 subagent → 拒
+        // fail 出口接 subagent → 拒（条件节点 fail / 扩展 fail 都不行）
         let bad_fail = graph(
             vec![skill_ext("x", "ui-guidelines", "required"), subagent_node("s", "explore")],
             vec![edge("e1", "x", "s", Some("fail"))],
         );
         assert!(validate_graph(&bad_fail).is_err());
-        // 合法：extension --pass--> subagent
+        let bad_fail2 = graph(
+            vec![node("r", "requirement", json!({"toolName":"read_file"})), subagent_node("s", "explore")],
+            vec![edge("e1", "r", "s", Some("fail"))],
+        );
+        assert!(validate_graph(&bad_fail2).is_err());
+        // Action → subagent → 拒（动作不能声明义务）
+        let bad_action = graph(
+            vec![node("a", "action", json!({"result":"block"})), subagent_node("s", "explore")],
+            vec![edge("e1", "a", "s", Some("pass"))],
+        );
+        assert!(validate_graph(&bad_action).is_err());
+        // 合法：extension --pass--> subagent（纯授权）
         let ok = graph(
             vec![skill_ext("x", "ui-guidelines", "required"), subagent_node("s", "explore")],
             vec![edge("e1", "x", "s", Some("pass"))],
@@ -3002,13 +3124,13 @@ mod tests {
             json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
         );
         assert!(validate_graph(&out).is_err());
-        // 非扩展入边（trigger → squad）→ 拒
-        let bad_in = graph_with_squads(
+        // 义务入边（trigger --out--> squad）→ 合法
+        let duty = graph_with_squads(
             vec![node("t", "trigger", json!({"action":"any"})), squad_node("sq", "team")],
             vec![edge("e1", "t", "sq", Some("out"))],
             json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
         );
-        assert!(validate_graph(&bad_in).is_err());
+        assert!(validate_graph(&duty).is_ok());
     }
 
     #[test]
@@ -3214,5 +3336,119 @@ mod tests {
             "",
         );
         assert!(!pass.blocked);
+    }
+
+    #[test]
+    fn dispatch_obligation_blocks_until_spawned() {
+        // trigger --out--> squad：触发链要求本 run 已派发该军团。
+        let g = graph_with_squads(
+            vec![
+                node("t", "trigger", json!({"action":"modify","targetDir":"src"})),
+                squad_node("sq", "team"),
+            ],
+            vec![edge("e1", "t", "sq", Some("out"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        validate_graph(&g).unwrap();
+        let snap = snapshot();
+        // 未派发 → 拦截 + 默认派生消息
+        let hit = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert!(hit.matched && hit.blocked);
+        let message = hit.message.unwrap();
+        assert!(message.contains("team"), "默认义务消息应点名军团：{message}");
+        // 历史 target 为 type/description——前缀匹配命中
+        let spawned = [history("spawn_subagent", "team/调研任务", 1)];
+        let ok = evaluate(&g, &write_call("src/a.ts", "x"), &spawned, 1, &snap, "");
+        assert!(ok.matched && !ok.blocked);
+        // 别的军团名不满足
+        let wrong = [history("spawn_subagent", "other/x", 1)];
+        assert!(evaluate(&g, &write_call("src/a.ts", "x"), &wrong, 1, &snap, "").blocked);
+        // 义务窗口为 run 级：上一轮派发不算数
+        let stale = [history("spawn_subagent", "team/调研任务", 9)];
+        assert!(evaluate(&g, &write_call("src/a.ts", "x"), &stale, 1, &snap, "").blocked);
+        // 不命中触发链的调用不受影响
+        assert!(!evaluate(&g, &write_call("docs/a.md", "x"), &[], 1, &snap, "").blocked);
+    }
+
+    #[test]
+    fn dispatch_obligation_spawn_call_not_self_locked() {
+        // any 触发链：spawn_subagent 本身也命中 any——当前调用即满足义务，不自锁。
+        let g = graph_with_squads(
+            vec![
+                node("t", "trigger", json!({"action":"any"})),
+                squad_node("sq", "team"),
+            ],
+            vec![edge("e1", "t", "sq", Some("out"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        validate_graph(&g).unwrap();
+        let snap = snapshot();
+        let spawn = PendingCall { tool: "spawn_subagent".into(), target: "team/调研".into(), content: None };
+        assert!(!evaluate(&g, &spawn, &[], 1, &snap, "").blocked);
+        // 派发别的类型仍被拦（当前调用不满足本义务）
+        let other = PendingCall { tool: "spawn_subagent".into(), target: "other/x".into(), content: None };
+        assert!(evaluate(&g, &other, &[], 1, &snap, "").blocked);
+    }
+
+    #[test]
+    fn dispatch_obligation_via_requirement_chain() {
+        // trigger --out--> requirement --pass--> subagent：要求满足后仍须已派发。
+        let g = graph(
+            vec![
+                node("t", "trigger", json!({"action":"modify","targetDir":"src"})),
+                node("r", "requirement", json!({"toolName":"read_file","targetFile":"docs"})),
+                subagent_node("s", "explore"),
+            ],
+            vec![
+                edge("e1", "t", "r", Some("out")),
+                edge("e2", "r", "s", Some("pass")),
+            ],
+        );
+        validate_graph(&g).unwrap();
+        let snap = snapshot();
+        // 要求未满足 → 被 Requirement 拦（义务尚未到达）
+        let unmet = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert!(unmet.blocked);
+        assert!(unmet.message.unwrap().contains("必须先满足前置要求"));
+        // 要求已满足但未派发 → 被义务拦
+        let met = [history("read_file", "docs/a.md", 1)];
+        let blocked = evaluate(&g, &write_call("src/a.ts", "x"), &met, 1, &snap, "");
+        assert!(blocked.blocked);
+        assert!(blocked.message.unwrap().contains("explore"));
+        // 要求满足 + 已派发 → 放行
+        let done = [history("read_file", "docs/a.md", 1), history("spawn_subagent", "explore/x", 1)];
+        assert!(!evaluate(&g, &write_call("src/a.ts", "x"), &done, 1, &snap, "").blocked);
+        // 自定义 message 优先于默认义务文案
+        let g2 = graph(
+            vec![
+                node("t", "trigger", json!({"action":"modify"})),
+                { let mut v = subagent_node("s", "explore"); v["data"]["message"] = json!("先派 explore 再写"); v },
+            ],
+            vec![edge("e1", "t", "s", Some("out"))],
+        );
+        let hit = evaluate(&g2, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert_eq!(hit.message.as_deref(), Some("先派 explore 再写"));
+    }
+
+    #[test]
+    fn dispatch_obligation_pure_grant_stays_transparent() {
+        // 纯 extension 入边（授权）不产生义务——subagent 维持求值透明。
+        let g = graph(
+            vec![
+                node("t", "trigger", json!({"action":"modify","targetDir":"src"})),
+                skill_ext("x", "ui-guidelines", "optional"),
+                subagent_node("s", "explore"),
+            ],
+            vec![
+                edge("e1", "t", "x", Some("out")),
+                edge("e2", "x", "s", Some("pass")),
+            ],
+        );
+        validate_graph(&g).unwrap();
+        let snap = snapshot();
+        // 可选扩展不拦、义务不存在 → 放行，且无 subagent trace 步骤
+        let hit = evaluate(&g, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
+        assert!(!hit.blocked);
+        assert!(!hit.trace.iter().any(|step| step.node_id == "s"));
     }
 }

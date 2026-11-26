@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  createExtensionNode, createNode, deserializeGraph, isConnectionAllowed,
+  createExtensionNode, createNode, deserializeGraph, edgeTone, isConnectionAllowed,
   autoActionMessage, isSquadConnectionAllowed, layoutSquadTree, nodeSummary, remapIds, sampleGraph,
   serializeGraph, squadSkeleton, traceNodeStatus, validateDraft, validateSquadDraft,
   SANDBOX_TEMPLATES,
@@ -237,15 +237,55 @@ describe('subagent 装配节点', () => {
     expect(isConnectionAllowed(nodes, edges, { source: b.id, target: s.id }).ok).toBe(true);
   });
 
-  it('拒绝非扩展入边、fail 装配边与 subagent 出边', () => {
+  it('义务入边：trigger out / 条件 pass 可连；fail 与 action 入边仍拒', () => {
     const s = agent();
     const trigger = createNode('trigger', at, { action: 'any' });
+    const req = createNode('requirement', at, { toolName: 'read_file' });
+    const deny = createNode('restriction', at, { denyRule: 'secret' });
     const skill = ext();
-    const nodes = [s, trigger, skill];
-    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: s.id, sourceHandle: 'out' }).ok).toBe(false);
-    expect(isConnectionAllowed(nodes, [], { source: skill.id, target: s.id, sourceHandle: 'fail' }).ok).toBe(false);
     const action = createNode('action', at, { result: 'block' });
+    const nodes = [s, trigger, req, deny, skill, action];
+    // 义务连线（连线即声明「必须先派发」）
+    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: s.id, sourceHandle: 'out' }).ok).toBe(true);
+    expect(isConnectionAllowed(nodes, [], { source: req.id, target: s.id, sourceHandle: 'pass' }).ok).toBe(true);
+    expect(isConnectionAllowed(nodes, [], { source: deny.id, target: s.id, sourceHandle: 'pass' }).ok).toBe(true);
+    // fail 出口与 Action 源仍拒
+    expect(isConnectionAllowed(nodes, [], { source: skill.id, target: s.id, sourceHandle: 'fail' }).ok).toBe(false);
+    expect(isConnectionAllowed(nodes, [], { source: req.id, target: s.id, sourceHandle: 'fail' }).ok).toBe(false);
+    expect(isConnectionAllowed(nodes, [], { source: action.id, target: s.id, sourceHandle: 'pass' }).ok).toBe(false);
+    // subagent 自身仍无出边
     expect(isConnectionAllowed([s, action], [], { source: s.id, target: action.id, sourceHandle: 'pass' }).ok).toBe(false);
+  });
+
+  it('义务边语义色为 dispatch 紫；授权边保持默认', () => {
+    const s = agent();
+    const trigger = createNode('trigger', at, { action: 'any' });
+    const req = createNode('requirement', at, { toolName: 'read_file' });
+    const skill = ext();
+    const nodes = [s, trigger, req, skill];
+    const duty: SandboxEdge = { id: 'e1', source: trigger.id, target: s.id, sourceHandle: 'out', targetHandle: 'in' };
+    const gated: SandboxEdge = { id: 'e2', source: req.id, target: s.id, sourceHandle: 'pass', targetHandle: 'in' };
+    const grant: SandboxEdge = { id: 'e3', source: skill.id, target: s.id, sourceHandle: 'pass', targetHandle: 'in' };
+    expect(edgeTone(duty, nodes)).toBe('dispatch');
+    expect(edgeTone(gated, nodes)).toBe('dispatch');
+    expect(edgeTone(grant, nodes)).toBe('default');
+  });
+
+  it('validateDraft：义务链回溯不到 Trigger 报警告', () => {
+    const s = agent();
+    const req = createNode('requirement', at, { toolName: 'read_file' });
+    const trigger = createNode('trigger', at, { action: 'any' });
+    // req→s 死链（req 无 trigger 上游）
+    const dead: SandboxEdge = { id: 'e1', source: req.id, target: s.id, sourceHandle: 'pass', targetHandle: 'in' };
+    const { warnings } = validateDraft([s, req], [dead], { ...SEED, agents: [] });
+    expect(warnings.some((w) => w.includes('回溯不到 Trigger'))).toBe(true);
+    // trigger→req→s 活链无警告
+    const live: SandboxEdge[] = [
+      { id: 'e2', source: trigger.id, target: req.id, sourceHandle: 'out', targetHandle: 'in' },
+      dead,
+    ];
+    const ok = validateDraft([s, req, trigger], live, { ...SEED, agents: [] });
+    expect(ok.warnings.some((w) => w.includes('回溯不到 Trigger'))).toBe(false);
   });
 
   it('validateDraft：缺 agent/非法字符报错，未定义 agent 报警告', () => {
@@ -277,15 +317,19 @@ describe('squad 军团（subnet 子沙盘）', () => {
     createNode('subagent', at, optional ? { agent, requirement: 'optional' } : { agent });
   const squadOf = (name: string) => createNode('squad', at, { squad: name });
 
-  it('主图：squad 只接受扩展 pass 入边，自身无出边', () => {
+  it('主图：squad 接受扩展 pass + 义务入边，自身无出边', () => {
     const sq = squadOf('team-1');
     const ext = createExtensionNode(at, { kind: 'skill', name: 's', target: 's', requirement: 'required' });
     const trigger = createNode('trigger', at, { action: 'any' });
+    const req = createNode('requirement', at, { toolName: 'read_file' });
     const action = createNode('action', at, { result: 'block' });
-    const nodes = [sq, ext, trigger, action];
+    const nodes = [sq, ext, trigger, req, action];
     expect(isConnectionAllowed(nodes, [], { source: ext.id, target: sq.id, sourceHandle: 'pass' }).ok).toBe(true);
     expect(isConnectionAllowed(nodes, [], { source: ext.id, target: sq.id, sourceHandle: 'fail' }).ok).toBe(false);
-    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: sq.id, sourceHandle: 'out' }).ok).toBe(false);
+    // 义务入边：trigger out / 条件 pass
+    expect(isConnectionAllowed(nodes, [], { source: trigger.id, target: sq.id, sourceHandle: 'out' }).ok).toBe(true);
+    expect(isConnectionAllowed(nodes, [], { source: req.id, target: sq.id, sourceHandle: 'pass' }).ok).toBe(true);
+    expect(isConnectionAllowed(nodes, [], { source: req.id, target: sq.id, sourceHandle: 'fail' }).ok).toBe(false);
     expect(isConnectionAllowed(nodes, [], { source: sq.id, target: action.id, sourceHandle: 'pass' }).ok).toBe(false);
   });
 

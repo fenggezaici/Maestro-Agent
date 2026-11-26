@@ -250,8 +250,10 @@ export function isConnectionAllowed(
   if (source.data.nodeType === 'subagent') return { ok: false, reason: 'Subagent 是装配终点，不能作为起点' };
   if (source.data.nodeType === 'squad') return { ok: false, reason: 'Squad 是装配终点，不能作为起点' };
   if (target.data.nodeType === 'trigger') return { ok: false, reason: 'Trigger 是起点，不能作为目标' };
-  if ((target.data.nodeType === 'subagent' || target.data.nodeType === 'squad') && source.data.nodeType !== 'extension') {
-    return { ok: false, reason: `${NODE_LABELS[target.data.nodeType]} 只接受扩展节点入边` };
+  // 装配终点两类入边：extension pass = 授权；trigger out / 条件 pass = 派发义务。
+  if ((target.data.nodeType === 'subagent' || target.data.nodeType === 'squad')
+    && !['extension', 'trigger', 'requirement', 'restriction'].includes(source.data.nodeType)) {
+    return { ok: false, reason: `${NODE_LABELS[target.data.nodeType]} 只接受 扩展(pass)/触发器(out)/条件(pass) 入边` };
   }
   if ((candidate.targetHandle ?? 'in') !== 'in') return { ok: false, reason: '目标仅接受入口 Handle' };
   // 缺省出口按 source 类型取默认 Handle（与 Rust None 语义一致）：
@@ -266,9 +268,9 @@ export function isConnectionAllowed(
         : '该 Handle 不支持从此节点出发',
     };
   }
-  // 装配连线仅表达「授予」：扩展 → Subagent/Squad 只允许 pass（缺省出口按 pass 计）。
+  // 装配连线仅表达「授予/义务」：Subagent/Squad 入边不接受 fail 出口。
   if ((target.data.nodeType === 'subagent' || target.data.nodeType === 'squad') && handle === 'fail') {
-    return { ok: false, reason: '扩展 → 装配终点的连线只能使用 pass 出口' };
+    return { ok: false, reason: '→ 装配终点的连线不能使用 fail 出口' };
   }
   // 存储边的缺省出口同样按 source 类型归一化（trigger→out，其余→pass）再比较。
   const defaultHandle = source.data.nodeType === 'trigger' ? 'out' : 'pass';
@@ -281,12 +283,19 @@ export function isConnectionAllowed(
   return { ok: true };
 }
 
-/// 边的语义色：fail → 红；目标为 warn Action → 黄；dispatch（指挥→成员）→ 紫；pass/out → 默认。
+/// 边的语义色：fail → 红；目标为 warn Action → 黄；dispatch（指挥→成员）
+/// 与派发义务（非扩展来源→装配终点）→ 紫；pass/out → 默认。
 export function edgeTone(edge: SandboxEdge, nodes: SandboxNode[]): 'fail' | 'warn' | 'dispatch' | 'default' {
   const handle = edge.sourceHandle ?? 'out';
   if (handle === 'fail') return 'fail';
   if (handle === 'dispatch') return 'dispatch';
+  const source = nodes.find((node) => node.id === edge.source);
   const target = nodes.find((node) => node.id === edge.target);
+  if (source && target
+    && (target.data.nodeType === 'subagent' || target.data.nodeType === 'squad')
+    && source.data.nodeType !== 'extension') {
+    return 'dispatch';
+  }
   if (target?.data.nodeType === 'action') {
     return target.data.result === 'warn' ? 'warn' : 'fail';
   }
@@ -467,6 +476,32 @@ export function autoActionMessage(upstream: SandboxNode | undefined): string {
   }
 }
 
+/// 派发义务上游：沿「非扩展来源」入边回溯收集 Trigger（死链检测用；
+/// extension→终点是授权边，其上游触发器不属于义务语境）。
+const obligationTriggerAncestors = (nodes: SandboxNode[], edges: SandboxEdge[], nodeId: string): string[] => {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map<string, string[]>();
+  for (const edge of edges) {
+    if (byId.get(edge.source)?.data.nodeType === 'extension') continue;
+    const list = incoming.get(edge.target) ?? [];
+    list.push(edge.source);
+    incoming.set(edge.target, list);
+  }
+  const out: string[] = [];
+  const visited = new Set<string>();
+  const queue = [nodeId];
+  while (queue.length > 0) {
+    const id = queue.pop()!;
+    for (const parent of incoming.get(id) ?? []) {
+      if (visited.has(parent)) continue;
+      visited.add(parent);
+      if (byId.get(parent)?.data.nodeType === 'trigger') out.push(parent);
+      queue.push(parent);
+    }
+  }
+  return out;
+};
+
 const nodeName = (node: SandboxNode): string => {
   const data = node.data;
   if (data.nodeType === 'extension') return data.extension?.name || data.extension?.target || node.id;
@@ -586,6 +621,15 @@ export function validateDraft(
     }
     const check = isConnectionAllowed(nodes, edges.filter((item) => item.id !== edge.id), edge);
     if (!check.ok && check.reason !== '重复连线') errors.push(`边 ${edge.id}：${check.reason}`);
+    // 派发义务边（非扩展来源 → 装配终点）：回溯不到 Trigger = 死链，运行时永不生效。
+    const source = nodes.find((node) => node.id === edge.source);
+    const target = nodes.find((node) => node.id === edge.target);
+    if (source && target
+      && (target.data.nodeType === 'subagent' || target.data.nodeType === 'squad')
+      && source.data.nodeType !== 'extension'
+      && obligationTriggerAncestors(nodes, edges, edge.target).length === 0) {
+      warnings.push(`派发义务链（→ ${nodeName(target)}）回溯不到 Trigger：该义务不会生效`);
+    }
   }
   // 环检测（整体）
   if (hasCycle(nodes, edges)) errors.push('规则图存在环（必须是 DAG）');

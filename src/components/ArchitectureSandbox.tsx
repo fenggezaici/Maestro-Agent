@@ -334,10 +334,14 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
           <input className="prop-input" list="maestro-tool-names" value={String(data.toolName ?? '')} placeholder="read_file / mcp__server__tool"
             onChange={(e) => set({ toolName: e.target.value || undefined })} />
         </Field>
-        <Field label="要求路径（可选）">
-          <input className="prop-input" value={String(data.targetFile ?? '')} placeholder="docs/architecture.md"
+        <Field label={data.toolName === 'spawn_subagent' ? '要求类型（agent/军团名）' : '要求路径（可选）'}>
+          <input className="prop-input" value={String(data.targetFile ?? '')}
+            placeholder={data.toolName === 'spawn_subagent' ? 'explore / research-team；留空 = 任意派发' : 'docs/architecture.md'}
             onChange={(e) => set({ targetFile: e.target.value || undefined })} />
         </Field>
+        {data.toolName === 'spawn_subagent' && (
+          <p className="prop-note">匹配 spawn_subagent 的 type 参数。提示：直接把触发器/条件连线到子智能体或军团节点，即可声明「必须先派发」。</p>
+        )}
         <label className="prop-check">
           <input type="checkbox" checked={Boolean(data.updatePlan)}
             onChange={(e) => set({ updatePlan: e.target.checked || undefined })} />
@@ -526,14 +530,14 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
         <p className="prop-note">
           {insideSquad
             ? <>军团成员：用「派发」出口连向其他成员即成为指挥（至多一个）；扩展「装配」出口连入本成员 = 该成员的能力授权。{String(data.requirement ?? 'required') === 'required' ? '必选成员未派发会被逐轮追问，耗尽标注「编排违例」。' : ''}</>
-            : <>装配终点：扩展节点用「通过」出口连入本节点——spawn_subagent(type={String(data.agent ?? '') || '…'}) 派发时，
-              子循环获得这些扩展能力；必选条目强制真实调用后才能收尾，可选条目只注入建议。本节点不参与调用链求值。</>}
+            : <>装配终点：扩展节点用「通过」出口连入 = spawn_subagent(type={String(data.agent ?? '') || '…'}) 时子循环获得这些能力；
+              触发器/条件连入 = 派发义务，命中触发链时本 run 必须先真实派发该类型。</>}
         </p>
-        {upstream && upstream.length > 0 && (
+        {upstream && upstream.some((src) => src.data.nodeType === 'extension') && (
           <div className="prop-detail">
-            <p className="prop-detail-title">已绑定扩展（{upstream.length}）</p>
+            <p className="prop-detail-title">已绑定扩展（{upstream.filter((src) => src.data.nodeType === 'extension').length}）</p>
             <dl className="prop-detail-meta">
-              {upstream.map((src) => {
+              {upstream.filter((src) => src.data.nodeType === 'extension').map((src) => {
                 const srcExt = src.data.extension as ExtensionData | undefined;
                 return (
                   <div key={src.id} className="prop-detail-meta-row">
@@ -547,6 +551,24 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
             </dl>
           </div>
         )}
+        {!insideSquad && upstream && upstream.some((src) => src.data.nodeType !== 'extension') && (
+          <div className="prop-detail">
+            <p className="prop-detail-title">派发义务（{upstream.filter((src) => src.data.nodeType !== 'extension').length}）</p>
+            <dl className="prop-detail-meta">
+              {upstream.filter((src) => src.data.nodeType !== 'extension').map((src) => (
+                <div key={src.id} className="prop-detail-meta-row">
+                  <dt>{NODE_LABELS[src.data.nodeType] ?? src.data.nodeType}</dt>
+                  <dd>{nodeSummary(src)}</dd>
+                </div>
+              ))}
+            </dl>
+            <Field label="未派发拦截提示语（可选）">
+              <input className="prop-input" value={String(data.message ?? '')}
+                placeholder={`先派生子智能体 ${String(data.agent ?? '') || '…'} 完成调研，再继续当前操作`}
+                onChange={(e) => set({ message: e.target.value || undefined })} />
+            </Field>
+          </div>
+        )}
       </>}
 
       {data.nodeType === 'squad' && <>
@@ -556,13 +578,14 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
         </Field>
         <p className="prop-note">
           双击本节点进入子沙盘编排：成员（子智能体）「派发」出口连成「指挥→成员」树，扩展「装配」出口给单个成员授权。
-          有指挥 = 指挥嵌套派发成员；无指挥 = 全员并行。本节点是装配终点：主图扩展「通过」出口连入 = 全员共享授权。
+          有指挥 = 指挥嵌套派发成员；无指挥 = 全员并行。本节点是装配终点：主图扩展「通过」连入 = 全员共享授权；
+          触发器/条件连入 = 派发义务（如「提交计划前必须先派发本军团」）。
         </p>
-        {upstream && upstream.length > 0 && (
+        {upstream && upstream.some((src) => src.data.nodeType === 'extension') && (
           <div className="prop-detail">
-            <p className="prop-detail-title">军团级授权（全员生效，{upstream.length}）</p>
+            <p className="prop-detail-title">军团级授权（全员生效，{upstream.filter((src) => src.data.nodeType === 'extension').length}）</p>
             <dl className="prop-detail-meta">
-              {upstream.map((src) => {
+              {upstream.filter((src) => src.data.nodeType === 'extension').map((src) => {
                 const srcExt = src.data.extension as ExtensionData | undefined;
                 return (
                   <div key={src.id} className="prop-detail-meta-row">
@@ -574,6 +597,24 @@ const PropertyPanel = memo(function PropertyPanel({ node, known, effectiveAfter,
                 );
               })}
             </dl>
+          </div>
+        )}
+        {upstream && upstream.some((src) => src.data.nodeType !== 'extension') && (
+          <div className="prop-detail">
+            <p className="prop-detail-title">派发义务（{upstream.filter((src) => src.data.nodeType !== 'extension').length}）</p>
+            <dl className="prop-detail-meta">
+              {upstream.filter((src) => src.data.nodeType !== 'extension').map((src) => (
+                <div key={src.id} className="prop-detail-meta-row">
+                  <dt>{NODE_LABELS[src.data.nodeType] ?? src.data.nodeType}</dt>
+                  <dd>{nodeSummary(src)}</dd>
+                </div>
+              ))}
+            </dl>
+            <Field label="未派发拦截提示语（可选）">
+              <input className="prop-input" value={String(data.message ?? '')}
+                placeholder={`先派发军团 ${String(data.squad ?? '') || '…'} 完成调研，再继续当前操作`}
+                onChange={(e) => set({ message: e.target.value || undefined })} />
+            </Field>
           </div>
         )}
       </>}
