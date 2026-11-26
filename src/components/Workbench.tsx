@@ -231,7 +231,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkbenchProject | null>(null);
   const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
-  const [listTab, setListTab] = useState<ListTab>(() => restoredPanel?.listTab && ['explorer', 'changes', 'tasks', 'subagents'].includes(restoredPanel.listTab) ? restoredPanel.listTab : 'changes');
+  const [listTab, setListTab] = useState<ListTab>(() => restoredPanel?.listTab && ['explorer', 'changes', 'tasks', 'subagents', 'browser'].includes(restoredPanel.listTab) ? restoredPanel.listTab : 'changes');
   const [openTabs, setOpenTabs] = useState<ListTab[]>(['explorer', 'changes']);
   const tasksDismissed = useRef(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -791,7 +791,7 @@ const reviewPlan = useCallback((id: number) => { setSelectedPlanId(id); setListT
             </div>
           </>}
       </main>
-      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} subagents={sessionSubagents} activeSubagentId={activeSubagentId} onActiveSubagent={setActiveSubagentId} onCancelSubagent={cancelSubagent} reasoningDisplay={preferences.reasoningDisplay} light={theme === 'light'} onOpenWorkspaceFile={openWorkspaceFile} /> : null} />
+      } review={reviewOpen ? <RightPanel listTab={listTab} onListTabChange={setListTab} openTabs={openTabs} onAddTab={addTab} onCloseTab={closeTab} activeFile={activeFile} onActiveFile={setActiveFile} reviewFiles={panelReviewFiles} plans={plans} planSteps={planSteps} planRunning={planRunning} explorerView={explorerView} onExplorerViewChange={setExplorerView} scope={`${currentProject.id}:${c.selectedSessionId}`} fontSize={preferences.editorFontSize} fontFamily={preferences.editorFont} preview={preview} workspace={workspace} subagents={sessionSubagents} activeSubagentId={activeSubagentId} onActiveSubagent={setActiveSubagentId} onCancelSubagent={cancelSubagent} reasoningDisplay={preferences.reasoningDisplay} light={theme === 'light'} onOpenWorkspaceFile={openWorkspaceFile} browserStorageKey={`maestro.browser-url.${currentProject.id}`} /> : null} />
     </div>
     <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} preview={preview} preferences={preferences} onPreferences={updatePreferences} onModelsChanged={() => setSettingsVersion((value) => value + 1)} agentFocus={agentFocus} />
     <CommandCenter open={paletteOpen} onOpenChange={setPaletteOpen} source={source} projects={projects} commands={paletteCommands}

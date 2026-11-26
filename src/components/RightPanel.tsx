@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../i18n';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X } from 'lucide-react';
+import { Bot, Braces, ChevronDown, File, FileCode2, FileJson, FileText, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, ListTodo, LockKeyhole, Plus, RefreshCw, X, Globe } from 'lucide-react';
 import SplitDivider, { STORAGE_KEY } from './SplitDivider';
 import type { FileNode } from '../api/workspace';
 import { pickDirectory } from '../api/dialog';
@@ -13,13 +13,14 @@ import { mockExplorerFiles, type ExplorerFile } from './workbenchMock';
 import type { ExplorerViewState } from './ExplorerPanel';
 import { countChanges } from './MiniDiff';
 import LightweightDiffPreview from './LightweightDiffPreview';
+import BrowserPane from './BrowserPane';
 import CodeViewer from './CodeViewer';
 import TaskPlanPanel from './TaskPlanPanel';
 import SubagentTracePanel from './SubagentTracePanel';
 import type { UiPreferences } from '../uiPreferences';
 import { preloadViewer } from '../viewer/loader';
 
-export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents';
+export type ListTab = 'explorer' | 'changes' | 'tasks' | 'subagents' | 'browser';
 export interface ActiveFile { kind: 'workspace' | 'change'; path: string }
 
 interface ListNode { id: string; name: string; children: ListNode[]; leaf?: { path: string; file?: ExplorerFile } }
@@ -124,7 +125,7 @@ function ChangesList({ files, activePath, onPick }: { files: ReviewFile[]; activ
 /// toggled by a compact segmented header) + a right preview column that shows
 /// CodeViewer for workspace files, LightweightDiffPreview for changed files, and a slim
 /// approval bar while a call is suspended.
-const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily, subagents, activeSubagentId, onActiveSubagent, onCancelSubagent, reasoningDisplay, light, onOpenWorkspaceFile }: {
+const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs, onAddTab, onCloseTab, activeFile, onActiveFile, reviewFiles, plans, planSteps, planRunning, preview, workspace, explorerView, onExplorerViewChange, scope, fontSize, fontFamily, subagents, activeSubagentId, onActiveSubagent, onCancelSubagent, reasoningDisplay, light, onOpenWorkspaceFile, browserStorageKey }: {
   listTab: ListTab; onListTabChange: (tab: ListTab) => void;
   openTabs: ListTab[]; onAddTab: (tab: ListTab) => void; onCloseTab: (tab: ListTab) => void;
   activeFile: ActiveFile | null; onActiveFile: (file: ActiveFile | null) => void;
@@ -132,7 +133,7 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
   planSteps: PlanStep[]; planRunning: boolean;
   preview: boolean; workspace: WorkspaceController;
   explorerView: ExplorerViewState; onExplorerViewChange: (view: ExplorerViewState) => void;
-  scope: string; fontSize: number; fontFamily: string;
+  scope: string; fontSize: number; fontFamily: string; browserStorageKey?: string;
   subagents: SubagentView[]; activeSubagentId: string | null; onActiveSubagent: (id: string) => void;
   onCancelSubagent?: (id: string) => void; reasoningDisplay: UiPreferences['reasoningDisplay']; light: boolean;
   onOpenWorkspaceFile?: (path: string) => void;
@@ -192,6 +193,7 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
     changes: { label: '变更', icon: <GitCompareArrows size={12} /> },
     tasks: { label: '任务', icon: <ListTodo size={12} /> },
     subagents: { label: '子智能体', icon: <Bot size={12} /> },
+    browser: { label: '浏览器', icon: <Globe size={12} /> },
   };
   const noTabs = openTabs.length === 0;
   const [listWidth, setListWidth] = useState(() => { try { return Number(localStorage.getItem(STORAGE_KEY)) || 240; } catch { return 240; } });
@@ -241,7 +243,8 @@ const RightPanel = memo(function RightPanel({ listTab, onListTabChange, openTabs
             </DropdownMenu.Root>
           </div>
         </div>
-    <div ref={splitRef} className="right-split">
+    {listTab === 'browser' && openTabs.includes('browser') ? <div className="browser-host"><BrowserPane storageKey={browserStorageKey ?? 'maestro.browser-url.local'} /></div> : null}
+    <div ref={splitRef} className="right-split" style={listTab === 'browser' ? { display: 'none' } : undefined}>
       <div className="right-list-pane">
         <div className="list-body">
           {noTabs ? <div className="right-tabs-empty"><p>点击右侧 + 添加视图</p></div> : listTab === 'explorer' ? <>
