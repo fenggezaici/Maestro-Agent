@@ -574,7 +574,7 @@ export default function Workbench({ controller: c, source = 'live', projects: su
 ${item.text}\`\`\``).join('');
     // >3MiB 的图片没有 dataUrl 不会随消息发送——之前静默丢失且卡片误标已发送。
     const unsentImages = sentAttachments.filter((item) => item.type === 'image' && !item.dataUrl).length;
-    if (unsentImages) setToastError(`${unsentImages} 张图片超过 3 MiB，仅作本地预览不会发送`);
+    if (unsentImages) setToastError(`${unsentImages} 张图片无法解码或压缩后仍超 3 MiB，仅作本地预览不会发送`);
     if (images.length && !preview) {
       const vision = resolveCapability(capability.model, capability.provider).vision;
       if (!vision) { setToastError('当前模型不支持视觉输入，请先移除图片附件'); return false; }

@@ -17,7 +17,7 @@ import SessionStats, { sessionUsage } from './SessionStats';
 import ContextRing from './ContextRing';
 import SlashPanel from './SlashPanel';
 import { buildSlashGroups, skillDirective, slashQuery, type SlashAction, type SlashItem } from '../slashCommands';
-import { attachmentKind, attachmentName, IMAGE_INLINE_LIMIT, MAX_ATTACHMENTS, MAX_FILE_SIZE, TEXT_INLINE_LIMIT } from '../lib/attachments';
+import { attachmentKind, attachmentName, MAX_ATTACHMENTS, MAX_FILE_SIZE, prepareImageDataUrl, TEXT_INLINE_LIMIT } from '../lib/attachments';
 
 const AGENT_STATUS_LABEL: Record<'approval' | 'tool' | 'thinking' | 'working', string> = {
   approval: '等待批准', tool: '执行工具中', thinking: '思考中', working: '工作中',
@@ -117,9 +117,9 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
       if (!type) { rejected += 1; continue; }
       const url = URL.createObjectURL(file); attachmentUrls.current.add(url);
       const entry: LocalAttachment = { id: crypto.randomUUID(), name: attachmentName(file), type, url };
-      if (type === 'image' && file.size <= IMAGE_INLINE_LIMIT) void new Promise<string | undefined>((resolve) => {
-        const reader = new FileReader(); reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : undefined); reader.onerror = () => resolve(undefined); reader.readAsDataURL(file);
-      }).then((dataUrl) => { if (dataUrl) onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, dataUrl } : item)); });
+      // 图片统一走压缩管线：大图缩放重编码、小图原编码直通；
+      // 解码失败或压缩后仍超限则没有 dataUrl，发送时按"未发送"提示。
+      if (type === 'image') void prepareImageDataUrl(file).then((dataUrl) => { if (dataUrl) onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, dataUrl } : item)); });
       else if (type === 'text' && file.size <= TEXT_INLINE_LIMIT) void file.text().then((text) => onAttachmentsChange((current) => current.map((item) => item.id === entry.id ? { ...item, text } : item))).catch(() => undefined);
       added.push(entry);
     }

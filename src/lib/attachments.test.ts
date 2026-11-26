@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { attachmentKind, attachmentName, isAcceptedFile } from './attachments';
+import { attachmentKind, attachmentName, isAcceptedFile, scaledDimensions } from './attachments';
 
 const file = (type: string, name: string) => ({ type, name });
 
@@ -38,5 +38,18 @@ describe('attachmentName', () => {
     expect(attachmentName(file('image/png', 'image.png'), now)).toBe('pasted-090507.png');
     expect(attachmentName(file('image/jpeg', ''), now)).toBe('pasted-090507.jpeg');
     expect(attachmentName(file('', 'blob'), now)).toBe('pasted-090507.bin');
+  });
+});
+
+describe('scaledDimensions', () => {
+  it('keeps images already within the edge budget untouched', () => {
+    expect(scaledDimensions(800, 600)).toEqual([800, 600]);
+    expect(scaledDimensions(1568, 1568)).toEqual([1568, 1568]);
+  });
+
+  it('scales the longest edge down to the budget preserving aspect ratio', () => {
+    expect(scaledDimensions(3136, 1568)).toEqual([1568, 784]);
+    // 1000×3000 → scale 1568/3000: width rounds to 523, height lands exactly.
+    expect(scaledDimensions(1000, 3000)).toEqual([523, 1568]);
   });
 });
