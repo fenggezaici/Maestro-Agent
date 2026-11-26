@@ -6,6 +6,7 @@ pub mod architecture;
 pub mod credentials;
 pub mod debug;
 pub mod extensions;
+pub mod git;
 pub mod kernel;
 pub mod models;
 pub mod sessions;

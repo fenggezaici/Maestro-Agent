@@ -6,6 +6,7 @@ pub mod credentials;
 pub mod db;
 pub mod exec;
 pub mod fs;
+pub mod git;
 pub mod llm;
 pub mod mcp;
 pub mod plugins;
