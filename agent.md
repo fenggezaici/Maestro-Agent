@@ -28,5 +28,5 @@
 - Tauri 前端内嵌：`frontendDist: "../dist"` 在编译期打进 `maestro.exe`——改了 `src/` 前端后必须 `pnpm build` 再 `cargo build`，否则 exe 里是旧 UI。
 - 开发热更：`corepack pnpm tauri dev`（自动起 vite dev server，前端改动即时生效、无需重编 Rust）。
 - 冒烟验证：`corepack pnpm build` + `cargo build`（src-tauri）→ `target/debug/maestro.exe`。
-- **推送远端前门禁：`corepack pnpm ci`**（`scripts/ci.mjs`，与 CI 同构：前端测试 + build + `cargo clippy --all-targets -D warnings` + `cargo test --workspace`）。只跑 `cargo test`/`check` 会漏 clippy——CI 的 Rust lint 步曾因此连挂多提交。
+- **推送远端前门禁：`corepack pnpm verify`**（`scripts/ci.mjs`，与 CI 同构：前端测试 + build + `cargo clippy --all-targets -D warnings` + `cargo test --workspace` + preview e2e）。⚠️ `pnpm ci` 不是门禁——它命中 pnpm 内置的清理安装命令（只装依赖不跑测试），真正的门禁脚本名是 `verify`。只跑 `cargo test`/`check` 会漏 clippy——CI 的 Rust lint 步曾因此连挂多提交。
 - 工具链由 `rust-toolchain.toml` 钉在 1.97 minor：升 minor 时改 channel 并顺手清新 clippy lint。
