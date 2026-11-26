@@ -768,13 +768,14 @@ impl ToolRouter {
         });
         tools.push(ToolSpec {
             name: "grep_files".into(),
-            description: "在工作区文件内做文本行搜索（只读，字面子串匹配）。query 为查找内容；glob 可选限定文件集（如 src/**/*.rs）；ignore_case 为 true 时忽略大小写。".into(),
+            description: "在工作区文件内做正则行搜索（只读，Rust regex 语法；含特殊字符时按正则解释，纯文本亦然）。query 为查找模式；glob 可选限定文件集（如 src/**/*.rs）；ignore_case 为 true 时忽略大小写；context 可选 0–5，输出每个匹配前后各 N 行（匹配行 path:行号:，上下文行 path-行号-）。正则不合法会报错，请修正后重试。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string" },
                     "glob": { "type": "string" },
-                    "ignore_case": { "type": "boolean" }
+                    "ignore_case": { "type": "boolean" },
+                    "context": { "type": "integer", "description": "匹配行前后各输出的行数，0–5" }
                 },
                 "required": ["query"]
             }),
@@ -1301,7 +1302,8 @@ impl ToolRouter {
                 let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
                 let glob = arguments.get("glob").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 let ignore_case = arguments.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
-                (fs::grep_files(root, arg("query", tool)?, glob, ignore_case)?, None)
+                let context = arguments.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                (fs::grep_files(root, arg("query", tool)?, glob, ignore_case, context)?, None)
             }
             "update_plan" => {
                 let steps = plan_steps(&arguments)?;
@@ -1541,6 +1543,48 @@ impl ToolRouter {
                     }
                 }
             }
+        }
+        // 派发义务段：subagent/squad 节点的非扩展入边（trigger out / 条件 pass）
+        // 声明「连线即义务」——命中触发链时本 run 必须先真实派发该类型。
+        for node in &graph.nodes {
+            let kind = crate::domain::NodeKind::parse(&node.node_type);
+            if !matches!(
+                kind,
+                Some(crate::domain::NodeKind::Subagent | crate::domain::NodeKind::Squad)
+            ) {
+                continue;
+            }
+            let obliged = graph.edges.iter().any(|edge| {
+                edge.target == node.id
+                    && graph.nodes.iter().any(|source| {
+                        source.id == edge.source
+                            && crate::domain::NodeKind::parse(&source.node_type)
+                                != Some(crate::domain::NodeKind::Extension)
+                    })
+            });
+            if !obliged {
+                continue;
+            }
+            let (name, label) = match kind {
+                Some(crate::domain::NodeKind::Squad) => {
+                    (node.data.squad.as_deref(), "军团")
+                }
+                _ => (node.data.agent.as_deref(), "子智能体"),
+            };
+            let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let ctx = crate::domain::obligation_trigger_ancestors(&graph, &node.id)
+                .into_iter()
+                .map(|data| describe_trigger(&data))
+                .collect::<Vec<_>>()
+                .join(" 或 ");
+            if ctx.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "- 派发义务：{ctx}前，本对话必须已真实 spawn_subagent(type={name}) 派发{label}，否则调用会被拦截。"
+            ));
         }
         if required_extensions(&graph).is_empty() {
             lines.push("- 图中包含前置要求（Requirement）与禁止内容（Restriction）约束：命中触发器时按连线顺序校验。".into());

@@ -227,26 +227,39 @@ pub fn glob_files(root: &Path, pattern: &str) -> AppResult<String> {
     Ok(body)
 }
 
-/// `grep_files` tool body: literal substring line search across text files.
-/// `glob` narrows the file set (`src/**/*.rs`); `ignore_case` folds case.
-/// Results are `path:行号: 行内容`, bounded at MAX_SEARCH_RESULTS.
+/// `grep_files` tool body: regex line search across text files. `glob` narrows
+/// the file set (`src/**/*.rs`); `ignore_case` folds case; `context_lines`
+/// (clamped to 0–5) prints that many surrounding lines around every match.
+/// Output follows grep conventions — `path:行号: 内容` for matches,
+/// `path-行号- 内容` for context, `--` between non-contiguous blocks — and
+/// stays bounded at MAX_SEARCH_RESULTS matched lines / MAX_TEXT_CHARS output.
+/// An invalid pattern is an error reported back to the model (it can fix and
+/// retry), never a silent fallback to literal matching.
 pub fn grep_files(
     root: &Path,
     query: &str,
     glob: Option<&str>,
     ignore_case: bool,
+    context_lines: u32,
 ) -> AppResult<String> {
     if query.is_empty() {
         return Err("grep_files 需要非空 query".into());
     }
+    let pattern = regex::RegexBuilder::new(query)
+        .case_insensitive(ignore_case)
+        .build()
+        .map_err(|error| format!("正则表达式无效：{error}"))?;
+    let context = context_lines.min(5) as usize;
     let base = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
-    let needle = if ignore_case { query.to_lowercase() } else { query.to_string() };
     let mut files = Vec::new();
     walk_files(&base, &mut files);
-    let mut matches_out = Vec::new();
+    let mut body = String::new();
+    let mut matched = 0usize;
+    let mut truncated = false;
+    let mut wrote_block = false;
     'files: for rel in files {
-        if let Some(pattern) = glob {
-            if !glob_match(&pattern.replace('\\', "/"), &rel) {
+        if let Some(glob_pattern) = glob {
+            if !glob_match(&glob_pattern.replace('\\', "/"), &rel) {
                 continue;
             }
         }
@@ -260,23 +273,70 @@ pub fn grep_files(
             continue; // binary file
         }
         let Ok(text) = String::from_utf8(bytes) else { continue };
-        for (index, line) in text.lines().enumerate() {
-            let hay = if ignore_case { line.to_lowercase() } else { line.to_string() };
-            if hay.contains(&needle) {
+        let lines: Vec<&str> = text.lines().collect();
+        let remaining = MAX_SEARCH_RESULTS.saturating_sub(matched);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        // Take one past the remaining budget so truncation is detected in the
+        // same single pass instead of rescanning the file.
+        let mut hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| pattern.is_match(line).then_some(index))
+            .take(remaining + 1)
+            .collect();
+        if hits.len() > remaining {
+            truncated = true;
+            hits.truncate(remaining);
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        let hitset: std::collections::HashSet<usize> = hits.iter().copied().collect();
+        // Merge context-expanded ranges into contiguous blocks: a hit at line
+        // `i` covers [i-context, i+context]; overlapping or touching ranges
+        // form one block, `--` separates the rest (grep -C semantics).
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        for &hit in &hits {
+            let start = hit.saturating_sub(context);
+            let end = (hit + context + 1).min(lines.len());
+            match blocks.last_mut() {
+                Some((_, bend)) if start <= *bend => *bend = end.max(*bend),
+                _ => blocks.push((start, end)),
+            }
+        }
+        for (start, end) in blocks {
+            if wrote_block {
+                body.push_str("--\n");
+            }
+            wrote_block = true;
+            for (offset, line) in lines[start..end].iter().enumerate() {
+                let index = start + offset;
                 let trimmed: String = line.trim().chars().take(200).collect();
-                matches_out.push(format!("{}:{}: {}", rel, index + 1, trimmed));
-                if matches_out.len() >= MAX_SEARCH_RESULTS {
+                let lineno = index + 1;
+                if hitset.contains(&index) {
+                    body.push_str(&format!("{rel}:{lineno}: {trimmed}\n"));
+                } else {
+                    body.push_str(&format!("{rel}-{lineno}- {trimmed}\n"));
+                }
+                if body.len() >= MAX_TEXT_CHARS {
+                    truncated = true;
                     break 'files;
                 }
             }
         }
+        matched += hits.len();
     }
-    if matches_out.is_empty() {
+    if matched == 0 {
         return Ok("（无匹配行）".into());
     }
-    let mut body = matches_out.join("\n");
-    if matches_out.len() >= MAX_SEARCH_RESULTS {
-        body.push_str(&format!("\n…已截断，仅显示前 {MAX_SEARCH_RESULTS} 条匹配"));
+    while body.ends_with('\n') {
+        body.pop();
+    }
+    if truncated {
+        body.push_str(&format!("\n…已截断，仅显示前 {MAX_SEARCH_RESULTS} 条匹配及其上下文"));
     }
     Ok(body)
 }
@@ -602,5 +662,74 @@ mod tests {
         assert!(out.contains("offset"), "{out}");
         // read_file_full 返回完整内容。
         assert_eq!(read_file_full(root, "big.txt").unwrap().len(), 100_000);
+    }
+
+    #[test]
+    fn grep_files_supports_regex_alternation_and_classes() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn read_file() {}\nlet x = 1;\nfn write_file() {}\nlet y = 2;\nfn other() {}\n",
+        )
+        .unwrap();
+        let out = grep_files(root, "fn (read|write)_file", None, false, 0).unwrap();
+        assert!(out.contains("a.rs:1: fn read_file() {}"), "{out}");
+        assert!(out.contains("a.rs:3: fn write_file() {}"), "{out}");
+        assert!(!out.contains("other"), "{out}");
+        // `.` 是正则元字符：a.c 同时命中 abc 与字面 a.c。
+        std::fs::write(root.join("b.txt"), "abc\na.c\n").unwrap();
+        let out = grep_files(root, "a.c", None, false, 0).unwrap();
+        assert!(out.contains("b.txt:1: abc"), "{out}");
+        assert!(out.contains("b.txt:2: a.c"), "{out}");
+    }
+
+    #[test]
+    fn grep_files_invalid_regex_is_an_error_not_a_literal_fallback() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        std::fs::write(root.join("a.txt"), "anything\n").unwrap();
+        let error = grep_files(root, "(", None, false, 0).unwrap_err();
+        assert!(error.contains("正则表达式无效"), "{error}");
+    }
+
+    #[test]
+    fn grep_files_ignore_case_and_glob_filter() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        std::fs::write(root.join("a.rs"), "fn read_file() {}\n").unwrap();
+        std::fs::write(root.join("b.txt"), "read_file mentioned\n").unwrap();
+        let out = grep_files(root, "READ_FILE", None, true, 0).unwrap();
+        assert!(out.contains("a.rs:1:"), "{out}");
+        let only_txt = grep_files(root, "read_file", Some("*.txt"), false, 0).unwrap();
+        assert!(only_txt.contains("b.txt:1:"), "{only_txt}");
+        assert!(!only_txt.contains("a.rs"), "{only_txt}");
+        let no_hit = grep_files(root, "read_file", Some("*.md"), false, 0).unwrap();
+        assert_eq!(no_hit, "（无匹配行）");
+    }
+
+    #[test]
+    fn grep_files_context_lines_merge_overlapping_blocks() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path();
+        // 命中第 1、3 行，context=1 的扩展区间 [1-2] 与 [2-4] 相触合并为单块，
+        // 中间不出现 `--` 分隔；与第二个远处命中之间才有分隔。
+        std::fs::write(
+            root.join("a.txt"),
+            "hit-one\nctx\nhit-two\nctx\nfar\nfar\nfar\nhit-three\n",
+        )
+        .unwrap();
+        let out = grep_files(root, "^hit-", None, false, 1).unwrap();
+        assert!(out.contains("a.txt:1: hit-one"), "{out}");
+        assert!(out.contains("a.txt-2- ctx"), "{out}");
+        assert!(out.contains("a.txt:3: hit-two"), "{out}");
+        assert!(out.contains("a.txt:8: hit-three"), "{out}");
+        assert!(out.contains("--\n"), "{out}");
+        // context=0 时无上下文行也无分隔。
+        let plain = grep_files(root, "^hit-", None, false, 0).unwrap();
+        assert!(!plain.contains("-2-"), "{plain}");
+        // context 超过 5 被钳制。
+        let clamped = grep_files(root, "^hit-one", None, false, 99).unwrap();
+        assert!(clamped.lines().count() <= 8, "{clamped}");
     }
 }
