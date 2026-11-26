@@ -744,3 +744,10 @@
 .browser-address:focus { border-color: var(--color-primary); }
 .browser-error { margin: 4px 8px 0; font-size: 11px; color: var(--color-destructive); flex-shrink: 0; }
 .browser-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: #fff; }
+
+/* 搜索 key 配置区 */
+.search-keys-form { margin-top: var(--space-5, 20px); border-top: 1px solid var(--color-border); padding-top: var(--space-4, 14px); }
+.search-key-row .search-key-controls { display: flex; align-items: center; gap: 6px; }
+.search-key-row .secret-input { display: flex; align-items: center; gap: 2px; }
+.search-key-row input { width: 180px; }
+.credential-stored-tag { margin-left: 6px; font-size: 10px; color: var(--color-primary); border: 1px solid var(--color-primary); border-radius: 4px; padding: 0 4px; }

@@ -5,7 +5,7 @@ import type { ExplorerFile } from '../components/workbenchMock';
 import { LLM_SETTINGS_KEY } from '../settings';
 
 const ipc = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
-vi.mock('@tauri-apps/api/core', () => ({ invoke: ipc.invoke }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: ipc.invoke, isTauri: () => false }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: ipc.listen }));
 vi.mock('../components/CodeViewer', () => ({ default: ({ file }: { file: ExplorerFile }) => <section aria-label={`文件预览 ${file.path}`}>{file.content}</section> }));
 

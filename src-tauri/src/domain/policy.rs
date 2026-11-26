@@ -32,7 +32,7 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
         | "update_plan" | "spawn_subagent" | "ask_user" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
-        "web_fetch" => ToolEffect::NetworkEgress,
+        "web_fetch" | "web_search" => ToolEffect::NetworkEgress,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
         _ => return Err(format!("Unknown or unregistered tool: {tool}")),
     })

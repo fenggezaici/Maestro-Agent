@@ -134,6 +134,7 @@ struct ArchitectureState {
 
 pub struct ToolRouter {
     extensions: ExtensionManager,
+    credentials: crate::adapters::credentials::CredentialStore,
     workspace: Mutex<Option<PathBuf>>,
     database: Arc<Database>,
     architecture: Mutex<ArchitectureState>,
@@ -159,7 +160,8 @@ fn file_stamp(path: &Path) -> FileStamp {
 impl ToolRouter {
     pub fn new(maestro_dir: PathBuf, database: Arc<Database>) -> AppResult<Self> {
         Ok(Self {
-            extensions: ExtensionManager::new(maestro_dir)?,
+            extensions: ExtensionManager::new(maestro_dir.clone())?,
+            credentials: crate::adapters::credentials::CredentialStore::open(&maestro_dir.join("credentials"))?,
             workspace: Mutex::new(None),
             database,
             architecture: Mutex::new(ArchitectureState::default()),
@@ -793,6 +795,18 @@ impl ToolRouter {
             }),
         });
         tools.push(ToolSpec {
+            name: "web_search".into(),
+            description: "联网搜索（网络出口，不可逆；需在设置中配置 Tavily/Brave API key）。query 为搜索词；max_results 可选 1–10，默认 5。返回编号结果列表（标题/URL/摘要），以不可信边界包裹；可用 web_fetch 抓取感兴趣结果的完整页面。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "搜索词" },
+                    "max_results": { "type": "integer", "description": "结果条数 1–10，默认 5" }
+                },
+                "required": ["query"]
+            }),
+        });
+        tools.push(ToolSpec {
             name: "write_file".into(),
             description: "在工作区内创建或覆盖一个文本文件（有副作用；调用会挂起等待用户批准后才真实写入）。path 为相对路径。".into(),
             parameters: json!({
@@ -1008,6 +1022,7 @@ impl ToolRouter {
             "grep_files" => arg("query").unwrap_or("").to_string(),
             "task_output" | "task_stop" => arg("task_id").unwrap_or("").to_string(),
             "run_command" => arg("command").unwrap_or("").to_string(),
+            "web_search" => arg("query").unwrap_or("").to_string(),
             "web_fetch" => reqwest::Url::parse(arg("url").unwrap_or(""))
                 .map(|url| url.origin().ascii_serialization())
                 .unwrap_or_else(|_| arg("url").unwrap_or("").to_string()),
@@ -1267,6 +1282,13 @@ impl ToolRouter {
                     };
                     (text, None)
                 }
+            }
+            "web_search" => {
+                let query = arg("query", tool)?;
+                let max_results = arguments.get("max_results").and_then(|v| v.as_u64()).map(|v| v as usize);
+                let (engine, key) = crate::adapters::search::resolve_engine(&self.credentials)?;
+                let hits = crate::adapters::search::search(engine, &key, query, max_results).await?;
+                (crate::adapters::search::format_hits(query, &hits), None)
             }
             "web_fetch" => {
                 let url = arg("url", tool)?;

@@ -4,6 +4,7 @@ import * as Slider from '@radix-ui/react-slider';
 import { Bot, BrainCircuit, Globe2, Keyboard, Palette, Pencil, Plus, RotateCcw, Search, Settings2, Trash2, X } from 'lucide-react';
 import AgentsSettings, { type AgentFocus } from './AgentsSettings';
 import LlmSettingsForm from './LlmSettingsForm';
+import SearchKeysForm from './SearchKeysForm';
 import ConfirmDialog from './ConfirmDialog';
 import { Button, Choice } from './ui';
 import { bindShortcut, defaultShortcuts, formatShortcut, labels, shortcutChord, shortcutLabels, type ShortcutAction, type UiPreferences } from '../uiPreferences';
@@ -106,6 +107,7 @@ export default function SettingsPanel({ open, onOpenChange, preview, preferences
               <LlmSettingsForm provider={modelProvider} preview={preview} onSaved={() => { setCredentialsTick((tick) => tick + 1); onModelsChanged(); onOpenChange(false); }} onChanged={() => { setCredentialsTick((tick) => tick + 1); onModelsChanged(); }} />
             </div>
           </div>
+          <SearchKeysForm preview={preview} />
         </div>
         <div hidden={section !== 'agents'}><AgentsSettings preview={preview} focus={agentFocus} /></div>
         <div hidden={section !== 'shortcuts'}>
