@@ -5,6 +5,9 @@ pub enum ToolEffect {
     ReadOnly,
     WorkspaceWrite,
     ProcessExecution,
+    /// 网络出口不可逆（内容离机即不可撤回），与本地只读不等价——
+    /// Plan 物理剥离，Code/Confirm 走审批，Auto 放行。
+    NetworkEgress,
 }
 
 /// What the kernel must do with a tool call under the run's mode.
@@ -29,6 +32,7 @@ pub fn classify(tool: &str) -> AppResult<ToolEffect> {
         | "update_plan" | "spawn_subagent" | "ask_user" => ToolEffect::ReadOnly,
         "apply_patch" | "write_file" => ToolEffect::WorkspaceWrite,
         "run_command" => ToolEffect::ProcessExecution,
+        "web_fetch" => ToolEffect::NetworkEgress,
         _ if tool.starts_with("mcp__") => ToolEffect::ProcessExecution,
         _ => return Err(format!("Unknown or unregistered tool: {tool}")),
     })
@@ -49,7 +53,7 @@ pub fn gate(mode: Mode, effect: ToolEffect) -> ToolGate {
         },
         Mode::Code => match effect {
             ToolEffect::ReadOnly | ToolEffect::WorkspaceWrite => ToolGate::Allow,
-            ToolEffect::ProcessExecution => ToolGate::RequireApproval,
+            ToolEffect::ProcessExecution | ToolEffect::NetworkEgress => ToolGate::RequireApproval,
         },
         Mode::Confirm => ToolGate::RequireApproval,
         Mode::Auto | Mode::Execute => ToolGate::Allow,
@@ -107,6 +111,19 @@ pub fn authorize(mode: Mode, tool: &str) -> AppResult<ToolEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_fetch_is_network_egress_with_per_mode_gating() {
+        assert_eq!(classify("web_fetch").unwrap(), ToolEffect::NetworkEgress);
+        // Plan 物理剥离、Code/Confirm 审批、Auto 放行——网络出口不可逆，不放只读档。
+        assert_eq!(gate(Mode::Plan, ToolEffect::NetworkEgress), ToolGate::Deny);
+        assert_eq!(gate(Mode::Code, ToolEffect::NetworkEgress), ToolGate::RequireApproval);
+        assert_eq!(gate(Mode::Confirm, ToolEffect::NetworkEgress), ToolGate::RequireApproval);
+        assert_eq!(gate(Mode::Auto, ToolEffect::NetworkEgress), ToolGate::Allow);
+        assert!(!spec_visible(Mode::Plan, "web_fetch", ToolEffect::NetworkEgress));
+        assert!(spec_visible(Mode::Code, "web_fetch", ToolEffect::NetworkEgress));
+        assert!(authorize(Mode::Plan, "web_fetch").is_err());
+    }
 
     #[test]
     fn plan_mode_denies_side_effects_and_allows_read_only_work() {
