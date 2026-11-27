@@ -16,6 +16,7 @@ import {
   conversationRuns, errorMessage, initialSnapshot, kernelReducer, type KernelAction, type TimelineItem,
 } from '../lib/conversation';
 import { hasProviderCredential, readLlmSettings, validateLlmSettings } from '../settings';
+import { clearWorkspaceFileCache } from './useWorkspaceStore';
 
 export interface KernelStore {
   state: Snapshot;
@@ -317,6 +318,8 @@ export const useKernelStore = create<KernelStore>()((set, get) => {
         });
       }
       if (event.type === 'workspace_changed') {
+        // agent 写入后缓存即过期——否则运行中点击刚写过的文件读到旧内容。
+        clearWorkspaceFileCache();
         set((s) => ({ workspaceTick: s.workspaceTick + 1 }));
       }
       if (event.type === 'extensions_changed') {
