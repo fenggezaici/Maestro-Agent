@@ -20,11 +20,12 @@ export function useStickyScroll<T extends HTMLElement>(
 
   const pin = () => {
     const element = ref.current;
-    if (!element) return;
-    element.scrollTop = following.current ? element.scrollHeight : lastTop.current;
-    // Record the clamped position immediately: scroll events are async, and an
-    // upward wheel tick must be detected before the next render.
-    if (following.current) lastTop.current = element.scrollTop;
+    if (!element || !following.current) return;
+    // 不跟随时完全放手：React 重渲不会重置 scrollTop，内容上方位移由浏览器
+    // 原生 scroll anchoring 补偿——手动 restore 是滚动吞没竞态的温床（它写出的
+    // 位置会被迟到的 scroll 事件误读为用户意图）。
+    element.scrollTop = element.scrollHeight;
+    lastTop.current = element.scrollTop;
   };
 
   useLayoutEffect(() => {
@@ -47,6 +48,57 @@ export function useStickyScroll<T extends HTMLElement>(
     });
     observer.observe(content);
     return () => observer.disconnect();
+  });
+
+  // 输入层意图捕获：wheel/touch/key 输入事件同步派发——先于浏览器滚动与异步
+  // scroll 事件脱离跟随，流式渲染的 pin 因此永远抢不过用户滚动（wheel 是离散
+  // 输入，被吞后没有后续事件自愈；滚动条拖拽是连续输入，scroll 事件兜底）。
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    // 嵌套可滚动块（代码块/工具输出）会消费这次滚轮——容器位置并未改变，
+    // 不算用户离开底部。
+    const consumedByNested = (event: Event) => {
+      let node = event.target as HTMLElement | null;
+      while (node && node !== element) {
+        if (/(auto|scroll)/.test(window.getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight && node.scrollTop > 0) {
+          return true;
+        }
+        node = node.parentElement;
+      }
+      return false;
+    };
+    const unfollow = () => {
+      following.current = false;
+      onNearBottom?.(false);
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0 && element.scrollTop > 0 && !consumedByNested(event)) unfollow();
+    };
+    let touchY: number | null = null;
+    const onTouchStart = (event: TouchEvent) => {
+      touchY = event.touches[0]?.clientY ?? null;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      // 手指下滑 = 内容向顶部方向回卷。
+      const y = event.touches[0]?.clientY;
+      if (touchY != null && y != null && y > touchY + 2 && element.scrollTop > 0) unfollow();
+    };
+    const onKeydown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, [contenteditable]')) return;
+      if (event.key === 'PageUp' || event.key === 'ArrowUp' || event.key === 'Home') unfollow();
+    };
+    element.addEventListener('wheel', onWheel, { passive: true });
+    element.addEventListener('touchstart', onTouchStart, { passive: true });
+    element.addEventListener('touchmove', onTouchMove, { passive: true });
+    element.addEventListener('keydown', onKeydown);
+    return () => {
+      element.removeEventListener('wheel', onWheel);
+      element.removeEventListener('touchstart', onTouchStart);
+      element.removeEventListener('touchmove', onTouchMove);
+      element.removeEventListener('keydown', onKeydown);
+    };
   });
 
   const onScroll = () => {
