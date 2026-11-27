@@ -98,7 +98,7 @@ export default function AgentsSettings({ preview, focus }: { preview: boolean; f
       <label>默认模型（留空跟随会话）<input value={defaults.model ?? ''} onChange={(event) => patchDefaults({ model: event.target.value.trim() || null })} placeholder="跟随会话模型" /></label>
       <label>默认轮次上限（LLM 对话轮）<input type="number" min={1} max={128} value={defaults.steps ?? ''} placeholder="8" onChange={(event) => patchDefaults({ steps: numberOrNull(event.target.value) })} /></label>
       <label>默认工具预算（工具调用总次数）<input type="number" min={1} max={1000} value={defaults.toolBudget ?? ''} placeholder="100" onChange={(event) => patchDefaults({ toolBudget: numberOrNull(event.target.value, 1, 1000) })} /></label>
-      <label>每轮并行上限<input type="number" min={1} max={4} value={defaults.maxParallel ?? ''} placeholder="2" onChange={(event) => patchDefaults({ maxParallel: numberOrNull(event.target.value, 1, 4) })} /></label>
+      <label>每轮并行上限<input type="number" min={1} max={8} value={defaults.maxParallel ?? ''} placeholder="4" onChange={(event) => patchDefaults({ maxParallel: numberOrNull(event.target.value, 1, 8) })} /></label>
       <label>单 run 总额度<input type="number" min={1} max={16} value={defaults.maxTotal ?? ''} placeholder="8" onChange={(event) => patchDefaults({ maxTotal: numberOrNull(event.target.value, 1, 16) })} /></label>
       <p className="agent-editor-note agent-editor-wide">留空回退内置默认；每个子智能体的字段留空则继承这里的全局默认（模型最终回退到会话模型）。一轮对话可包含多个并行工具调用——通常轮次先耗尽；耗尽前最后一轮会禁用工具、强制输出纯文本收尾结论，不会静默返回空报告。</p>
       <div className="agent-editor-actions">{defaultsNote && <span className="agent-editor-note">{defaultsNote}</span>}<button type="button" className="button-approve" onClick={saveDefaults}>保存全局默认</button></div>

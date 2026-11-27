@@ -4956,4 +4956,43 @@ mod tests {
         assert!(summary.contains("工具预算（100 次）"), "预算截断标注应透传父模型：{summary}");
         kernel.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn subagent_compacts_midflight_when_context_fills() {
+        let (kernel, _) = test_kernel().await;
+        let provider = Arc::new(SynthProbeProvider {
+            seen: StdMutex::new(Vec::new()),
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            fanout: 1,
+        });
+        let probe = provider.clone();
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        // 极小上下文窗口：几轮累积即越线——压缩必须中途接管而非让子智能体
+        // 死于溢出。压缩记录落库是最硬的可观测断言面。
+        let mut config = test_config();
+        config.context_window = Some(400);
+        let (run_id, rx) = seed_run(&kernel).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        let summary = crate::services::agent_loop::run_subagent(
+            kernel.clone(),
+            &config,
+            session_id,
+            run_id,
+            "sub-compact".into(),
+            r#"{"description":"压缩测试","prompt":"调研仓库结构","subagent_type":"explore"}"#,
+            rx,
+            Arc::new(std::sync::atomic::AtomicUsize::new(4)),
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let compactions = kernel.database.list_compactions(session_id).await.unwrap();
+        assert!(
+            compactions.iter().any(|c| c.status == "completed"),
+            "子智能体循环必须接线压缩并落库：{compactions:?}"
+        );
+        assert!(summary.contains("最终综合结论"), "压缩后续跑仍应收尾：{summary}");
+        kernel.shutdown().await.unwrap();
+    }
 }

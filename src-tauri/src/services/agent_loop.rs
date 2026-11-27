@@ -804,14 +804,16 @@ fn child_session_id(parent: Option<&str>, subagent_id: &str) -> String {
 
 /// 每轮并行上限：~/.maestro/agents.json > env MAESTRO_MAX_SUBAGENTS > 2（范围 1-4）。
 fn resolve_max_parallel(defaults: &crate::domain::SubagentDefaults) -> usize {
+    // 上限 8 是 provider 限速现实下的诚实天花板（ZCode 完全不设限——
+    //  GLM/deepseek 网关并发流超限会被踢回，过大扇出是自欺）。
     if let Some(value) = defaults.max_parallel {
-        return (value as usize).clamp(1, 4);
+        return (value as usize).clamp(1, 8);
     }
     std::env::var("MAESTRO_MAX_SUBAGENTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=4).contains(value))
-        .unwrap_or(2)
+        .filter(|value| (1..=8).contains(value))
+        .unwrap_or(4)
 }
 
 /// Run 级子智能体总额度（含军团成员/孙级），防扇出：
@@ -1291,6 +1293,11 @@ pub(crate) async fn run_subagent(
         // 停滞检测：与父循环同口径——同名同参连续调用软警告→拦截→
         // 硬终止，防止子智能体在小预算内反复相同调用空转。
         let mut doom = DoomGuard::default();
+        // 压缩失败熔断计数（与主循环同一 COMPACTION_FAILURE_BREAKER 语义）。
+        let mut compaction_failures = 0u32;
+        // context-error 压缩重试只一次：压缩后仍溢出说明窗口真的容不下，
+        // 再重试是烧钱循环。
+        let mut context_retried = false;
         let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
         // 收尾轮哨兵：最后一轮或预算耗尽时触发一次无工具纯文本轮——
         // 模型必须综合已收集证据输出结论，而不是直接返回旁白碎片。
@@ -1307,6 +1314,34 @@ pub(crate) async fn run_subagent(
             }
             if synthesis_done {
                 break;
+            }
+            // 上下文管理（主循环同款三段式）：廉价裁剪每轮跑，逼近窗口时
+            // 付费压缩续命——上下文永不应成为子智能体的沉默死因。压缩记录
+            // 进 run 级历史，会话侧可观测。
+            microcompact(&mut messages);
+            if needs_compaction(&messages, child_config.context_window, last_input_tokens, child_config.max_output) {
+                match compact_messages(
+                    &kernel,
+                    &provider,
+                    &child_config,
+                    &messages,
+                    &mut CompactionCtx {
+                        run_id,
+                        session_id,
+                        trigger: "auto",
+                        cancel: &mut cancel,
+                        failures: &mut compaction_failures,
+                    },
+                )
+                .await
+                {
+                    Ok(compacted) => messages = compacted,
+                    Err(error) => {
+                        kernel
+                            .audit_turn_anomaly(run_id, format!("subagent={subagent_id} compaction_error={error}"))
+                            .await;
+                    }
+                }
             }
             let budget_out = tool_count >= tool_budget;
             let synthesis_round = budget_out || iteration + 1 >= steps;
@@ -1360,6 +1395,27 @@ pub(crate) async fn run_subagent(
                         if retryable {
                             attempt += 1;
                             tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        if is_context_error(&error) && !context_retried {
+                            context_retried = true;
+                            if let Ok(compacted) = compact_messages(
+                                &kernel,
+                                &provider,
+                                &child_config,
+                                &messages,
+                                &mut CompactionCtx {
+                                    run_id,
+                                    session_id,
+                                    trigger: "auto",
+                                    cancel: &mut cancel,
+                                    failures: &mut compaction_failures,
+                                },
+                            )
+                            .await
+                            {
+                                messages = compacted;
+                            }
                             continue;
                         }
                         if !partial.trim().is_empty() {
@@ -1745,7 +1801,8 @@ pub(crate) async fn run(
                     &config,
                     &messages,
                     &mut CompactionCtx {
-                        run: &run,
+                        run_id: run.id,
+                        session_id: run.session_id,
                         trigger: "auto",
                         cancel: &mut cancel,
                         failures: &mut compaction_failures,
@@ -1779,7 +1836,8 @@ pub(crate) async fn run(
                         &config,
                         &messages,
                         &mut CompactionCtx {
-                            run: &run,
+                            run_id: run.id,
+                            session_id: run.session_id,
                             trigger: "auto",
                             cancel: &mut cancel,
                             failures: &mut compaction_failures,
@@ -2222,7 +2280,8 @@ async fn summarize_with_model(
 /// Compaction call context: the owning run, the audit trigger label, the
 /// cancel channel and the consecutive-failure breaker counter.
 struct CompactionCtx<'a> {
-    run: &'a RunView,
+    run_id: i64,
+    session_id: i64,
     trigger: &'a str,
     cancel: &'a mut watch::Receiver<bool>,
     failures: &'a mut u32,
@@ -2253,11 +2312,11 @@ async fn compact_messages(
         .map(|message| format!("{}: {}", message.role, message.content.chars().take(1000).collect::<String>()))
         .collect::<Vec<_>>()
         .join("\n");
-    let operation_id = format!("compact-{}-{}", ctx.run.id, crate::domain::unix_now());
+    let operation_id = format!("compact-{}-{}", ctx.run_id, crate::domain::unix_now());
     let running = ContextCompaction {
         operation_id: operation_id.clone(),
-        session_id: ctx.run.session_id,
-        through_run_id: ctx.run.id - 1,
+        session_id: ctx.session_id,
+        through_run_id: ctx.run_id - 1,
         summary: String::new(),
         trigger: ctx.trigger.into(),
         status: "running".into(),
@@ -2627,11 +2686,11 @@ mod tests {
         assert_eq!(resolve_max_total(&defaults), 9);
         // 全局默认也未设置时回退内置；env 仅作未设置项的兜底。
         let empty = crate::domain::SubagentDefaults::default();
-        assert_eq!(resolve_max_parallel(&empty), 2);
+        assert_eq!(resolve_max_parallel(&empty), 4);
         assert_eq!(resolve_max_total(&empty), 8);
         // 文件值超界时 clamp，而不是透传。
         let wild = crate::domain::SubagentDefaults { max_parallel: Some(99), max_total: Some(0), ..Default::default() };
-        assert_eq!(resolve_max_parallel(&wild), 4);
+        assert_eq!(resolve_max_parallel(&wild), 8);
         assert_eq!(resolve_max_total(&wild), 1);
     }
 }
