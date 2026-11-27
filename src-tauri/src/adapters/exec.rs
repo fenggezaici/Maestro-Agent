@@ -10,7 +10,7 @@ use std::{
 
 use tokio::{
     io::AsyncReadExt,
-    process::Command,
+    process::{Child, Command},
     sync::watch,
     task::JoinHandle,
 };
@@ -82,8 +82,13 @@ pub async fn run_program(
     let cwd = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
     let mut process = Command::new(program);
     process.args(args);
-    // git would otherwise spawn a pager and refresh the index; both would make
-    // a "read-only" command write or block.
+    apply_git_env(&mut process, program);
+    spawn_and_collect(process, &cwd, timeout, cancel, "无法启动命令").await
+}
+
+/// git would otherwise spawn a pager and refresh the index; both would make
+/// a "read-only" command write or block.
+fn apply_git_env(process: &mut Command, program: &Path) {
     if program
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -95,7 +100,123 @@ pub async fn run_program(
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0");
     }
-    spawn_and_collect(process, &cwd, timeout, cancel, "无法启动命令").await
+}
+
+/// Execute an allowlisted read-only pipeline: direct argv processes chained
+/// stdout→stdin through real pipe fds — never a shell anywhere. Large upstream
+/// output streams through instead of hitting memory caps, and a `head`-style
+/// terminator backpressures the chain exactly like a shell pipeline.
+pub async fn run_pipeline(
+    root: &Path,
+    segments: &[(PathBuf, Vec<String>)],
+    timeout: Duration,
+    cancel: Option<watch::Receiver<bool>>,
+) -> AppResult<String> {
+    let cwd = root.canonicalize().map_err(|_| "工作区不可用".to_string())?;
+    if segments.is_empty() {
+        return Err("空管道".into());
+    }
+    let mut children: Vec<Child> = Vec::with_capacity(segments.len());
+    let mut trees = Vec::new();
+    let mut stderr_tasks = Vec::new();
+    let mut prev_stdout: Option<tokio::process::ChildStdout> = None;
+    let mut names: Vec<String> = Vec::new();
+    for (program, args) in segments {
+        let mut process = Command::new(program);
+        process.args(args);
+        apply_git_env(&mut process, program);
+        names.push(format!(
+            "{} {}",
+            program.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            args.join(" ")
+        ));
+        let stdin = match prev_stdout.take() {
+            Some(stdout) => {
+                let stdout: std::process::Stdio = stdout.try_into().map_err(|_| "无法接管管道输出".to_string())?;
+                stdout
+            }
+            None => std::process::Stdio::null(),
+        };
+        let mut child = process
+            .current_dir(&cwd)
+            .stdin(stdin)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| format!("无法启动命令：{}", program.display()))?;
+        prev_stdout = child.stdout.take();
+        if let Some(stderr) = child.stderr.take() {
+            stderr_tasks.push(tokio::spawn(drain_bounded(stderr)));
+        }
+        trees.push(ProcessTree::attach(&child));
+        children.push(child);
+    }
+    let stdout_pipe = prev_stdout.ok_or("无法获取 stdout")?;
+    let stdout_task = tokio::spawn(drain_bounded(stdout_pipe));
+
+    // 等全部子进程退出；timeout/cancel 时整链回收。select 取消等待 future 不
+    // 会 drop Child（在 vec 里），必须显式逐段 terminate。
+    let wait_all = async {
+        let mut codes = Vec::new();
+        for child in children.iter_mut() {
+            codes.push(child.wait().await);
+        }
+        codes
+    };
+    let mut cancel = cancel;
+    enum PipeEnd {
+        Exited(Vec<std::io::Result<std::process::ExitStatus>>),
+        TimedOut,
+        Cancelled,
+    }
+    let end = tokio::select! {
+        codes = wait_all => PipeEnd::Exited(codes),
+        () = tokio::time::sleep(timeout) => PipeEnd::TimedOut,
+        () = wait_for_cancel(cancel.as_mut()) => PipeEnd::Cancelled,
+    };
+    if !matches!(end, PipeEnd::Exited(_)) {
+        for (tree, child) in trees.iter_mut().zip(children.iter_mut()) {
+            tree.terminate(child);
+            let _ = child.wait().await;
+        }
+        let _ = join_drain(stdout_task).await;
+        for task in stderr_tasks {
+            let _ = join_drain(task).await;
+        }
+        return Err(match end {
+            PipeEnd::TimedOut => format!("命令执行超时（{}s），已终止", timeout.as_secs()),
+            _ => "命令已取消".into(),
+        });
+    }
+    let PipeEnd::Exited(results) = end else { unreachable!() };
+    let (stdout, stdout_dropped) = join_drain(stdout_task).await;
+    let mut stderr_all: Vec<u8> = Vec::new();
+    let mut stderr_dropped = 0u64;
+    for task in stderr_tasks {
+        let (bytes, dropped) = join_drain(task).await;
+        stderr_all.extend_from_slice(&bytes);
+        stderr_dropped += dropped;
+    }
+    let mut failures = Vec::new();
+    for (index, status) in results.iter().enumerate() {
+        let code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
+        if code != 0 {
+            failures.push(format!("第 {} 段（{}）退出码 {}", index + 1, names[index], code));
+        }
+    }
+    let last_code = results
+        .last()
+        .and_then(|s| s.as_ref().ok())
+        .and_then(|s| s.code())
+        .unwrap_or(-1);
+    let mut text = format!("exit code {last_code}");
+    if !failures.is_empty() {
+        text.push_str(&format!("（{}）", failures.join("；")));
+    }
+    append_stream(&mut text, "stdout", &stdout, stdout_dropped);
+    append_stream(&mut text, "stderr", &stderr_all, stderr_dropped);
+    Ok(text)
 }
 
 /// Resolve a bare program name through `PATH`, never through the current
@@ -617,5 +738,55 @@ mod tests {
             .expect("cancel must end the command, not wait for the 60s timeout")
             .unwrap();
         assert!(result.unwrap_err().contains("取消"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipeline_chains_stdout_into_stdin_without_a_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let echo = resolve_in_path("echo", root.path()).expect("echo must exist");
+        let sort = resolve_in_path("sort", root.path()).expect("sort must exist");
+        let head = resolve_in_path("head", root.path()).expect("head must exist");
+        let out = run_pipeline(
+            root.path(),
+            &[
+                (echo, ["b
+a
+c".to_string()].into()),
+                (sort, vec![]),
+                (head, ["-n".into(), "2".into()]),
+            ],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("exit code 0"), "{out}");
+        // sort 后 head 截两行：a、b——顺序证明 stdout 真的接进了 stdin。
+        assert!(out.contains("a"), "{out}");
+        assert!(out.contains("b"), "{out}");
+        assert!(!out.contains("
+c"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipeline_reports_segment_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let echo = resolve_in_path("echo", root.path()).expect("echo must exist");
+        let grep = resolve_in_path("grep", root.path()).expect("grep must exist");
+        // grep 无匹配退出码 1——如实上报段失败而不是静默。
+        let out = run_pipeline(
+            root.path(),
+            &[
+                (echo, ["hello".to_string()].into()),
+                (grep, ["zzz-no-match".to_string()].into()),
+            ],
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("退出码 1"), "{out}");
     }
 }

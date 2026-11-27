@@ -1174,14 +1174,16 @@ pub(crate) async fn run_subagent(
     let tool_allowed = |name: &str| {
         allowed.iter().any(|entry| entry == name || (entry.ends_with("__") && name.starts_with(entry.as_str())))
     };
-    // 只读研究契约：子智能体清单再按 effect 过滤——Plan 下 run_command 等
-    // 可审批工具不进子智能体（执行侧同口径降级为拒绝）。
+    // 只读研究契约：子智能体清单再按 effect 过滤——run_command 开特例：
+    // 它的效应是 ProcessExecution，但执行侧 gate_call 已把可执行面收窄到
+    // 白名单只读命令（无 shell 直执行），研究与 git 感知离不开它。
     let mut tools: Vec<_> = Vec::new();
     for spec in kernel.agent_tools(Mode::Plan, run_root.as_deref()).await {
         if spec.name == "spawn_subagent" || (!base_open && !tool_allowed(&spec.name)) {
             continue;
         }
-        if !matches!(kernel.tool_effect(&spec.name).await, Ok(crate::domain::ToolEffect::ReadOnly)) {
+        let read_only = matches!(kernel.tool_effect(&spec.name).await, Ok(crate::domain::ToolEffect::ReadOnly));
+        if !read_only && spec.name != "run_command" {
             continue;
         }
         tools.push(spec);

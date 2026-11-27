@@ -31,10 +31,19 @@ const SHELL_METACHARS: &[char] = &[
     '!', '#',
 ];
 
+/// One allowlisted argv in a pipeline — program name plus literal arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlySegment {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPolicy {
-    /// Parsed and allowlisted: run directly (no shell) with these arguments.
-    ReadOnly { program: String, args: Vec<String> },
+    /// Parsed and allowlisted: run directly (no shell). A single command is a
+    /// one-segment pipeline; multi-segment pipelines wire stdout→stdin manually
+    /// — still no shell anywhere, so quoting/expansion never happens.
+    ReadOnly { segments: Vec<ReadOnlySegment> },
     /// 自主放行：没有命中危险规则——走平台 shell 执行，无需审批。
     Auto,
     /// 命中危险规则：挂起等待审批，批准后走平台 shell 执行。
@@ -46,44 +55,134 @@ pub fn parse(command: &str) -> CommandPolicy {
     if command.len() > MAX_COMMAND_CHARS {
         return CommandPolicy::Dangerous;
     }
-    if let Some(tokens) = tokenize(command) {
-        if let Some(program) = program_name(&tokens[0]) {
-            let args = &tokens[1..];
-            let safe = match program.as_str() {
-                "git" => git_args(args),
-                "rg" => args_match(args, RG_FLAGS, true) && positionals_are_relative(args),
-                "fd" => args_match(args, FD_FLAGS, true) && positionals_are_relative(args),
-                "grep" => args_match(args, GREP_FLAGS, true) && positionals_are_relative(args),
-                "cat" => args_match(args, CAT_FLAGS, true) && positionals_are_relative(args),
-                "head" | "tail" => {
-                    args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args)
-                }
-                "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
-                "more" => {
-                    positionals_are_relative(args) && args.iter().all(|arg| !arg.starts_with('-'))
-                }
-                "ls" => args_match(args, LS_FLAGS, true) && positionals_are_relative(args),
-                "tree" => args_match(args, TREE_FLAGS, true) && positionals_are_relative(args),
-                "pwd" | "ver" | "hostname" | "whoami" => args.is_empty(),
-                "echo" => true,
-                "which" | "where" => where_args(args),
-                // Version probes only.
-                "node" | "npm" | "python" | "python3" | "pip" | "pip3" | "cargo" | "rustc"
-                | "go" | "dotnet" | "java" | "javac" | "php" | "ruby" | "deno" | "bun"
-                | "pnpm" | "yarn" | "cmake" | "tsc" | "sqlite3" => {
-                    matches!(args, [arg] if matches!(arg.as_str(), "-v" | "-V" | "--version" | "version"))
-                }
-                _ => false,
-            };
-            if safe {
-                return CommandPolicy::ReadOnly { program, args: args.to_vec() };
-            }
-        }
+    if let Some(segments) = read_only_pipeline(command) {
+        return CommandPolicy::ReadOnly { segments };
     }
     if is_dangerous(command) {
         CommandPolicy::Dangerous
     } else {
         CommandPolicy::Auto
+    }
+}
+
+/// 管道段数上限：`git ls-tree | sort | head` 三段是真实工作形态，更多段
+/// 往往是模型在拼凑 shell 脚本——超出即回落危险分类（Code 审批/Plan 拒绝）。
+const MAX_PIPE_SEGMENTS: usize = 4;
+
+/// Split on **unquoted** `|` only. Every other shell metachar stays fatal
+/// inside `tokenize`, so this is the one place pipes become structure.
+/// Quoted pipes never split — but note `tokenize` still rejects metachars
+/// inside quotes, so they are not a smuggling vector either way.
+fn split_pipes(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        match quote {
+            Some(open) => {
+                current.push(ch);
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '|' => out.push(std::mem::take(&mut current)),
+                _ => current.push(ch),
+            },
+        }
+    }
+    out.push(current);
+    out
+}
+
+/// Classify one tokenized argv against the allowlist; returns the resolved
+/// program and args when every element is listed.
+fn classify_segment(tokens: &[String]) -> Option<(String, Vec<String>)> {
+    let program = program_name(tokens.first()?)?;
+    let args = &tokens[1..];
+    let safe = match program.as_str() {
+        "git" => git_args(args),
+        "rg" => args_match(args, RG_FLAGS, true) && positionals_are_relative(args),
+        "fd" => args_match(args, FD_FLAGS, true) && positionals_are_relative(args),
+        "grep" => args_match(args, GREP_FLAGS, true) && positionals_are_relative(args),
+        "cat" => args_match(args, CAT_FLAGS, true) && positionals_are_relative(args),
+        "head" | "tail" => {
+            args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args)
+        }
+        "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
+        "sort" => {
+            let expanded = expand_short_clusters(args, "nrubfsVMhz", "kt");
+            args_match(&expanded, SORT_FLAGS, true) && positionals_are_relative(&expanded)
+        }
+        "more" => {
+            positionals_are_relative(args) && args.iter().all(|arg| !arg.starts_with('-'))
+        }
+        "ls" => args_match(args, LS_FLAGS, true) && positionals_are_relative(args),
+        "tree" => args_match(args, TREE_FLAGS, true) && positionals_are_relative(args),
+        "pwd" | "ver" | "hostname" | "whoami" => args.is_empty(),
+        "echo" => true,
+        "which" | "where" => where_args(args),
+        // Version probes only.
+        "node" | "npm" | "python" | "python3" | "pip" | "pip3" | "cargo" | "rustc"
+        | "go" | "dotnet" | "java" | "javac" | "php" | "ruby" | "deno" | "bun"
+        | "pnpm" | "yarn" | "cmake" | "tsc" | "sqlite3" => {
+            matches!(args, [arg] if matches!(arg.as_str(), "-v" | "-V" | "--version" | "version"))
+        }
+        _ => false,
+    };
+    safe.then(|| (program, args.to_vec()))
+}
+
+/// `-k4` / `-nr` 这类短 flag 簇在真实命令里随处可见。展开为独立 token 再
+/// 过白名单：簇内字符已在 tokenize 阶段排除元字符，展开不产生新语义。
+/// 仅当簇内字符全部属于已知布尔集、或首字符是取值 flag 时展开——否则原样
+/// 保留（白名单拒收，失败安全）。
+fn expand_short_clusters(args: &[String], bools: &str, valued: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let bytes: Vec<char> = arg.chars().collect();
+        let expandable = bytes.len() > 2 && bytes[0] == '-' && bytes[1] != '-';
+        if expandable {
+            let cluster: Vec<char> = bytes[1..].to_vec();
+            if cluster.iter().all(|c| bools.contains(*c)) {
+                for c in cluster {
+                    out.push(format!("-{c}"));
+                }
+                continue;
+            }
+            if valued.contains(cluster[0]) && cluster.len() > 1 {
+                out.push(format!("-{}", cluster[0]));
+                out.push(cluster[1..].iter().collect());
+                continue;
+            }
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+/// The whole command parses as a pipeline of allowlisted read-only segments:
+/// split on unquoted pipes, then every segment must independently satisfy the
+/// same strict argv allowlist as a single command.
+fn read_only_pipeline(command: &str) -> Option<Vec<ReadOnlySegment>> {
+    let parts = split_pipes(command);
+    if parts.len() > MAX_PIPE_SEGMENTS {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(parts.len());
+    for part in parts {
+        let tokens = tokenize(part.trim())?;
+        let (program, args) = classify_segment(&tokens)?;
+        segments.push(ReadOnlySegment { program, args });
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
     }
 }
 
@@ -667,6 +766,64 @@ const GIT_LS_FILES: &[FlagSpec] = &[
     flag("--exclude-standard"),
     flag("--"),
 ];
+const GIT_LS_TREE: &[FlagSpec] = &[
+    flag("-r"),
+    flag("-l"),
+    flag("-t"),
+    flag("-d"),
+    flag("-z"),
+    flag("--name-only"),
+    flag("--name-status"),
+    flag("--object-only"),
+    flag("--full-tree"),
+    valued("--abbrev"),
+    flag("--"),
+];
+// `--textconv`/`--filters` 可执行配置的转换程序，batch 模式是交互协议——
+// 只有纯对象查询形态只读。
+const GIT_CAT_FILE: &[FlagSpec] = &[flag("-t"), flag("-s"), flag("-e"), flag("-p"), flag("--")];
+const GIT_REV_LIST: &[FlagSpec] = &[
+    flag("--count"),
+    valued("-n"),
+    valued("--max-count"),
+    flag("--oneline"),
+    flag("--reverse"),
+    flag("--first-parent"),
+    flag("--all"),
+    flag("--branches"),
+    flag("--tags"),
+    flag("--merges"),
+    flag("--no-merges"),
+    flag("--"),
+];
+const GIT_SHOW_REF: &[FlagSpec] = &[
+    flag("--heads"),
+    flag("--tags"),
+    flag("-s"),
+    flag("--hash"),
+    flag("-d"),
+    flag("--dereference"),
+    flag("--"),
+];
+const GIT_COUNT_OBJECTS: &[FlagSpec] = &[flag("-v"), flag("-H"), flag("--human-readable")];
+const GIT_VAR: &[FlagSpec] = &[flag("-l"), flag("--list")];
+// sort 的 `-o` 写文件、`--files0-from` 读任意路径清单——只允许纯排序；
+// positionals 是待排序文件，读相对路径与 cat 同级。
+const SORT_FLAGS: &[FlagSpec] = &[
+    flag("-n"),
+    flag("-r"),
+    flag("-u"),
+    flag("-b"),
+    flag("-f"),
+    flag("-s"),
+    flag("-V"),
+    flag("-M"),
+    flag("-h"),
+    flag("-z"),
+    valued("-k"),
+    valued("-t"),
+    flag("--"),
+];
 const GIT_BLAME: &[FlagSpec] = &[valued("-L"), flag("-n"), flag("--porcelain"), flag("--")];
 const GIT_DESCRIBE: &[FlagSpec] = &[flag("--tags"), flag("--always"), flag("--long"), valued("--abbrev")];
 const GIT_SHORTLOG: &[FlagSpec] = &[flag("-s"), flag("-n"), flag("--summary"), flag("--")];
@@ -750,6 +907,12 @@ fn git_args(args: &[String]) -> bool {
         "show" => args_match(rest, GIT_SHOW, true),
         "rev-parse" => args_match(rest, GIT_REV_PARSE, true),
         "ls-files" => args_match(rest, GIT_LS_FILES, true),
+        "ls-tree" => args_match(rest, GIT_LS_TREE, true),
+        "cat-file" => args_match(rest, GIT_CAT_FILE, true),
+        "rev-list" => args_match(rest, GIT_REV_LIST, true),
+        "show-ref" => args_match(rest, GIT_SHOW_REF, true),
+        "count-objects" => args_match(rest, GIT_COUNT_OBJECTS, true),
+        "var" => args_match(rest, GIT_VAR, true),
         "blame" => args_match(rest, GIT_BLAME, true),
         "describe" => args_match(rest, GIT_DESCRIBE, false),
         "shortlog" => args_match(rest, GIT_SHORTLOG, true),
@@ -967,7 +1130,6 @@ mod tests {
         for command in [
             "git status && del x",
             "git status; del x",
-            "git status | more",
             "git status > out.txt",
             "git status < in.txt",
             "git status\ndel x",
@@ -1085,7 +1247,7 @@ mod tests {
         assert!(safe("git log --oneline -n 20 -- \"main\""));
         assert_eq!(
             parse("git show \"main\""),
-            CommandPolicy::ReadOnly { program: "git".into(), args: vec!["show".into(), "main".into()] }
+            CommandPolicy::ReadOnly { segments: vec![crate::domain::command_policy::ReadOnlySegment { program: "git".into(), args: vec!["show".into(), "main".into()] }] }
         );
         assert!(!safe("git show \"a|b\""));
         assert!(!safe("git show \"unterminated"));
@@ -1305,7 +1467,7 @@ mod tests {
     fn parse_tiers_split_readonly_auto_dangerous() {
         assert_eq!(
             parse("git status"),
-            CommandPolicy::ReadOnly { program: "git".into(), args: vec!["status".into()] }
+            CommandPolicy::ReadOnly { segments: vec![crate::domain::command_policy::ReadOnlySegment { program: "git".into(), args: vec!["status".into()] }] }
         );
         assert_eq!(parse("npm test"), CommandPolicy::Auto);
         assert_eq!(parse("dir"), CommandPolicy::Auto);
@@ -1313,5 +1475,59 @@ mod tests {
         assert_eq!(parse("git push"), CommandPolicy::Dangerous);
         assert_eq!(parse("rm -rf x"), CommandPolicy::Dangerous);
         assert_eq!(parse("cmd /C dir"), CommandPolicy::Dangerous);
+    }
+
+    #[test]
+    fn pipelines_of_allowlisted_segments_are_readonly() {
+        // 截图原案：git ls-tree 管道 sort/head。
+        assert!(safe("git ls-tree -r -l HEAD | sort -k4 -n -r | head -n 45"));
+        assert!(safe("git status --short | sort"));
+        assert!(safe("cat src/main.rs | wc -l"));
+        assert!(safe("git status | more"));
+        assert!(safe("git ls-tree HEAD | sort -nr"));
+        // 单命令是单段管道。
+        assert!(safe("git ls-tree HEAD"));
+        assert!(safe("git cat-file -p HEAD"));
+        assert!(safe("git rev-list --count HEAD"));
+        assert!(safe("git show-ref --heads"));
+        assert!(safe("git count-objects -v"));
+    }
+
+    #[test]
+    fn pipelines_reject_unsafe_segments_and_write_caps() {
+        // 任一段不在白名单 = 整体拒绝。
+        assert!(!safe("git status | rm -rf x"));
+        assert!(!safe("echo hi | sh"));
+        // sort -o 写文件——管道内外都不放过。
+        assert!(!safe("git ls-tree HEAD | sort -o out.txt"));
+        assert!(!safe("sort -o out.txt"));
+        assert!(!safe("sort --files0-from list.txt"));
+        // cat-file 执行向量与 batch 协议模式。
+        assert!(!safe("git cat-file --textconv HEAD:file"));
+        assert!(!safe("git cat-file --batch"));
+        // 段数超限、空段、双管道。
+        assert!(!safe("echo a | echo b | echo c | echo d | echo e"));
+        assert!(!safe("echo a || echo b"));
+        assert!(!safe("| echo a"));
+        // 引号内管道不拆分——但元字符黑名单仍然拒收（不做放宽）。
+        assert!(!safe("echo \"a|b\""));
+        // 重定向/分号等其他 shell 结构依然拒绝。
+        assert!(!safe("echo hi > out.txt"));
+        assert!(!safe("echo a; echo b"));
+        // 排除网络出口子命令。
+        assert!(!safe("git ls-remote origin"));
+    }
+
+    #[test]
+    fn pipeline_segments_parse_into_multi_segment_readonly() {
+        match parse("git ls-tree -r HEAD | sort -n | head -n 5") {
+            CommandPolicy::ReadOnly { segments } => {
+                assert_eq!(segments.len(), 3);
+                assert_eq!(segments[0].program, "git");
+                assert_eq!(segments[1].program, "sort");
+                assert_eq!(segments[2].program, "head");
+            }
+            other => panic!("expected readonly pipeline, got {other:?}"),
+        }
     }
 }

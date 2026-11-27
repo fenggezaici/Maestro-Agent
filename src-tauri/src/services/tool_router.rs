@@ -1324,21 +1324,22 @@ impl ToolRouter {
                     (text, None)
                 } else {
                     let text = match crate::domain::command_policy::parse(command) {
-                        // Allowlisted: run the resolved binary directly, no shell.
-                        crate::domain::command_policy::CommandPolicy::ReadOnly { program, args } => {
-                            let Some(path) = crate::adapters::exec::resolve_in_path(&program, root) else {
-                                return Err(format!(
-                                    "只读白名单命令不可用：{program} 未在 PATH 中找到（未执行）"
-                                ));
-                            };
-                            crate::adapters::exec::run_program(
-                                root,
-                                &path,
-                                &args,
-                                timeout,
-                                cancel,
-                            )
-                            .await?
+                        // Allowlisted: run the resolved binaries directly, no shell.
+                        crate::domain::command_policy::CommandPolicy::ReadOnly { segments } => {
+                            let mut resolved = Vec::with_capacity(segments.len());
+                            for segment in &segments {
+                                let Some(path) =
+                                    crate::adapters::exec::resolve_in_path(&segment.program, root)
+                                else {
+                                    return Err(format!(
+                                        "只读白名单命令不可用：{} 未在 PATH 中找到（未执行）",
+                                        segment.program
+                                    ));
+                                };
+                                resolved.push((path, segment.args.clone()));
+                            }
+                            crate::adapters::exec::run_pipeline(root, &resolved, timeout, cancel)
+                                .await?
                         }
                         // 自主放行与已批准的危险命令都走 shell 路径。
                         crate::domain::command_policy::CommandPolicy::Auto

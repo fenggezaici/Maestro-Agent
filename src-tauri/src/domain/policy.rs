@@ -76,7 +76,9 @@ pub fn spec_visible(mode: Mode, tool: &str, effect: ToolEffect) -> bool {
 /// Mode gate that also consults the command policy. `tool` disambiguates the
 /// `command` argument — MCP tools may carry their own `command` field.
 /// - Plan: only allowlisted read-only commands (`is_read_only_safe`, no
-///   `background`) suspend for approval; every other side effect stays Deny.
+///   `background`) execute directly — strict argv parsing plus no-shell
+///   execution is safer than `read_file`, so approval is pure friction.
+///   Every other side effect stays Deny.
 /// - Code: commands not flagged dangerous run without asking (ZCode 自主模式).
 /// - Confirm still asks for everything, Auto already allows everything.
 pub fn gate_call(mode: Mode, tool: &str, effect: ToolEffect, command: Option<&str>) -> ToolGate {
@@ -85,7 +87,7 @@ pub fn gate_call(mode: Mode, tool: &str, effect: ToolEffect, command: Option<&st
         && effect == ToolEffect::ProcessExecution
         && command.is_some_and(command_policy::is_read_only_safe)
     {
-        return ToolGate::RequireApproval;
+        return ToolGate::Allow;
     }
     if mode == Mode::Code
         && effect == ToolEffect::ProcessExecution
@@ -140,11 +142,12 @@ mod tests {
     #[test]
     fn plan_mode_asks_only_for_allowlisted_read_only_commands() {
         use ToolGate::*;
-        // 白名单只读命令：挂起等批准，批准后走无 shell exec。
+        // 白名单只读命令：直放免审批——严格 argv 解析+无 shell 执行比 read_file
+        // 更安全，审批是纯摩擦。
         for command in ["git status", "rg TODO", "cat a.txt", "ls", "node -v", "where cargo"] {
             assert_eq!(
                 gate_call(Mode::Plan, "run_command", ToolEffect::ProcessExecution, Some(command)),
-                RequireApproval,
+                Allow,
                 "{command}"
             );
         }

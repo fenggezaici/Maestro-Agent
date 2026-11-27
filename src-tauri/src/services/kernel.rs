@@ -4206,23 +4206,16 @@ mod tests {
             )
             .await;
         assert!(results[0].is_err());
-        // 白名单命令在 Plan 下只挂起等逐项审批——会话放行同样不豁免。
-        let worker = kernel.clone();
-        let suspended = tokio::spawn(async move {
-            worker
-                .execute_tool_calls_as(
-                    id,
-                    &[("run_command".into(), r#"{"command":"git status"}"#.into())],
-                    Some(Mode::Plan),
-                )
-                .await
-        });
-        wait_for_phase_count(&events, ToolPhase::AwaitingApproval, 2).await;
-        kernel
-            .resolve_approval(id, ApprovalDecision::Deny, CommandScope::Exact, None)
-            .await
-            .unwrap();
-        assert!(suspended.await.unwrap()[0].is_err());
+        // 白名单命令在 Plan 下直放免审批——严格 argv+无 shell 执行，不再需要
+        // 逐项审批环节。
+        let results = kernel
+            .execute_tool_calls_as(
+                id,
+                &[("run_command".into(), r#"{"command":"git status"}"#.into())],
+                Some(Mode::Plan),
+            )
+            .await;
+        assert!(results[0].is_ok(), "{:?}", results[0]);
         kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
@@ -4481,20 +4474,13 @@ mod tests {
         assert!(first.await.unwrap().is_ok());
         kernel.finish(confirm_run, RunStatus::Completed, None).await;
 
-        // Plan 模式：持久规则不免除逐项审批——同样的白名单命令仍挂起等批准。
+        // Plan 模式：白名单只读命令直放免审批——严格 argv 解析+无 shell 执行
+        // 比 read_file 更安全，挂起是纯摩擦。
         let plan_run = seed_run_in_session(&kernel, session_id, Mode::Plan).await;
-        let worker = kernel.clone();
-        let suspended = tokio::spawn(async move {
-            worker
-                .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
-                .await
-        });
-        wait_for_phase_count(&events, ToolPhase::AwaitingApproval, 2).await;
-        kernel
-            .resolve_approval(plan_run, ApprovalDecision::AllowOnce, CommandScope::Exact, None)
+        let output = kernel
+            .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
             .await
             .unwrap();
-        let output = suspended.await.unwrap().unwrap();
         assert!(!output.trim().is_empty());
         kernel.finish(plan_run, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
@@ -4502,7 +4488,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_mode_denies_non_allowlisted_and_background_commands() {
-        let (kernel, events) = test_kernel().await;
+        let (kernel, _events) = test_kernel().await;
         let workspace = tempfile::tempdir().unwrap();
         kernel
             .set_workspace_root(Some(workspace.path().to_path_buf()))
@@ -4520,20 +4506,12 @@ mod tests {
                 .unwrap_err();
             assert!(denied.contains("Plan Mode blocked"), "{denied}");
         }
-        // 白名单命令拒绝路径：挂起后用户拒绝，模型拿到拒绝原因。
-        let worker = kernel.clone();
-        let suspended = tokio::spawn(async move {
-            worker
-                .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
-                .await
-        });
-        wait_for_phase(&events, ToolPhase::AwaitingApproval).await;
-        kernel
-            .resolve_approval(plan_run, ApprovalDecision::Deny, CommandScope::Exact, Some("计划阶段不要跑命令".into()))
+        // 白名单命令直放：无审批环节，直接执行返回输出。
+        let output = kernel
+            .execute_model_tool(plan_run, "run_command", r#"{"command":"whoami"}"#)
             .await
             .unwrap();
-        let denied = suspended.await.unwrap().unwrap_err();
-        assert!(denied.contains("用户拒绝"), "{denied}");
+        assert!(output.contains("exit code 0"), "{output}");
         kernel.finish(plan_run, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
@@ -4546,13 +4524,22 @@ mod tests {
             .set_workspace_root(Some(workspace.path().to_path_buf()))
             .await;
         let (plan_run, _rx) = seed_run_mode(&kernel, Mode::Plan).await;
-        // 同一条白名单命令：主作用域会挂起审批，子智能体作用域直接拒绝。
+        // 白名单只读命令：子智能体作用域同样直放（用户拍板——研究离不开
+        // git 只读感知）；非白名单命令依旧拒绝。
         let calls = [(
             "run_command".to_string(),
             r#"{"command":"whoami"}"#.to_string(),
         )];
         let results = kernel
             .execute_subagent_tool_calls(plan_run, "sub-plan", &calls, Some(Mode::Plan))
+            .await;
+        assert!(results[0].as_ref().is_ok(), "{:?}", results[0]);
+        let denied = [(
+            "run_command".to_string(),
+            r#"{"command":"git push"}"#.to_string(),
+        )];
+        let results = kernel
+            .execute_subagent_tool_calls(plan_run, "sub-plan", &denied, Some(Mode::Plan))
             .await;
         assert!(
             results[0].as_ref().unwrap_err().contains("Plan Mode blocked"),
