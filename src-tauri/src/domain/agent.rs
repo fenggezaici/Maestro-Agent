@@ -39,8 +39,8 @@ pub struct AgentDefinition {
     pub tools: Vec<String>,
     #[serde(default)]
     pub steps: Option<u32>,
-    /// Tool-call budget per subagent run; `None` falls back to
-    /// `DEFAULT_SUBAGENT_TOOL_BUDGET` in the child loop.
+    /// Tool-call budget per subagent run; `None`（且全局默认也为空）= 无硬顶，
+    /// 子循环跑到模型自然收尾——显式设置只是安全阀。
     #[serde(default)]
     pub tool_budget: Option<u32>,
     #[serde(default)]
@@ -53,8 +53,6 @@ pub struct AgentDefinition {
 
 fn default_mode() -> String { "subagent".into() }
 
-/// Default tool-call budget when a definition does not set `tool_budget`.
-pub const DEFAULT_SUBAGENT_TOOL_BUDGET: u32 = 100;
 /// Upper bound applied to a configured budget to catch absurd values.
 pub const MAX_SUBAGENT_TOOL_BUDGET: u32 = 1000;
 
@@ -92,7 +90,7 @@ impl AgentDefinition {
                     "run_command".into(),
                     "load_skill".into(),
                 ],
-                steps: Some(8), tool_budget: None, hidden: false, color: Some("#8B5CF6".into()), source: AgentSource::Builtin,
+                steps: None, tool_budget: None, hidden: false, color: Some("#8B5CF6".into()), source: AgentSource::Builtin,
             }),
             "general" => Some(Self {
                 name: "general".into(),
@@ -108,7 +106,7 @@ impl AgentDefinition {
                     "run_command".into(),
                     "load_skill".into(),
                 ],
-                steps: Some(8), tool_budget: None, hidden: false, color: Some("#22D3EE".into()), source: AgentSource::Builtin,
+                steps: None, tool_budget: None, hidden: false, color: Some("#22D3EE".into()), source: AgentSource::Builtin,
             }),
             _ => None,
         }

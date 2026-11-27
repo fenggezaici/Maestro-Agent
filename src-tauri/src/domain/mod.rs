@@ -37,7 +37,7 @@ pub use extension::{
 };
 pub use message::{validate_messages, ChatMessage, ToolCallSpec, ToolSpec};
 pub use activity::{ActivityDay, ActivitySnapshot, ModelTrendDay, ModelUsage};
-pub use agent::{AgentDefinition, AgentItemRef, AgentSource, SubagentDefaults, DEFAULT_SUBAGENT_TOOL_BUDGET, MAX_SUBAGENT_TOOL_BUDGET};
+pub use agent::{AgentDefinition, AgentItemRef, AgentSource, SubagentDefaults, MAX_SUBAGENT_TOOL_BUDGET};
 pub use change::{
     line_change_counts, merge_file_changes, RevertIssue, RevertPreview, RevertResult,
     RunChangeSummary, RunFileChange,

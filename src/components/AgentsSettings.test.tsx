@@ -73,7 +73,7 @@ describe('AgentsSettings', () => {
   it('saves global defaults through save_agent_defaults', async () => {
     render(<AgentsSettings preview={false} />);
     await screen.findByLabelText('选择要配置的子智能体');
-    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮）'), { target: { value: '12' } });
+    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮，留空不限）'), { target: { value: '12' } });
     fireEvent.change(screen.getByLabelText('单 run 总额度'), { target: { value: '12' } });
     fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent_defaults', {
@@ -84,8 +84,8 @@ describe('AgentsSettings', () => {
   it('clamps numeric fields to the raised caps (128 steps / 1000 budget)', async () => {
     render(<AgentsSettings preview={false} />);
     await screen.findByLabelText('选择要配置的子智能体');
-    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮）'), { target: { value: '999' } });
-    fireEvent.change(screen.getByLabelText('默认工具预算（工具调用总次数）'), { target: { value: '99999' } });
+    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮，留空不限）'), { target: { value: '999' } });
+    fireEvent.change(screen.getByLabelText('默认工具预算（工具调用总次数，留空不限）'), { target: { value: '99999' } });
     fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent_defaults', {
       defaults: expect.objectContaining({ steps: 128, toolBudget: 1000 }),

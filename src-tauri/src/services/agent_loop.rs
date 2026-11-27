@@ -100,15 +100,21 @@ const DEFAULT_SUBAGENT_PROMPT: &str = "你是只读研究子智能体。只使�
 /// Efficiency budget: broad research otherwise reads every file until timeout.
 /// 如实告知双约束——模型无法管理它看不见的限制；一轮可并行多调用是
 /// 小模型调研效率的关键，必须显式说明。
-fn subagent_budget_hint(steps: u32, tool_budget: usize) -> String {
-    format!("效率约束：你最多有 {steps} 轮对话和 {tool_budget} 次工具调用。一轮可以并行调用多个工具——先 repo_map 拿仓库全貌，再每轮批量并行读取多个关键文件；不要逐文件顺序读取，不要重复读取同一文件。接近上限时立即输出已有结论；最后一轮工具将被禁用，必须输出纯文本的最终结论、证据路径与风险。")
+fn subagent_budget_hint(steps: Option<u32>, tool_budget: Option<usize>) -> String {
+    if steps.is_none() && tool_budget.is_none() {
+        return "效率指引：没有轮次或工具次数硬上限，上下文会自动压缩——把任务做完再自然收尾，不必赶。保持效率：先 repo_map 拿仓库全貌，一轮并行批量读取多个关键文件，不逐文件顺序读取，不重复读取同一文件。证据足够时直接输出纯文本最终结论（不调用工具）即告完成。".to_string();
+    }
+    format!("效率约束：你最多有 {} 轮对话和 {} 次工具调用。一轮可以并行调用多个工具——先 repo_map 拿仓库全貌，再每轮批量并行读取多个关键文件；不要逐文件顺序读取，不要重复读取同一文件。接近上限时立即输出已有结论；最后一轮工具将被禁用，必须输出纯文本的最终结论、证据路径与风险。",
+        steps.map(|v| v.to_string()).unwrap_or_else(|| "不限".into()),
+        tool_budget.map(|v| v.to_string()).unwrap_or_else(|| "不限".into()))
 }
 
-/// A child that stops producing progress must not hold the parent turn forever.
-/// The default lives in `domain::DEFAULT_SUBAGENT_TOOL_BUDGET`; definitions may
-/// override it via `tool_budget`.
-fn subagent_tool_budget(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> usize {
-    definition.tool_budget.or(defaults.tool_budget).unwrap_or(crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET).clamp(1, crate::domain::MAX_SUBAGENT_TOOL_BUDGET) as usize
+/// None = 无硬顶：终止权在模型不在计数器（上下文由压缩续命）；显式设置
+/// （definition > 全局默认）是用户自留的安全阀，触顶触发收尾轮。
+fn subagent_tool_budget(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> Option<usize> {
+    // None = 无硬顶（ZCode 哲学：终止权在模型不在计数器）；显式设置是用户
+    // 自留的安全阀，仍按上限 clamp。
+    definition.tool_budget.or(defaults.tool_budget).map(|value| value.clamp(1, crate::domain::MAX_SUBAGENT_TOOL_BUDGET) as usize)
 }
 
 fn subagent_timeout() -> Duration {
@@ -116,8 +122,18 @@ fn subagent_timeout() -> Duration {
         std::env::var("MAESTRO_SUBAGENT_TIMEOUT")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| (60..=1800).contains(value))
-            .unwrap_or(600),
+            .filter(|value| (60..=7200).contains(value))
+            .unwrap_or(1800),
+    )
+}
+fn subagent_idle_timeout() -> Duration {
+    // 模型流静默看门狗：零输出（含首 token）持续此时长即判卡死。
+    Duration::from_secs(
+        std::env::var("MAESTRO_SUBAGENT_IDLE_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (5..=600).contains(value))
+            .unwrap_or(120),
     )
 }
 /// Partial findings kept when a child times out or exhausts its step budget.
@@ -632,6 +648,7 @@ struct SubagentDrainCtx {
     provider: String,
     model: String,
     subagent_id: String,
+    activity: Arc<AtomicU64>,
 }
 
 async fn drain_subagent_stream(
@@ -640,7 +657,7 @@ async fn drain_subagent_stream(
     mut rx: mpsc::UnboundedReceiver<StreamEvent>,
     started: Instant,
 ) -> SubagentCall {
-    let SubagentDrainCtx { run_id, session_id, provider, model, subagent_id } = ctx;
+    let SubagentDrainCtx { run_id, session_id, provider, model, subagent_id, activity } = ctx;
     let mut call = SubagentCall::default();
     let mut last_delta_ms = None;
     // 父 metrics 口径按“本调用”计时（与 stream_turn relay 同构）。
@@ -678,6 +695,8 @@ async fn drain_subagent_stream(
         m.live_surface_tokens = (est > 0).then_some(est);
     };
     while let Some(event) = rx.recv().await {
+        // 任何事件都证明模型流活着——喂饱看门狗。
+        activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         // DSH isTokenDelta：text/reasoning/tool-call delta 都算有效增量。
         let is_delta = matches!(
             event,
@@ -830,8 +849,9 @@ fn resolve_max_total(defaults: &crate::domain::SubagentDefaults) -> usize {
 }
 
 /// steps 解析链：definition → 全局默认 → 8（0 视为未设置）。
-fn resolve_steps(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> u32 {
-    definition.steps.or(defaults.steps).filter(|value| *value > 0).unwrap_or(8)
+fn resolve_steps(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> Option<u32> {
+    // None = 无硬顶：循环跑到模型自然收尾（ZCode 内建不设 maxTurns 同款）。
+    definition.steps.or(defaults.steps).filter(|value| *value > 0)
 }
 
 /// 预算原子扣减：到 0 返回 false（fetch_update 失败时不写回，语义精确）。
@@ -1214,11 +1234,11 @@ pub(crate) async fn run_subagent(
         });
     }
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
-    let tool_budget = subagent_tool_budget(&definition, &defaults);
-    let steps = resolve_steps(&definition, &defaults);
+    let tool_budget_cap = subagent_tool_budget(&definition, &defaults);
+    let steps_cap = resolve_steps(&definition, &defaults);
     let dispatch_prompt = squad.as_ref().map(|squad| squad_dispatch_prompt(squad, &defaults)).unwrap_or_default();
     let system_prompt = format!("{}
-{}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(steps, tool_budget), subagent_assembly_prompt(&grants), dispatch_prompt);
+{}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(steps_cap, tool_budget_cap), subagent_assembly_prompt(&grants), dispatch_prompt);
     // 必选装配：子循环内逐轮强制，全部真实调用后才允许收尾。
     let mut pending_grants: Vec<SubagentGrant> = grants
         .into_iter()
@@ -1304,7 +1324,9 @@ pub(crate) async fn run_subagent(
         // 收尾轮只跑一次（synthesis_done 防重复燃烧 LLM 调用）；超时仍
         // 是硬墙，不假装有时间收尾。
         let mut synthesis_done = false;
-        for iteration in 0..steps {
+        let mut iteration = 0u32;
+        loop {
+            iteration += 1;
             if *cancel.borrow() {
                 return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
@@ -1343,8 +1365,9 @@ pub(crate) async fn run_subagent(
                     }
                 }
             }
-            let budget_out = tool_count >= tool_budget;
-            let synthesis_round = budget_out || iteration + 1 >= steps;
+            let budget_out = tool_budget_cap.is_some_and(|cap| tool_count >= cap);
+            let steps_out = steps_cap.is_some_and(|cap| iteration >= cap);
+            let synthesis_round = budget_out || steps_out;
             if synthesis_round {
                 synthesis_done = true;
                 messages.push(ChatMessage::text("user", "【系统提示】这是最后一轮：工具已全部禁用。请立即基于已收集的证据输出最终结论——关键发现、证据文件路径与风险；不要尝试调用任何工具。"));
@@ -1357,6 +1380,8 @@ pub(crate) async fn run_subagent(
                     return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                 }
                 let (tx, rx) = mpsc::unbounded_channel();
+                let activity = Arc::new(AtomicU64::new(0));
+                let idle_limit = subagent_idle_timeout();
                 // 与 stream 并发排空：delta 时刻是真实到达时间，usage 逐次累加。
                 let consumer = tokio::spawn(drain_subagent_stream(
                     kernel.clone(),
@@ -1366,14 +1391,46 @@ pub(crate) async fn run_subagent(
                         provider: child_config.provider.name().to_string(),
                         model: child_config.model.clone(),
                         subagent_id: subagent_id.clone(),
+                        activity: activity.clone(),
                     },
                     rx,
                     started,
                 ));
-                let streamed = tokio::time::timeout(
-                    remaining,
-                    provider.clone().stream(&child_config, &messages, round_tools, &mut cancel, tx),
-                ).await;
+                // 三路 select：模型流 / 总deadline / 静默看门狗（每5s查活跃时间戳）。
+                // 看门狗触发=丢弃 stream future 物理取消，不 retry 诚实失败。
+                // 块作用域隔离：stream future 借用 cancel/messages，结果移出后
+                // 立刻丢弃 future 终结借用，后续重试/压缩才能再动它们。
+                let (streamed, idle_fired) = {
+                    let stream_fut = provider.clone().stream(&child_config, &messages, round_tools, &mut cancel, tx);
+                    tokio::pin!(stream_fut);
+                    let total_sleep = tokio::time::sleep(remaining);
+                    tokio::pin!(total_sleep);
+                    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+                    let mut idle_fired = false;
+                    let streamed = loop {
+                        tokio::select! {
+                            result = &mut stream_fut => break Some(result),
+                            _ = &mut total_sleep => break None,
+                            _ = watchdog.tick() => {
+                                let silent_ms = started.elapsed().as_millis() as u64 - activity.load(Ordering::Relaxed);
+                                if silent_ms >= idle_limit.as_millis() as u64 {
+                                    idle_fired = true;
+                                    break None;
+                                }
+                            }
+                        }
+                    };
+                    (streamed, idle_fired)
+                };
+                let streamed: Result<Result<_, String>, ()> = match (streamed, idle_fired) {
+                    (Some(Ok(outcome)), _) => Ok(Ok(outcome)),
+                    (Some(Err(error)), _) => Ok(Err(error)),
+                    (None, true) => Ok(Err(format!(
+                        "模型流静默超过 {} 秒无任何输出，判定卡死已中止（可经 MAESTRO_SUBAGENT_IDLE_TIMEOUT 调整）",
+                        idle_limit.as_secs()
+                    ))),
+                    (None, false) => Err(()),
+                };
                 let drained = consumer.await.unwrap_or_default();
                 if first_token_ms.is_none() {
                     first_token_ms = drained.first_delta_ms;
@@ -1454,9 +1511,9 @@ pub(crate) async fn run_subagent(
             // 追加）；模型仍空响应时落入既有空轮诊断路径。
             if synthesis_round && !text.trim().is_empty() {
                 let error = if budget_out {
-                    format!("达到工具预算（{tool_budget} 次），已返回收尾结论")
+                    format!("达到工具预算（{} 次），已返回收尾结论", tool_budget_cap.unwrap_or(0))
                 } else {
-                    format!("达到轮次上限（{steps} 轮），已返回收尾结论")
+                    format!("达到轮次上限（{} 轮），已返回收尾结论", steps_cap.unwrap_or(0))
                 };
                 return ChildOutcome { status: SubagentStatus::Completed, content: text, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
@@ -1477,9 +1534,9 @@ pub(crate) async fn run_subagent(
                         )
                         .await;
                     let error = if budget_out {
-                        format!("达到工具预算（{tool_budget} 次），已返回部分结论")
+                        format!("达到工具预算（{} 次），已返回部分结论", tool_budget_cap.unwrap_or(0))
                     } else {
-                        format!("达到轮次上限（{steps} 轮），已返回部分结论")
+                        format!("达到轮次上限（{} 轮），已返回部分结论", steps_cap.unwrap_or(0))
                     };
                     return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                 }
@@ -1700,7 +1757,7 @@ pub(crate) async fn run_subagent(
         ChildOutcome {
             status: SubagentStatus::Completed,
             content: notes,
-            error: Some(format!("达到轮次上限（{steps} 轮），已返回部分结论")),
+            error: Some(format!("达到轮次上限（{} 轮），已返回部分结论", steps_cap.unwrap_or(0))),
             input_tokens,
             output_tokens,
             reasoning_tokens,
@@ -2664,24 +2721,26 @@ mod tests {
     fn subagent_tool_budget_defaults_and_clamps() {
         let mut definition = crate::domain::AgentDefinition::builtin("explore").unwrap();
         let empty = crate::domain::SubagentDefaults::default();
-        assert_eq!(subagent_tool_budget(&definition, &empty), crate::domain::DEFAULT_SUBAGENT_TOOL_BUDGET as usize);
+        // 未设置 = None（无硬顶）；显式设置仍 clamp。
+        assert_eq!(subagent_tool_budget(&definition, &empty), None);
         definition.tool_budget = Some(0);
-        assert_eq!(subagent_tool_budget(&definition, &empty), 1);
+        assert_eq!(subagent_tool_budget(&definition, &empty), Some(1));
         definition.tool_budget = Some(9999);
-        assert_eq!(subagent_tool_budget(&definition, &empty), crate::domain::MAX_SUBAGENT_TOOL_BUDGET as usize);
+        assert_eq!(subagent_tool_budget(&definition, &empty), Some(crate::domain::MAX_SUBAGENT_TOOL_BUDGET as usize));
         definition.tool_budget = Some(60);
-        assert_eq!(subagent_tool_budget(&definition, &empty), 60);
+        assert_eq!(subagent_tool_budget(&definition, &empty), Some(60));
     }
 
     #[test]
     fn subagent_defaults_form_the_middle_fallback_tier() {
         let mut definition = crate::domain::AgentDefinition::builtin("explore").unwrap();
         let defaults = crate::domain::SubagentDefaults { model: None, steps: Some(12), tool_budget: Some(42), max_parallel: Some(3), max_total: Some(9) };
-        // 未设置字段回退到全局默认；已设置字段（steps=Some(8)）agent 胜出。
-        assert_eq!(resolve_steps(&definition, &defaults), 8);
-        assert_eq!(subagent_tool_budget(&definition, &defaults), 42);
+        // 内建 steps=None（无硬顶）——回退到全局默认 12；agent 显式设置后胜出。
+        assert_eq!(resolve_steps(&definition, &defaults), Some(12));
+        assert_eq!(subagent_tool_budget(&definition, &defaults), Some(42));
+        definition.steps = Some(8);
+        assert_eq!(resolve_steps(&definition, &defaults), Some(8));
         definition.steps = None;
-        assert_eq!(resolve_steps(&definition, &defaults), 12);
         assert_eq!(resolve_max_parallel(&defaults), 3);
         assert_eq!(resolve_max_total(&defaults), 9);
         // 全局默认也未设置时回退内置；env 仅作未设置项的兜底。

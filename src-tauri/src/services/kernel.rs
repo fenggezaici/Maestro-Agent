@@ -4897,23 +4897,36 @@ mod tests {
         }
     }
 
+    /// 内建 explore 已无硬顶（ZCode 哲学）——测试收尾轮安全阀须显式设上限的
+    /// 自定义定义。克隆内建改名后写入全局，caps 由调用方按场景指定。
+    async fn save_capped_explore(kernel: &Arc<Kernel>, steps: Option<u32>, tool_budget: Option<u32>) {
+        let mut capped = crate::domain::AgentDefinition::builtin("explore").unwrap();
+        capped.name = "capped-explore".into();
+        capped.steps = steps;
+        capped.tool_budget = tool_budget;
+        kernel.save_agent("global".into(), capped).await.unwrap();
+    }
+
     async fn drive_explore_subagent(kernel: &Arc<Kernel>) -> String {
+        drive_typed_subagent(kernel, "capped-explore", &test_config()).await.unwrap()
+    }
+
+    async fn drive_typed_subagent(kernel: &Arc<Kernel>, subagent_type: &str, config: &ChatConfig) -> AppResult<String> {
         let (run_id, rx) = seed_run(kernel).await;
         let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
         crate::services::agent_loop::run_subagent(
             kernel.clone(),
-            &test_config(),
+            config,
             session_id,
             run_id,
             "sub-probe".into(),
-            r#"{"description":"测试调研","prompt":"调研仓库结构","subagent_type":"explore"}"#,
+            &format!(r#"{{"description":"测试调研","prompt":"调研仓库结构","subagent_type":"{subagent_type}"}}"#),
             rx,
             Arc::new(std::sync::atomic::AtomicUsize::new(4)),
             false,
             Vec::new(),
         )
         .await
-        .unwrap()
     }
 
     #[tokio::test]
@@ -4926,9 +4939,10 @@ mod tests {
         });
         let probe = provider.clone();
         *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        save_capped_explore(&kernel, Some(8), None).await;
         let summary = drive_explore_subagent(&kernel).await;
         let seen = provider.seen.lock().unwrap().clone();
-        // explore 内建 8 轮：前 7 轮带工具载荷，最后一轮工具必须为空。
+        // 显式 8 轮上限：前 7 轮带工具载荷，最后一轮工具必须为空。
         assert_eq!(seen.len(), 8, "应恰好跑满 8 轮：{seen:?}");
         assert!(seen[..7].iter().all(|count| *count > 0), "前 7 轮应带工具：{seen:?}");
         assert_eq!(seen[7], 0, "最后一轮工具必须剥离：{seen:?}");
@@ -4947,13 +4961,49 @@ mod tests {
         });
         let probe = provider.clone();
         *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        save_capped_explore(&kernel, None, Some(100)).await;
         let summary = drive_explore_subagent(&kernel).await;
         let seen = provider.seen.lock().unwrap().clone();
-        // 第一轮 120 次调用直接击穿 100 默认预算：第二轮即收尾轮。
+        // 第一轮 120 次调用直接击穿 100 显式预算：第二轮即收尾轮。
         assert_eq!(seen.len(), 2, "预算耗尽后只应再跑一个收尾轮：{seen:?}");
         assert_eq!(seen[1], 0, "收尾轮工具必须剥离：{seen:?}");
         assert!(summary.contains("最终综合结论"), "预算耗尽也必须拿到综合结论：{summary}");
         assert!(summary.contains("工具预算（100 次）"), "预算截断标注应透传父模型：{summary}");
+        kernel.shutdown().await.unwrap();
+    }
+
+    /// 永不输出永不返回的探针——模拟卡死的模型连接，喂给看门狗。
+    struct SilentProbeProvider;
+
+    impl LlmProvider for SilentProbeProvider {
+        fn stream<'a>(
+            self: Arc<Self>,
+            _config: &'a ChatConfig,
+            _messages: &'a [crate::domain::ChatMessage],
+            _tools: &'a [crate::domain::ToolSpec],
+            _cancel: &'a mut watch::Receiver<bool>,
+            _events: tokio::sync::mpsc::UnboundedSender<crate::adapters::llm::StreamEvent>,
+        ) -> futures_util::future::BoxFuture<'a, AppResult<crate::adapters::llm::TurnOutcome>> {
+            Box::pin(async move { std::future::pending::<AppResult<crate::adapters::llm::TurnOutcome>>().await })
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_stream_is_aborted_by_the_idle_watchdog() {
+        // 5s 是 env 下限——探针零输出，看门狗必须在此处而非总超时（1800s）处决。
+        // env 进程级共享但不影响并行测试：其余探针即时响应，远够不到静默阈值。
+        unsafe { std::env::set_var("MAESTRO_SUBAGENT_IDLE_TIMEOUT", "5") };
+        let (kernel, _) = test_kernel().await;
+        let probe = Arc::new(SilentProbeProvider);
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        save_capped_explore(&kernel, Some(8), None).await;
+        let started = std::time::Instant::now();
+        let outcome = drive_typed_subagent(&kernel, "capped-explore", &test_config()).await;
+        let elapsed = started.elapsed().as_secs();
+        // 失败如实以 Err 上抛（ZCode 口径：不 retry、不粉饰），父级拿到诊断原文。
+        let error = outcome.unwrap_err();
+        assert!(error.contains("静默"), "看门狗诊断应如实标注：{error}");
+        assert!(elapsed < 60, "看门狗必须在总超时前处决（实际 {elapsed}s）");
         kernel.shutdown().await.unwrap();
     }
 
@@ -4971,22 +5021,11 @@ mod tests {
         // 死于溢出。压缩记录落库是最硬的可观测断言面。
         let mut config = test_config();
         config.context_window = Some(400);
-        let (run_id, rx) = seed_run(&kernel).await;
+        // 探针永续吐工具调用——无硬顶下循环永不自然终止，须显式上限保证测试收口；
+        // 压缩是否中途接管不受上限影响（窗口 400 几轮即越线）。
+        save_capped_explore(&kernel, Some(6), None).await;
+        let summary = drive_typed_subagent(&kernel, "capped-explore", &config).await.unwrap();
         let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
-        let summary = crate::services::agent_loop::run_subagent(
-            kernel.clone(),
-            &config,
-            session_id,
-            run_id,
-            "sub-compact".into(),
-            r#"{"description":"压缩测试","prompt":"调研仓库结构","subagent_type":"explore"}"#,
-            rx,
-            Arc::new(std::sync::atomic::AtomicUsize::new(4)),
-            false,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
         let compactions = kernel.database.list_compactions(session_id).await.unwrap();
         assert!(
             compactions.iter().any(|c| c.status == "completed"),
