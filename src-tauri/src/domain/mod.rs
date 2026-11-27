@@ -19,7 +19,7 @@ pub mod user_question;
 
 pub use architecture::{
     armed_obligations, describe_obligation, effective_after_set, evaluate as evaluate_architecture,
-    obligation_trigger_ancestors, optional_extensions, parse_graph, path_matches,
+    merge_graphs, obligation_trigger_ancestors, optional_extensions, parse_graph, path_matches,
     required_extensions, subagent_bindings,
     squad_bindings, squad_plan, trigger_ancestors, validate_graph, ActionResult, ArmedObligation,
     ArchitectureGraph, BoundExtension, ExtensionData, ExtensionKind, ExtensionRequirement,

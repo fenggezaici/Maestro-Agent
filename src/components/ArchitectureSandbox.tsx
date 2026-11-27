@@ -665,7 +665,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   const [status, setStatus] = useState<{ kind: 'info' | 'ok' | 'error' | 'warn'; text: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [issues, setIssues] = useState<{ errors: string[]; warnings: string[] } | null>(null);
-  const [loaded, setLoaded] = useState<{ path: string | null; source: string } | null>(null);
+  const [loaded, setLoaded] = useState<{ path: string | null; source: string; mergedWith?: string | null } | null>(null);
   const [dirty, setDirty] = useState(false);
   const [showJson, setShowJson] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
@@ -795,7 +795,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
           setSquads({});
         }
         setOpenSquad(null);
-        setLoaded({ path: result.path, source: result.resolvedScope ?? scope });
+        setLoaded({ path: result.path, source: result.resolvedScope ?? scope, mergedWith: result.mergedWith });
         setDirty(false); dirtyRef.current = false;
         if (!result.error) setStatus(result.resolvedScope && result.resolvedScope !== scope
           ? { kind: 'info', text: `当前作用域无规则，已回退加载${result.resolvedScope === 'global' ? '全局' : '项目'}规则` }
@@ -1159,7 +1159,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     setStatus({ kind: 'info', text: '保存中…' });
     try {
       const result = await architectureApi.save(graph, scope);
-      setLoaded({ path: result.removed ? null : result.path, source: result.scope });
+      setLoaded((prev) => ({ path: result.removed ? null : result.path, source: result.scope, mergedWith: prev?.mergedWith }));
       setDirty(false); dirtyRef.current = false;
       setStatus({ kind: 'ok', text: result.removed ? `空画布已清空该作用域规则（回退生效）` : `已保存到 ${result.path}` });
     } catch (reason) {
@@ -1287,7 +1287,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
             <button type="button" className="toolbar-btn" onClick={() => setShowJson((v) => !v)}><FileCode2 size={13} /> JSON</button>
           </div>
           <div className="toolbar-group">
-            {loaded && <span className="toolbar-meta">{loaded.source === 'project' ? '项目' : loaded.source === 'global' ? '全局' : '示例'}{dirty && ' · 未保存'}</span>}
+            {loaded && <span className="toolbar-meta">{loaded.source === 'project' ? '项目' : loaded.source === 'global' ? '全局' : '示例'}{loaded.mergedWith ? ` · 与${loaded.mergedWith === 'project' ? '项目' : '全局'}规则合并生效` : ''}{dirty && ' · 未保存'}</span>}
             <button type="button" className="toolbar-btn primary" onClick={() => void save()} disabled={preview}>
               <Save size={13} /> 保存沙盘
             </button>

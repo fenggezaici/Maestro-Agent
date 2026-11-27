@@ -45,6 +45,9 @@ pub struct ArchitectureGraphView {
     pub resolved_scope: Option<String>,
     /// 运行期真正生效的作用域（项目文件存在→project，否则全局→global，全无→null）。
     pub effective_scope: Option<String>,
+    /// 与当前查看作用域**合并生效**的另一作用域（其规则文件存在时为其名）。
+    /// 运行时两图合并求值——本字段仅用于 UI 提示「此图会与另一份规则合并」。
+    pub merged_with: Option<String>,
     pub path: Option<String>,
     pub graph: Option<ArchitectureGraph>,
     /// 文件存在但解析/校验失败；保存端不会出现，运行端按「解析失败」处理。
@@ -107,6 +110,15 @@ pub fn view_for(
     workspace: Option<&Path>,
 ) -> AppResult<ArchitectureGraphView> {
     let effective_scope = effective_path(maestro_dir, workspace).map(|(scope, _)| scope.as_str().to_string());
+    // 运行时两图合并求值——标注另一作用域是否也有规则文件一并生效。
+    let other_scope = match scope {
+        GraphScope::Project => GraphScope::Global,
+        GraphScope::Global => GraphScope::Project,
+    };
+    let merged_with = rules_path(other_scope, maestro_dir, workspace)
+        .ok()
+        .filter(|path| path.is_file())
+        .map(|_| other_scope.as_str().to_string());
     match rules_path(scope, maestro_dir, workspace) {
         Ok(path) => {
             let (graph, error) = load_path(&path);
@@ -118,6 +130,7 @@ pub fn view_for(
                     None
                 },
                 effective_scope,
+                merged_with,
                 path: Some(path.to_string_lossy().into_owned()),
                 graph,
                 error,
@@ -127,6 +140,7 @@ pub fn view_for(
             scope: scope.as_str().to_string(),
             resolved_scope: None,
             effective_scope,
+            merged_with,
             path: None,
             graph: None,
             error: Some(reason),

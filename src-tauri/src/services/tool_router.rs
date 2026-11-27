@@ -303,24 +303,50 @@ impl ToolRouter {
     }
 
     /// （重）装载当前生效的架构规则：受信任项目根下的
-    /// `.maestro/graph_rules.json` 优先，否则全局 `~/.maestro/graph_rules.json`。
-    /// 工作区未受信任时项目规则不生效（与 skills/agents 同一信任语义）。
+    /// 全局 `~/.maestro/graph_rules.json` 与项目 `<workspace>/.maestro/graph_rules.json`
+    /// **合并生效**（项目覆盖冲突项，与 agents/skills 的按条目合并先例一致；
+    /// 不再整文件遮蔽）。工作区未受信任时项目规则不生效（同一信任语义）。
     pub async fn reload_architecture(&self) {
         let trusted = self
             .trusted_project_root(self.workspace.lock().await.as_deref())
             .await;
-        let found = crate::services::architecture::effective_path(
-            self.extensions.maestro_dir(),
-            trusted.as_deref(),
-        );
-        let state = match found {
-            Some((_, path)) => {
-                let (graph, error) = crate::services::architecture::load_path(&path);
-                ArchitectureState { graph, error }
+        let mut error: Option<String> = None;
+        let mut graphs: Vec<ArchitectureGraph> = Vec::new();
+        for path in [
+            Some(self.extensions.maestro_dir().join(crate::domain::RULES_FILE_NAME)),
+            trusted.map(|root| root.join(".maestro").join(crate::domain::RULES_FILE_NAME)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_file() {
+                continue;
             }
-            None => ArchitectureState::default(),
+            let (graph, file_error) = crate::services::architecture::load_path(&path);
+            if let Some(file_error) = file_error {
+                error.get_or_insert(file_error);
+            }
+            if let Some(graph) = graph {
+                graphs.push(graph);
+            }
+        }
+        // global 为底，project 覆盖（加载顺序即合并顺序）。
+        let mut iter = graphs.into_iter();
+        let merged = iter
+            .next()
+            .map(|first| iter.fold(first, crate::domain::merge_graphs));
+        // 合并结果防御性校验——非法则按规则损坏处理（fail-closed）。
+        let (graph, merge_error) = match merged {
+            Some(merged) => match crate::domain::validate_graph(&merged) {
+                Ok(()) => (Some(merged), None),
+                Err(reason) => (None, Some(reason)),
+            },
+            None => (None, None),
         };
-        *self.architecture.lock().await = state;
+        *self.architecture.lock().await = ArchitectureState {
+            graph,
+            error: merge_error.or(error),
+        };
     }
 
     /// 存在生效规则或规则文件损坏（损坏也要拦副作用工具）。

@@ -2059,6 +2059,54 @@ pub fn obligation_trigger_ancestors(graph: &ArchitectureGraph, node_id: &str) ->
     out
 }
 
+/// 双作用域合并：global 为底、project 覆盖——与 agents/skills 的
+/// builtin<global<project 按条目合并语义一致（不再是整文件遮蔽）。
+/// 同 id 节点/边 project 胜；squad 节点按 `data.squad` 名去重（同名 project 胜）；
+/// 悬空边（端点已被覆盖移除）剔除；squads 表同名 project 覆盖。
+pub fn merge_graphs(global: ArchitectureGraph, project: ArchitectureGraph) -> ArchitectureGraph {
+    let project_ids: HashSet<&str> = project.nodes.iter().map(|node| node.id.as_str()).collect();
+    let project_squad_names: HashSet<&str> = project
+        .nodes
+        .iter()
+        .filter(|node| NodeKind::parse(&node.node_type) == Some(NodeKind::Squad))
+        .filter_map(|node| node.data.squad.as_deref())
+        .collect();
+    let mut nodes: Vec<GraphNode> = global
+        .nodes
+        .into_iter()
+        .filter(|node| {
+            if project_ids.contains(node.id.as_str()) {
+                return false;
+            }
+            // squad 节点按军团名去重——同名军团以项目定义为准。
+            if NodeKind::parse(&node.node_type) == Some(NodeKind::Squad) {
+                if let Some(name) = node.data.squad.as_deref() {
+                    return !project_squad_names.contains(name);
+                }
+            }
+            true
+        })
+        .collect();
+    nodes.extend(project.nodes);
+    let node_ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let project_edge_ids: HashSet<&str> = project.edges.iter().map(|edge| edge.id.as_str()).collect();
+    let mut edges: Vec<GraphEdge> = global
+        .edges
+        .into_iter()
+        .filter(|edge| !project_edge_ids.contains(edge.id.as_str()))
+        .collect();
+    edges.extend(project.edges);
+    edges.retain(|edge| node_ids.contains(edge.source.as_str()) && node_ids.contains(edge.target.as_str()));
+    let mut squads = global.squads;
+    squads.extend(project.squads);
+    ArchitectureGraph {
+        version: global.version.max(project.version),
+        nodes,
+        edges,
+        squads,
+    }
+}
+
 /// 图中全部必选 Extension 节点（架构契约列举用）。
 pub fn required_extensions(graph: &ArchitectureGraph) -> Vec<&ExtensionData> {
     graph
@@ -3474,6 +3522,74 @@ mod tests {
         );
         let hit = evaluate(&g2, &write_call("src/a.ts", "x"), &[], 1, &snap, "");
         assert_eq!(hit.message.as_deref(), Some("先派 explore 再写"));
+    }
+
+    #[test]
+    fn merge_graphs_unions_scopes_with_project_precedence() {
+        // global：trigger + squad 义务边 + squads 表；project：trigger + 扩展链 + 同名军团。
+        let global = graph_with_squads(
+            vec![
+                node("gt", "trigger", json!({"action":"plan"})),
+                squad_node("gsq", "research-team"),
+                node("dup", "requirement", json!({"toolName":"global_tool"})),
+            ],
+            vec![
+                edge("ge1", "gt", "gsq", Some("out")),
+                edge("ge2", "dup", "gsq", Some("pass")),
+                edge("ge3", "gt", "dup", Some("out")),
+            ],
+            json!({ "research-team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        let project = graph_with_squads(
+            vec![
+                node("pt", "trigger", json!({"action":"modify"})),
+                node("dup", "requirement", json!({"toolName":"project_tool"})),
+                squad_node("psq", "research-team"), // 同名军团节点 → 覆盖 global
+            ],
+            vec![edge("pe1", "pt", "dup", Some("out")), edge("pe2", "dup", "psq", Some("pass"))],
+            json!({ "research-team": squad_json(vec![member_node("pm", "general", true)], vec![]) }),
+        );
+        let merged = merge_graphs(global, project);
+        // 节点并集：global squad 节点被同名 project 覆盖剔除，dup 被 project 覆盖。
+        assert_eq!(merged.nodes.len(), 4);
+        assert!(!merged.nodes.iter().any(|node| node.id == "gsq"));
+        let dup = merged.nodes.iter().find(|node| node.id == "dup").unwrap();
+        assert_eq!(dup.data.tool_name.as_deref(), Some("project_tool"));
+        // 悬空边剔除：ge1/ge2 指向已删除的 gsq → 丢；ge3 端点俱在 → 留。
+        assert_eq!(merged.edges.len(), 3);
+        assert!(merged.edges.iter().any(|edge| edge.id == "ge3"));
+        // squads 表同名 project 覆盖。
+        assert_eq!(merged.squads["research-team"].nodes[0].data.agent.as_deref(), Some("general"));
+        validate_graph(&merged).unwrap();
+    }
+
+    #[test]
+    fn merged_graph_evaluates_obligations_from_both_scopes() {
+        // 端到端用户场景：项目 trigger(plan) + 全局 squad 义务边——合并后同图求值。
+        let global = graph_with_squads(
+            vec![
+                node("gt", "trigger", json!({"action":"modify"})),
+                squad_node("gsq", "team"),
+            ],
+            vec![edge("ge1", "gt", "gsq", Some("out"))],
+            json!({ "team": squad_json(vec![member_node("m", "explore", true)], vec![]) }),
+        );
+        let project = graph(
+            vec![node("pt", "trigger", json!({"action":"plan"}))],
+            vec![],
+        );
+        let merged = merge_graphs(global, project);
+        validate_graph(&merged).unwrap();
+        let snap = snapshot();
+        // modify 调用命中全局义务链：未派发 → 拦。
+        assert!(evaluate(&merged, &write_call("src/a.ts", "x"), &[], 1, &snap, "").blocked);
+        // update_plan 命中项目 trigger（无下游）→ 不拦；两方各自生效。
+        let plan_call = PendingCall { tool: "update_plan".into(), target: "s".into(), content: None };
+        assert!(evaluate(&merged, &plan_call, &[], 1, &snap, "").matched);
+        assert!(!evaluate(&merged, &plan_call, &[], 1, &snap, "").blocked);
+        // 派发后 modify 放行。
+        let spawned = [history("spawn_subagent", "team/调研", 1)];
+        assert!(!evaluate(&merged, &write_call("src/a.ts", "x"), &spawned, 1, &snap, "").blocked);
     }
 
     #[test]

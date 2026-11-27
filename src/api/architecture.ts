@@ -94,6 +94,8 @@ export interface ArchitectureGraphView {
   resolvedScope: 'project' | 'global' | null;
   /** 运行期真正生效的作用域。 */
   effectiveScope: 'project' | 'global' | null;
+  /** 与当前作用域合并生效的另一作用域（其规则文件存在时为其名）。 */
+  mergedWith: 'project' | 'global' | null;
   path: string | null;
   graph: ArchitectureGraph | null;
   error: string | null;

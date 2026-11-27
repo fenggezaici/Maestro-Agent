@@ -1042,11 +1042,13 @@ impl Kernel {
         Ok(Self::format_subagent_reports(&traces))
     }
 
+    /// `history_target` 约定为 `"type/description"`——Requirement/派发义务按类型前缀命中。
     pub(crate) async fn record_spawn(
         &self,
         run_id: i64,
         subagent_id: &str,
         description: &str,
+        history_target: &str,
     ) {
         let _ = self
             .database
@@ -1059,7 +1061,7 @@ impl Kernel {
             .await;
         let _ = self
             .database
-            .record_tool_history(run_id, "spawn_subagent".into(), description.into())
+            .record_tool_history(run_id, "spawn_subagent".into(), history_target.into())
             .await;
     }
 
@@ -1918,6 +1920,51 @@ impl Kernel {
             );
         }
         (None, decision.reminder)
+    }
+
+    /// 特殊通道调用（`ask_user`/`spawn_subagent`——不走 execute_tool_calls）
+    /// 的架构检查：读最新会话历史，语义与批内 `architecture_gate` 一致。
+    /// `Ok(reminder)` 放行（reminder 附进工具结果）；`Err(reason)` 拦截。
+    pub(crate) async fn architecture_check_special(
+        &self,
+        run_id: i64,
+        session_id: i64,
+        tool: &str,
+        arguments_json: &str,
+        user_message: &str,
+    ) -> Result<Option<String>, String> {
+        if !self.router.has_architecture_rules().await {
+            return Ok(None);
+        }
+        let effect = match self.router.classify(tool).await {
+            Ok(effect) => effect,
+            Err(_) => return Ok(None),
+        };
+        let run_root = self.run_workspace_root(run_id).await;
+        let history = self
+            .database
+            .session_tool_history(session_id)
+            .await
+            .unwrap_or_default();
+        let target = ToolRouter::history_target(tool, arguments_json);
+        let decision = self
+            .router
+            .architecture_decision(
+                tool,
+                arguments_json,
+                effect,
+                &history,
+                run_id,
+                run_root.as_deref(),
+                user_message,
+            )
+            .await;
+        self.emit_architecture_trace(run_id, session_id, None, tool, &target, &decision)
+            .await;
+        if decision.blocked {
+            return Err(Self::architecture_reason(&decision));
+        }
+        Ok(decision.reminder)
     }
 
     /// 命中 Trigger 时向前端发出节点级执行轨迹（仅父 Run；子智能体评估
@@ -4705,4 +4752,104 @@ mod tests {
         kernel.finish(id, RunStatus::Cancelled, None).await;
         kernel.shutdown().await.unwrap();
     }
+
+    /// trigger(plan)→squad 派发义务图：全局/项目两文件各一段。
+    fn rules_json(squad_edge: bool) -> String {
+        let (nodes, edges, squads) = if squad_edge {
+            (
+                r#"[{"id":"gt","type":"trigger","position":{"x":0,"y":0},"data":{"action":"plan"}},
+                   {"id":"gsq","type":"squad","position":{"x":0,"y":0},"data":{"squad":"team"}}]"#,
+                r#"[{"id":"ge1","source":"gt","target":"gsq","sourceHandle":"out","targetHandle":"in"}]"#,
+                r#""squads":{"team":{"nodes":[{"id":"m","type":"subagent","position":{"x":0,"y":0},"data":{"agent":"explore"}}],"edges":[]}}"#,
+            )
+        } else {
+            (
+                r#"[{"id":"pt","type":"trigger","position":{"x":0,"y":0},"data":{"action":"modify","targetDir":"src"}},
+                   {"id":"pa","type":"action","position":{"x":0,"y":0},"data":{"result":"block","message":"stop"}}]"#,
+                r#"[{"id":"pe1","source":"pt","target":"pa","sourceHandle":"out","targetHandle":"in"}]"#,
+                r#""squads":{}"#,
+            )
+        };
+        format!(r#"{{"version":1,"nodes":{nodes},"edges":{edges},{squads}}}"#)
+    }
+
+    #[tokio::test]
+    async fn special_channel_calls_pass_through_architecture() {
+        // ask_user/spawn_subagent 不走 execute_tool_calls——专属检查要与
+        // 批内 gate 同语义：plan 触发链的派发义务拦 ask_user，spawn 自满足放行。
+        let (kernel, _) = test_kernel().await;
+        std::fs::write(
+            kernel.extensions().maestro_dir().join("graph_rules.json"),
+            rules_json(true),
+        )
+        .unwrap();
+        kernel.router.reload_architecture().await;
+        let (id, _rx) = seed_run(&kernel).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        // 未派发军团 → ask_user（plan 触发器覆盖）被拦。
+        let hit = kernel
+            .architecture_check_special(id, session_id, "ask_user", "{}", "调研")
+            .await;
+        assert!(hit.is_err(), "义务未满足应拦截 ask_user");
+        // spawn 派发该军团本身不被拦（self-satisfying）。
+        let spawn = kernel
+            .architecture_check_special(
+                id,
+                session_id,
+                "spawn_subagent",
+                r#"{"subagent_type":"team","description":"调研"}"#,
+                "调研",
+            )
+            .await;
+        assert!(spawn.is_ok(), "派发军团自身应放行");
+        // record_spawn 写入 "type/description" 历史 → 义务满足 → ask_user 放行。
+        kernel.record_spawn(id, "sa-1", "调研", "team/调研").await;
+        let pass = kernel
+            .architecture_check_special(id, session_id, "ask_user", "{}", "调研")
+            .await;
+        assert!(pass.is_ok(), "派发后应放行，此前 description 原文的历史 target 永不命中");
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn architecture_rules_merge_global_and_project() {
+        // 全局与项目规则文件合并生效（不再文件级遮蔽）：全局义务图 +
+        // 项目阻断图各自命中各自的链。
+        let (kernel, _) = test_kernel().await;
+        std::fs::write(
+            kernel.extensions().maestro_dir().join("graph_rules.json"),
+            rules_json(true),
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join(".maestro")).unwrap();
+        std::fs::write(
+            workspace.path().join(".maestro").join("graph_rules.json"),
+            rules_json(false),
+        )
+        .unwrap();
+        kernel
+            .trust_workspace(workspace.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+        kernel
+            .set_workspace_root(Some(workspace.path().to_path_buf()))
+            .await;
+        let (id, _rx) = seed_run(&kernel).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        // 项目图：写 src/ → 拦。
+        let project_hit = kernel
+            .architecture_check_special(id, session_id, "write_file", r#"{"path":"src/a.ts","content":"x"}"#, "")
+            .await;
+        assert!(project_hit.is_err(), "项目规则应命中：{}", project_hit.err().unwrap_or_default());
+        // 全局图：plan 触发链义务未满足 → 拦。
+        let global_hit = kernel
+            .architecture_check_special(id, session_id, "ask_user", "{}", "")
+            .await;
+        assert!(global_hit.is_err(), "全局军团义务应命中（合并后不再被项目文件遮蔽）");
+        kernel.finish(id, RunStatus::Cancelled, None).await;
+        kernel.shutdown().await.unwrap();
+    }
+
 }
