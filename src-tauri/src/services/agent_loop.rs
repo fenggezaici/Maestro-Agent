@@ -6,7 +6,7 @@
 /// 复刻别名而非导出，保持 kernel 内部类型私密）。
 type ToolPayload = (String, Vec<String>);
 
-use std::{sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{collections::HashMap, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
 
 use futures_util::future::join_all;
 
@@ -98,8 +98,10 @@ const SUBAGENT_HINT: &str = "当任务需要同时分析多个独立文件/目�
 const DEFAULT_SUBAGENT_PROMPT: &str = "你是只读研究子智能体。只使用提供的只读工具分析，不写文件、不执行命令；完成后用简洁中文给出结论、证据路径和风险。";
 
 /// Efficiency budget: broad research otherwise reads every file until timeout.
-fn subagent_budget_hint(tool_budget: usize) -> String {
-    format!("效率要求：先列出最关键的文件清单，再批量读取；不要重复读取同一文件；最多使用 {tool_budget} 次工具调用；接近预算或时间上限时立即输出已有结论、证据路径与风险，不要继续尝试。")
+/// 如实告知双约束——模型无法管理它看不见的限制；一轮可并行多调用是
+/// 小模型调研效率的关键，必须显式说明。
+fn subagent_budget_hint(steps: u32, tool_budget: usize) -> String {
+    format!("效率约束：你最多有 {steps} 轮对话和 {tool_budget} 次工具调用。一轮可以并行调用多个工具——先 repo_map 拿仓库全貌，再每轮批量并行读取多个关键文件；不要逐文件顺序读取，不要重复读取同一文件。接近上限时立即输出已有结论；最后一轮工具将被禁用，必须输出纯文本的最终结论、证据路径与风险。")
 }
 
 /// A child that stops producing progress must not hold the parent turn forever.
@@ -976,7 +978,6 @@ async fn run_squad_parallel(
         let member_id = next_subagent_id(run_id);
         let member_desc = format!("{description}·{}", member.agent);
         kernel.emit_spawn(run_id, &member_id, ToolPhase::Started, &member_desc).await;
-        kernel.record_spawn(run_id, &member_id, &member_desc).await;
         let mut grants = member.grants.clone();
         grants.extend(squad.squad_grants.clone());
         let arguments = serde_json::json!({
@@ -985,6 +986,14 @@ async fn run_squad_parallel(
             "prompt": prompt,
         })
         .to_string();
+        kernel
+            .record_spawn(
+                run_id,
+                &member_id,
+                &member_desc,
+                &crate::services::tool_router::ToolRouter::history_target("spawn_subagent", &arguments),
+            )
+            .await;
         jobs.push((member_id, member.agent.clone(), member_desc, arguments, grants));
     }
     let futures: Vec<_> = jobs
@@ -1044,7 +1053,7 @@ fn grant_satisfied(grant: &SubagentGrant, name: &str, arguments_json: &str) -> b
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_subagent(
+pub(crate) async fn run_subagent(
     kernel: Arc<Kernel>,
     config: &ChatConfig,
     session_id: i64,
@@ -1202,9 +1211,10 @@ async fn run_subagent(
     }
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
     let tool_budget = subagent_tool_budget(&definition, &defaults);
+    let steps = resolve_steps(&definition, &defaults);
     let dispatch_prompt = squad.as_ref().map(|squad| squad_dispatch_prompt(squad, &defaults)).unwrap_or_default();
     let system_prompt = format!("{}
-{}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(tool_budget), subagent_assembly_prompt(&grants), dispatch_prompt);
+{}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(steps, tool_budget), subagent_assembly_prompt(&grants), dispatch_prompt);
     // 必选装配：子循环内逐轮强制，全部真实调用后才允许收尾。
     let mut pending_grants: Vec<SubagentGrant> = grants
         .into_iter()
@@ -1280,10 +1290,12 @@ async fn run_subagent(
         // 硬终止，防止子智能体在小预算内反复相同调用空转。
         let mut doom = DoomGuard::default();
         let timeout_message = format!("子智能体超时（{}s）", timeout.as_secs());
-        for _ in 0..resolve_steps(&definition, &defaults) {
-            if tool_count >= tool_budget {
-                return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(format!("达到工具预算（{tool_budget} 次），已返回部分结论")), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
-            }
+        // 收尾轮哨兵：最后一轮或预算耗尽时触发一次无工具纯文本轮——
+        // 模型必须综合已收集证据输出结论，而不是直接返回旁白碎片。
+        // 收尾轮只跑一次（synthesis_done 防重复燃烧 LLM 调用）；超时仍
+        // 是硬墙，不假装有时间收尾。
+        let mut synthesis_done = false;
+        for iteration in 0..steps {
             if *cancel.borrow() {
                 return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
@@ -1291,6 +1303,16 @@ async fn run_subagent(
             if remaining.is_zero() {
                 return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
+            if synthesis_done {
+                break;
+            }
+            let budget_out = tool_count >= tool_budget;
+            let synthesis_round = budget_out || iteration + 1 >= steps;
+            if synthesis_round {
+                synthesis_done = true;
+                messages.push(ChatMessage::text("user", "【系统提示】这是最后一轮：工具已全部禁用。请立即基于已收集的证据输出最终结论——关键发现、证据文件路径与风险；不要尝试调用任何工具。"));
+            }
+            let round_tools: &[ToolSpec] = if synthesis_round { &[] } else { &tools };
             let mut attempt = 0;
             let (outcome, text) = loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1313,7 +1335,7 @@ async fn run_subagent(
                 ));
                 let streamed = tokio::time::timeout(
                     remaining,
-                    provider.clone().stream(&child_config, &messages, &tools, &mut cancel, tx),
+                    provider.clone().stream(&child_config, &messages, round_tools, &mut cancel, tx),
                 ).await;
                 let drained = consumer.await.unwrap_or_default();
                 if first_token_ms.is_none() {
@@ -1339,12 +1361,18 @@ async fn run_subagent(
                             continue;
                         }
                         if !partial.trim().is_empty() {
+                            if !notes.is_empty() {
+                                notes.push_str("\n\n");
+                            }
                             notes.push_str(&partial);
                         }
                         return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                     }
                     Err(_) => {
                         if !partial.trim().is_empty() {
+                            if !notes.is_empty() {
+                                notes.push_str("\n\n");
+                            }
                             notes.push_str(&partial);
                         }
                         return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
@@ -1355,12 +1383,48 @@ async fn run_subagent(
                 return ChildOutcome { status: SubagentStatus::Cancelled, content: notes, error: Some("子智能体已取消".into()), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
             }
             if !text.trim().is_empty() {
+                if !notes.is_empty() {
+                    notes.push_str("\n\n");
+                }
                 notes.push_str(&text);
                 if notes.len() > SUBAGENT_PARTIAL_BYTES {
                     notes = notes.chars().take(SUBAGENT_PARTIAL_BYTES).collect();
                 }
             }
+            // 收尾轮拦截：工具已剥离，正文即最终综合——无论是否还有必选
+            // 装配/必派成员未清，结论都必须送达父级（违例标注在循环外统一
+            // 追加）；模型仍空响应时落入既有空轮诊断路径。
+            if synthesis_round && !text.trim().is_empty() {
+                let error = if budget_out {
+                    format!("达到工具预算（{tool_budget} 次），已返回收尾结论")
+                } else {
+                    format!("达到轮次上限（{steps} 轮），已返回收尾结论")
+                };
+                return ChildOutcome { status: SubagentStatus::Completed, content: text, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
+            }
             if outcome.tool_calls.is_empty() {
+                // 收尾轮空转（正文为空——非空已在上方拦截返回）：没有更多轮次
+                // 可补救，提醒续跑只会撞上 synthesis_done 直接出循环。留审计后
+                // 如实以既有碎片收尾，耗尽原因按真实触发源区分。
+                if synthesis_round {
+                    kernel
+                        .audit_turn_anomaly(
+                            run_id,
+                            format!(
+                                "subagent={} synthesis_empty finish_reason={} dropped_tool_calls={}",
+                                subagent_id,
+                                outcome.finish_reason.as_deref().unwrap_or("none"),
+                                outcome.dropped_tool_calls
+                            ),
+                        )
+                        .await;
+                    let error = if budget_out {
+                        format!("达到工具预算（{tool_budget} 次），已返回部分结论")
+                    } else {
+                        format!("达到轮次上限（{steps} 轮），已返回部分结论")
+                    };
+                    return ChildOutcome { status: SubagentStatus::Completed, content: notes, error: Some(error), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
+                }
                 // 必选装配/必派成员未清：不收尾，附提醒续跑（步数上限兜底）——
                 // 与父级「正文已给但调用必须真实发生」同一口径。
                 if !pending_grants.is_empty() || !pending_members.is_empty() {
@@ -1465,7 +1529,14 @@ async fn run_subagent(
                         .unwrap_or_else(|| "军团成员任务".into());
                     let spawn_detail = format!("{member_type}/{member_desc}");
                     kernel.emit_spawn(run_id, &member_id, ToolPhase::Started, &spawn_detail).await;
-                    kernel.record_spawn(run_id, &member_id, &spawn_detail).await;
+                    kernel
+                        .record_spawn(
+                            run_id,
+                            &member_id,
+                            &spawn_detail,
+                            &crate::services::tool_router::ToolRouter::history_target("spawn_subagent", &call.arguments),
+                        )
+                        .await;
                     member_spawns.push((index, member_id, member.clone(), call.arguments.clone(), member_desc));
                 } else if allowed_names.iter().any(|name| name == &call.name) {
                     runnable.push((call.name.clone(), call.arguments.clone()));
@@ -1571,7 +1642,7 @@ async fn run_subagent(
         ChildOutcome {
             status: SubagentStatus::Completed,
             content: notes,
-            error: Some("达到工具轮次上限，已返回部分结论".into()),
+            error: Some(format!("达到轮次上限（{steps} 轮），已返回部分结论")),
             input_tokens,
             output_tokens,
             reasoning_tokens,
@@ -1604,6 +1675,13 @@ async fn run_subagent(
             "\n【编排违例】军团指挥未派发必选成员：{}——如结论依赖这些视角，请补齐后重派。",
             pending_members.join("、"),
         ));
+    }
+    // 截断标注透传父模型：耗尽/收尾的调研不是完整证据——此前只进 UI
+    // 视图，父级会把部分结论当完整调研采信。
+    if status == SubagentStatus::Completed {
+        if let Some(note) = &error {
+            summary.push_str(&format!("\n【调研受限】{note}——结论基于已收集证据，可能不完整。"));
+        }
     }
     let _ = kernel.finish_subagent(&subagent_id, status, summary.clone(), error.clone(), content.clone(), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens).await;
     if status == SubagentStatus::Cancelled {
@@ -1806,6 +1884,8 @@ pub(crate) async fn run(
             let mut normal_indices: Vec<usize> = Vec::new();
             let mut spawns = Vec::new();
             let mut asks = Vec::new();
+            // 特殊通道（spawn/ask）的架构放行附言——跟结果文本一起回喂。
+            let mut spawn_reminders: HashMap<usize, Option<String>> = HashMap::new();
             // 停滞检测 pre-pass：按序计数同名同参连续调用。
             // Warn 照常执行（结果尾部附警告）；Block 不执行改喂合成错误；
             // Abort 记录后在本轮消息落库后硬终止。
@@ -1833,6 +1913,16 @@ pub(crate) async fn run(
                     continue;
                 }
                 if call.name == "spawn_subagent" {
+                    // 特殊通道也过架构求值——`any`/`prompt` 链、派发义务
+                    // （spawn 自身满足不互锁）与普通调用同语义。
+                    let check = kernel
+                        .architecture_check_special(run.id, run.session_id, "spawn_subagent", &call.arguments, &run.prompt)
+                        .await;
+                    if let Err(reason) = check {
+                        results[index] = Some(Err(reason));
+                        continue;
+                    }
+                    spawn_reminders.insert(index, check.unwrap_or_default());
                     if spawns.len() >= resolve_max_parallel(&subagent_defaults) {
                         results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", resolve_max_parallel(&subagent_defaults))));
                         continue;
@@ -1842,10 +1932,27 @@ pub(crate) async fn run(
                         .unwrap_or_else(|| "研究子任务".into());
                     let subagent_id = next_subagent_id(run.id);
                     kernel.emit_spawn(run.id, &subagent_id, ToolPhase::Started, &description).await;
-                    kernel.record_spawn(run.id, &subagent_id, &description).await;
+                    kernel
+                        .record_spawn(
+                            run.id,
+                            &subagent_id,
+                            &description,
+                            &crate::services::tool_router::ToolRouter::history_target("spawn_subagent", &call.arguments),
+                        )
+                        .await;
                     spawns.push((index, subagent_id, call.arguments.clone(), description));
                 } else if call.name == "ask_user" {
-                    asks.push((index, call.arguments.clone()));
+                    // 与 spawn 同理过架构求值——`plan` 触发器覆盖 ask_user。
+                    match kernel
+                        .architecture_check_special(run.id, run.session_id, "ask_user", &call.arguments, &run.prompt)
+                        .await
+                    {
+                        Ok(reminder) => {
+                            spawn_reminders.insert(index, reminder);
+                            asks.push((index, call.arguments.clone()));
+                        }
+                        Err(reason) => results[index] = Some(Err(reason)),
+                    }
                 } else {
                     normal_calls.push((call.name.clone(), call.arguments.clone()));
                     normal_indices.push(index);
@@ -1853,7 +1960,10 @@ pub(crate) async fn run(
             }
             for (position, (index, arguments)) in asks.into_iter().enumerate() {
                 let result = if position == 0 {
-                    kernel.ask_user(run.id, &arguments, cancel.clone()).await.map(|text| (text, Vec::new()))
+                    kernel.ask_user(run.id, &arguments, cancel.clone()).await.map(|text| {
+                        let reminder = spawn_reminders.remove(&index).flatten();
+                        (reminder.map(|r| format!("{text}\n\n{r}")).unwrap_or(text), Vec::new())
+                    })
                 } else {
                     Err("同一轮最多提出 1 个问题".into())
                 };
@@ -1876,7 +1986,10 @@ pub(crate) async fn run(
             for ((index, subagent_id, _, description), result) in spawns.into_iter().zip(spawned) {
                 let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
                 kernel.emit_spawn(run.id, &subagent_id, if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
-                results[index] = Some(result.map(|text| (text, Vec::new())));
+                let reminder = spawn_reminders.remove(&index).flatten();
+                results[index] = Some(result.map(|text| {
+                    (reminder.map(|r| format!("{text}\n\n{r}")).unwrap_or(text), Vec::new())
+                }));
             }
             if !normal_calls.is_empty() {
                 let normal_results = kernel.execute_tool_calls(run.id, &normal_calls).await;

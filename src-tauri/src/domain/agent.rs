@@ -56,7 +56,7 @@ fn default_mode() -> String { "subagent".into() }
 /// Default tool-call budget when a definition does not set `tool_budget`.
 pub const DEFAULT_SUBAGENT_TOOL_BUDGET: u32 = 100;
 /// Upper bound applied to a configured budget to catch absurd values.
-pub const MAX_SUBAGENT_TOOL_BUDGET: u32 = 500;
+pub const MAX_SUBAGENT_TOOL_BUDGET: u32 = 1000;
 
 /// Global defaults for every subagent field; a `None` field on an
 /// `AgentDefinition` falls back here before the built-in constant. Stored at
@@ -82,7 +82,7 @@ impl AgentDefinition {
                 name: "explore".into(),
                 description: "只读代码调研：并行查找文件、证据路径与风险".into(),
                 category: Some("研究".into()), mode: "subagent".into(), model: None,
-                prompt: "你是只读代码调研子智能体。只使用提供的只读工具并行查找证据，不写文件、不执行命令；输出结论、证据路径和风险。".into(),
+                prompt: "你是只读代码调研子智能体。工作流程：第一轮优先用 repo_map 获取仓库符号全貌（陌生代码库），按需用 glob_files/grep_files 精确定位，然后每轮批量并行 read_file 多个关键文件；不写文件、不执行命令；输出结论、证据路径和风险。".into(),
                 tools: vec!["read_file".into(), "list_dir".into(), "load_skill".into()],
                 steps: Some(8), tool_budget: None, hidden: false, color: Some("#8B5CF6".into()), source: AgentSource::Builtin,
             }),
@@ -90,7 +90,7 @@ impl AgentDefinition {
                 name: "general".into(),
                 description: "只读分析总结：整理多来源信息并给出结论".into(),
                 category: Some("研究".into()), mode: "subagent".into(), model: None,
-                prompt: "你是只读分析子智能体。只使用提供的只读工具分析，不写文件、不执行命令；输出结论、证据路径和风险。".into(),
+                prompt: "你是只读分析子智能体。工作流程：每轮批量并行读取多个关键文件，避免逐文件顺序读取；不写文件、不执行命令；输出结论、证据路径和风险。".into(),
                 tools: vec!["read_file".into(), "list_dir".into(), "load_skill".into()],
                 steps: Some(8), tool_budget: None, hidden: false, color: Some("#22D3EE".into()), source: AgentSource::Builtin,
             }),

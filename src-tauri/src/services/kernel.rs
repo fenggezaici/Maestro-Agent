@@ -4852,4 +4852,121 @@ mod tests {
         kernel.shutdown().await.unwrap();
     }
 
+    /// 收尾轮探针 provider：记录每轮 tools 载荷长度；工具被剥离时输出
+    /// 最终结论文本，否则按 fanout 扇出互异 read_file 调用（避开停滞检测）。
+    struct SynthProbeProvider {
+        seen: StdMutex<Vec<usize>>,
+        counter: std::sync::atomic::AtomicUsize,
+        fanout: usize,
+    }
+
+    impl LlmProvider for SynthProbeProvider {
+        fn stream<'a>(
+            self: Arc<Self>,
+            _config: &'a ChatConfig,
+            _messages: &'a [crate::domain::ChatMessage],
+            tools: &'a [crate::domain::ToolSpec],
+            _cancel: &'a mut watch::Receiver<bool>,
+            events: tokio::sync::mpsc::UnboundedSender<crate::adapters::llm::StreamEvent>,
+        ) -> futures_util::future::BoxFuture<'a, AppResult<crate::adapters::llm::TurnOutcome>> {
+            self.seen.lock().unwrap().push(tools.len());
+            let stripped = tools.is_empty();
+            let fanout = self.fanout;
+            let base = self.counter.fetch_add(fanout, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                use crate::adapters::llm::{StreamEvent, TurnOutcome};
+                if stripped {
+                    let _ = events.send(StreamEvent::Token("最终综合结论".into()));
+                    let _ = events.send(StreamEvent::Done);
+                    return Ok(TurnOutcome {
+                        done: true,
+                        tool_calls: Vec::new(),
+                        content: "最终综合结论".into(),
+                        thinking: None,
+                        finish_reason: None,
+                        dropped_tool_calls: 0,
+                        input_tokens: None,
+                    });
+                }
+                let _ = events.send(StreamEvent::Token("继续读取".into()));
+                let _ = events.send(StreamEvent::Done);
+                let tool_calls = (0..fanout)
+                    .map(|i| crate::domain::ToolCallSpec {
+                        id: format!("call-{}", base + i),
+                        name: "read_file".into(),
+                        arguments: format!("{{\"path\":\"f{}.rs\"}}", base + i),
+                    })
+                    .collect();
+                Ok(TurnOutcome {
+                    done: true,
+                    tool_calls,
+                    content: "继续读取".into(),
+                    thinking: None,
+                    finish_reason: None,
+                    dropped_tool_calls: 0,
+                    input_tokens: None,
+                })
+            })
+        }
+    }
+
+    async fn drive_explore_subagent(kernel: &Arc<Kernel>) -> String {
+        let (run_id, rx) = seed_run(kernel).await;
+        let session_id = kernel.database.list_runs().await.unwrap()[0].session_id;
+        crate::services::agent_loop::run_subagent(
+            kernel.clone(),
+            &test_config(),
+            session_id,
+            run_id,
+            "sub-probe".into(),
+            r#"{"description":"测试调研","prompt":"调研仓库结构","subagent_type":"explore"}"#,
+            rx,
+            Arc::new(std::sync::atomic::AtomicUsize::new(4)),
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn final_step_strips_tools_and_returns_a_synthesis() {
+        let (kernel, _) = test_kernel().await;
+        let provider = Arc::new(SynthProbeProvider {
+            seen: StdMutex::new(Vec::new()),
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            fanout: 1,
+        });
+        let probe = provider.clone();
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        let summary = drive_explore_subagent(&kernel).await;
+        let seen = provider.seen.lock().unwrap().clone();
+        // explore 内建 8 轮：前 7 轮带工具载荷，最后一轮工具必须为空。
+        assert_eq!(seen.len(), 8, "应恰好跑满 8 轮：{seen:?}");
+        assert!(seen[..7].iter().all(|count| *count > 0), "前 7 轮应带工具：{seen:?}");
+        assert_eq!(seen[7], 0, "最后一轮工具必须剥离：{seen:?}");
+        assert!(summary.contains("最终综合结论"), "收尾结论必须送达父级：{summary}");
+        assert!(summary.contains("轮次上限（8 轮）"), "截断标注应透传父模型：{summary}");
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_triggers_the_synthesis_round_instead_of_fragments() {
+        let (kernel, _) = test_kernel().await;
+        let provider = Arc::new(SynthProbeProvider {
+            seen: StdMutex::new(Vec::new()),
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            fanout: 120,
+        });
+        let probe = provider.clone();
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        let summary = drive_explore_subagent(&kernel).await;
+        let seen = provider.seen.lock().unwrap().clone();
+        // 第一轮 120 次调用直接击穿 100 默认预算：第二轮即收尾轮。
+        assert_eq!(seen.len(), 2, "预算耗尽后只应再跑一个收尾轮：{seen:?}");
+        assert_eq!(seen[1], 0, "收尾轮工具必须剥离：{seen:?}");
+        assert!(summary.contains("最终综合结论"), "预算耗尽也必须拿到综合结论：{summary}");
+        assert!(summary.contains("工具预算（100 次）"), "预算截断标注应透传父模型：{summary}");
+        kernel.shutdown().await.unwrap();
+    }
 }
