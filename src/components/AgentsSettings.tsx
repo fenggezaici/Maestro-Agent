@@ -44,7 +44,7 @@ export default function AgentsSettings({ preview, focus }: { preview: boolean; f
   }, [preview]);
 
   const patchDefaults = (value: Partial<AgentDefaults>) => { setDefaults((current) => ({ ...current, ...value })); setDefaultsNote(null); };
-  const numberOrNull = (raw: string, min = 1, max = 64) => {
+  const numberOrNull = (raw: string, min = 1, max = 128) => {
     if (raw.trim() === '') return null;
     const value = Number(raw);
     return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : null;
@@ -96,11 +96,11 @@ export default function AgentsSettings({ preview, focus }: { preview: boolean; f
     <h4 className="agents-section-title">全局默认</h4>
     <div className="agent-editor">
       <label>默认模型（留空跟随会话）<input value={defaults.model ?? ''} onChange={(event) => patchDefaults({ model: event.target.value.trim() || null })} placeholder="跟随会话模型" /></label>
-      <label>默认轮次上限<input type="number" min={1} max={64} value={defaults.steps ?? ''} placeholder="8" onChange={(event) => patchDefaults({ steps: numberOrNull(event.target.value) })} /></label>
-      <label>默认工具预算（次）<input type="number" min={1} max={500} value={defaults.toolBudget ?? ''} placeholder="100" onChange={(event) => patchDefaults({ toolBudget: numberOrNull(event.target.value, 1, 500) })} /></label>
+      <label>默认轮次上限（LLM 对话轮）<input type="number" min={1} max={128} value={defaults.steps ?? ''} placeholder="8" onChange={(event) => patchDefaults({ steps: numberOrNull(event.target.value) })} /></label>
+      <label>默认工具预算（工具调用总次数）<input type="number" min={1} max={1000} value={defaults.toolBudget ?? ''} placeholder="100" onChange={(event) => patchDefaults({ toolBudget: numberOrNull(event.target.value, 1, 1000) })} /></label>
       <label>每轮并行上限<input type="number" min={1} max={4} value={defaults.maxParallel ?? ''} placeholder="2" onChange={(event) => patchDefaults({ maxParallel: numberOrNull(event.target.value, 1, 4) })} /></label>
       <label>单 run 总额度<input type="number" min={1} max={16} value={defaults.maxTotal ?? ''} placeholder="8" onChange={(event) => patchDefaults({ maxTotal: numberOrNull(event.target.value, 1, 16) })} /></label>
-      <p className="agent-editor-note agent-editor-wide">留空回退内置默认；每个子智能体的字段留空则继承这里的全局默认（模型最终回退到会话模型）。</p>
+      <p className="agent-editor-note agent-editor-wide">留空回退内置默认；每个子智能体的字段留空则继承这里的全局默认（模型最终回退到会话模型）。一轮对话可包含多个并行工具调用——通常轮次先耗尽；耗尽前最后一轮会禁用工具、强制输出纯文本收尾结论，不会静默返回空报告。</p>
       <div className="agent-editor-actions">{defaultsNote && <span className="agent-editor-note">{defaultsNote}</span>}<button type="button" className="button-approve" onClick={saveDefaults}>保存全局默认</button></div>
     </div>
     <h4 className="agents-section-title">单个子智能体</h4>
@@ -119,8 +119,8 @@ export default function AgentsSettings({ preview, focus }: { preview: boolean; f
       <label>描述<input value={draft.agent.description} onChange={(event) => patch({ description: event.target.value })} /></label>
       <label>分类<input value={draft.agent.category ?? ''} onChange={(event) => patch({ category: event.target.value })} /></label>
       <label>模型（留空继承全局默认/会话）<input value={draft.agent.model ?? ''} onChange={(event) => patch({ model: event.target.value || null })} /></label>
-      <label>轮次上限（留空继承）<input type="number" min={1} max={64} value={draft.agent.steps ?? ''} placeholder={String(defaults.steps ?? 8)} onChange={(event) => patch({ steps: numberOrNull(event.target.value) })} /></label>
-      <label>工具预算（次，留空继承）<input type="number" min={1} max={500} value={draft.agent.toolBudget ?? ''} placeholder={String(defaults.toolBudget ?? 100)} onChange={(event) => patch({ toolBudget: numberOrNull(event.target.value, 1, 500) })} /></label>
+      <label>轮次上限（LLM 对话轮，留空继承）<input type="number" min={1} max={128} value={draft.agent.steps ?? ''} placeholder={String(defaults.steps ?? 8)} onChange={(event) => patch({ steps: numberOrNull(event.target.value) })} /></label>
+      <label>工具预算（调用总次数，留空继承）<input type="number" min={1} max={1000} value={draft.agent.toolBudget ?? ''} placeholder={String(defaults.toolBudget ?? 100)} onChange={(event) => patch({ toolBudget: numberOrNull(event.target.value, 1, 1000) })} /></label>
       <label>作用域<select value={draft.scope} disabled={!draft.isNew} onChange={(event) => setDraft({ ...draft, scope: event.target.value as Draft['scope'] })}><option value="global">全局 ~/.maestro/agents</option><option value="project" disabled={!hasWorkspace}>项目 &lt;workspace&gt;/.maestro/agents</option></select></label>
       <label className="agent-editor-wide agent-disabled-toggle"><input type="checkbox" checked={draft.agent.hidden} onChange={(event) => patch({ hidden: event.target.checked })} />禁用（hidden：从派发枚举与沙盘物料中隐藏，定义保留）</label>
       <div className="agent-editor-wide agent-tools"><span>只读工具</span>{READ_ONLY_TOOLS.map((tool) => <label key={tool}><input type="checkbox" checked={draft.agent.tools.includes(tool)} onChange={() => toggleTool(tool)} />{tool}</label>)}<small>全不勾选时使用全部只读工具</small></div>
