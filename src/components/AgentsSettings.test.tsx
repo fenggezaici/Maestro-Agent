@@ -54,12 +54,11 @@ describe('AgentsSettings', () => {
     render(<AgentsSettings preview={false} focus={{ name: null, tick: 1 }} />);
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'reviewer' } });
     fireEvent.change(screen.getByLabelText('描述'), { target: { value: '代码评审' } });
-    fireEvent.change(screen.getByLabelText('工具预算（调用总次数，留空继承）'), { target: { value: '250' } });
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent', {
       scope: 'global',
-      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', toolBudget: 250, source: 'global' }),
+      agent: expect.objectContaining({ name: 'reviewer', description: '代码评审', mode: 'subagent', source: 'global' }),
     }));
   });
 
@@ -73,22 +72,9 @@ describe('AgentsSettings', () => {
   it('saves global defaults through save_agent_defaults', async () => {
     render(<AgentsSettings preview={false} />);
     await screen.findByLabelText('选择要配置的子智能体');
-    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮，留空不限）'), { target: { value: '12' } });
-    fireEvent.change(screen.getByLabelText('单 run 总额度'), { target: { value: '12' } });
     fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent_defaults', {
-      defaults: expect.objectContaining({ steps: 12, maxTotal: 12 }),
-    }));
-  });
-
-  it('clamps numeric fields to the raised caps (128 steps / 1000 budget)', async () => {
-    render(<AgentsSettings preview={false} />);
-    await screen.findByLabelText('选择要配置的子智能体');
-    fireEvent.change(screen.getByLabelText('默认轮次上限（LLM 对话轮，留空不限）'), { target: { value: '999' } });
-    fireEvent.change(screen.getByLabelText('默认工具预算（工具调用总次数，留空不限）'), { target: { value: '99999' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('save_agent_defaults', {
-      defaults: expect.objectContaining({ steps: 128, toolBudget: 1000 }),
+      defaults: expect.objectContaining({ steps: null, maxTotal: null }),
     }));
   });
 

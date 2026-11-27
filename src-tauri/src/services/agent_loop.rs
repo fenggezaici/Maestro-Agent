@@ -6,7 +6,7 @@
 /// 复刻别名而非导出，保持 kernel 内部类型私密）。
 type ToolPayload = (String, Vec<String>);
 
-use std::{collections::HashMap, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{collections::HashMap, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
 
 use futures_util::future::join_all;
 
@@ -133,7 +133,7 @@ fn subagent_idle_timeout() -> Duration {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (5..=600).contains(value))
-            .unwrap_or(120),
+            .unwrap_or(300),
     )
 }
 /// Partial findings kept when a child times out or exhausts its step budget.
@@ -821,45 +821,12 @@ fn child_session_id(parent: Option<&str>, subagent_id: &str) -> String {
     format!("{}-sub-{subagent_id}", parent.unwrap_or("maestro"))
 }
 
-/// 每轮并行上限：~/.maestro/agents.json > env MAESTRO_MAX_SUBAGENTS > 2（范围 1-4）。
-fn resolve_max_parallel(defaults: &crate::domain::SubagentDefaults) -> usize {
-    // 上限 8 是 provider 限速现实下的诚实天花板（ZCode 完全不设限——
-    //  GLM/deepseek 网关并发流超限会被踢回，过大扇出是自欺）。
-    if let Some(value) = defaults.max_parallel {
-        return (value as usize).clamp(1, 8);
-    }
-    std::env::var("MAESTRO_MAX_SUBAGENTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=8).contains(value))
-        .unwrap_or(4)
-}
 
-/// Run 级子智能体总额度（含军团成员/孙级），防扇出：
-/// agents.json > env MAESTRO_MAX_TOTAL_SUBAGENTS > 8（范围 1-16）。
-fn resolve_max_total(defaults: &crate::domain::SubagentDefaults) -> usize {
-    if let Some(value) = defaults.max_total {
-        return (value as usize).clamp(1, 16);
-    }
-    std::env::var("MAESTRO_MAX_TOTAL_SUBAGENTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=16).contains(value))
-        .unwrap_or(8)
-}
-
-/// steps 解析链：definition → 全局默认 → 8（0 视为未设置）。
 fn resolve_steps(definition: &crate::domain::AgentDefinition, defaults: &crate::domain::SubagentDefaults) -> Option<u32> {
     // None = 无硬顶：循环跑到模型自然收尾（ZCode 内建不设 maxTurns 同款）。
     definition.steps.or(defaults.steps).filter(|value| *value > 0)
 }
 
-/// 预算原子扣减：到 0 返回 false（fetch_update 失败时不写回，语义精确）。
-fn try_spawn_budget(budget: &AtomicUsize) -> bool {
-    budget
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
-        .is_ok()
-}
 
 /// 装配契约段：拼进子系统提示——必选/可选条目 + 必选 Skill 正文预注入。
 /// 与父级 architecture_brief 同口径：正文已给，但工具调用仍必须真实发生。
@@ -937,7 +904,7 @@ fn pending_grants_reminder(pending: &[SubagentGrant]) -> String {
 }
 
 /// 指挥系统提示追加：军团编排契约——成员 enum、必选派发、只读语义。
-fn squad_dispatch_prompt(squad: &ResolvedSquad, defaults: &crate::domain::SubagentDefaults) -> String {
+fn squad_dispatch_prompt(squad: &ResolvedSquad) -> String {
     let required: Vec<&str> = squad
         .members
         .iter()
@@ -951,8 +918,7 @@ fn squad_dispatch_prompt(squad: &ResolvedSquad, defaults: &crate::domain::Subage
         .map(|member| member.agent.as_str())
         .collect();
     format!(
-        "\n【军团编排】你是本军团的指挥：可用 spawn_subagent 向成员派发只读研究任务（同一轮最多 {} 个，本 run 总名额有限）。必选成员（收尾前必须实际派发）：{}。可选成员：{}。成员只读并返回摘要作为证据；不要试图派发成员之外的类型。",
-        resolve_max_parallel(defaults),
+        "\n【军团编排】你是本军团的指挥：可用 spawn_subagent 向成员派发只读研究任务。必选成员（收尾前必须实际派发）：{}。可选成员：{}。成员只读并返回摘要作为证据；不要试图派发成员之外的类型。",
         if required.is_empty() { "无".into() } else { required.join("、") },
         if optional.is_empty() { "无".into() } else { optional.join("、") },
     )
@@ -989,7 +955,6 @@ async fn run_squad_parallel(
     prompt: &str,
     description: &str,
     parent_cancel: watch::Receiver<bool>,
-    spawn_budget: Arc<AtomicUsize>,
 ) -> AppResult<String> {
     if squad.members.is_empty() {
         return Err("军团没有成员子智能体".into());
@@ -1029,7 +994,6 @@ async fn run_squad_parallel(
                 member_id.clone(),
                 arguments,
                 parent_cancel.clone(),
-                spawn_budget.clone(),
                 false,
                 grants.clone(),
             ))
@@ -1083,8 +1047,6 @@ pub(crate) async fn run_subagent(
     subagent_id: String,
     arguments_json: &str,
     mut parent_cancel: watch::Receiver<bool>,
-    // 全 run 子智能体总额度（含成员/孙级）——每个真实子循环入口各扣 1。
-    spawn_budget: Arc<AtomicUsize>,
     // 成员/孙级递归传 false：军团成员只引用 agent 定义，禁止军团套军团。
     resolve_squad: bool,
     // 军团级/成员级图谱补充授权（并入本调用 grants）。
@@ -1121,7 +1083,7 @@ pub(crate) async fn run_subagent(
             // 并行军团：无指挥——本调用 fan-out 全部成员，结果合并为一条。
             return run_squad_parallel(
                 kernel, config, session_id, run_id, squad, &prompt, &description,
-                parent_cancel, spawn_budget,
+                parent_cancel,
             )
             .await;
         }
@@ -1144,10 +1106,6 @@ pub(crate) async fn run_subagent(
     };
     if definition.hidden || definition.mode != "subagent" {
         return Err(format!("子智能体 {subagent_type} 未启用：hidden 或 mode 不是 subagent"));
-    }
-    // 每个真实子循环入口各扣 1 份 run 总额度（军团成员/孙级同样计）。
-    if !try_spawn_budget(&spawn_budget) {
-        return Err("本 run 子智能体总额度已用完（可在「设置 → 子智能体」或经 MAESTRO_MAX_TOTAL_SUBAGENTS 调整）".into());
     }
     // 全局默认（~/.maestro/agents.json）：per-agent 留空字段的第二级回退。
     let defaults = kernel.agent_defaults()?;
@@ -1236,7 +1194,7 @@ pub(crate) async fn run_subagent(
     let allowed_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
     let tool_budget_cap = subagent_tool_budget(&definition, &defaults);
     let steps_cap = resolve_steps(&definition, &defaults);
-    let dispatch_prompt = squad.as_ref().map(|squad| squad_dispatch_prompt(squad, &defaults)).unwrap_or_default();
+    let dispatch_prompt = squad.as_ref().map(squad_dispatch_prompt).unwrap_or_default();
     let system_prompt = format!("{}
 {}{}{}", if definition.prompt.trim().is_empty() { DEFAULT_SUBAGENT_PROMPT.to_string() } else { definition.prompt.clone() }, subagent_budget_hint(steps_cap, tool_budget_cap), subagent_assembly_prompt(&grants), dispatch_prompt);
     // 必选装配：子循环内逐轮强制，全部真实调用后才允许收尾。
@@ -1629,14 +1587,6 @@ pub(crate) async fn run_subagent(
                         )));
                         continue;
                     };
-                    if member_spawns.len() >= resolve_max_parallel(&defaults) {
-                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", resolve_max_parallel(&defaults))));
-                        continue;
-                    }
-                    if !try_spawn_budget(&spawn_budget) {
-                        results[index] = Some(Err("本 run 子智能体总额度已用完".into()));
-                        continue;
-                    }
                     let member_id = next_subagent_id(run_id);
                     let member_desc = serde_json::from_str::<serde_json::Value>(&call.arguments)
                         .ok()
@@ -1679,7 +1629,6 @@ pub(crate) async fn run_subagent(
                             member_id.clone(),
                             arguments,
                             cancel.clone(),
-                            spawn_budget.clone(),
                             false,
                             grants,
                         ))
@@ -1831,9 +1780,6 @@ pub(crate) async fn run(
         let max_rounds = max_tool_rounds();
         let mut last_input_tokens: Option<u64> = None;
         let mut compaction_failures = 0u32;
-        // 全 run 子智能体总额度（父级 spawn、军团成员、孙级同池扣减）——防扇出。
-        let subagent_defaults = kernel.agent_defaults()?;
-        let spawn_budget = Arc::new(AtomicUsize::new(resolve_max_total(&subagent_defaults)));
         // 事后验收追问上限：模型无视欠账连续收尾时避免死循环，2 次后放行。
         // 会话级欠账仍在——下一轮首个实质调用照样被 Layer-B 拦。
         let mut post_nudges = 0u32;
@@ -2040,10 +1986,6 @@ pub(crate) async fn run(
                         continue;
                     }
                     spawn_reminders.insert(index, check.unwrap_or_default());
-                    if spawns.len() >= resolve_max_parallel(&subagent_defaults) {
-                        results[index] = Some(Err(format!("同一轮最多运行 {} 个子智能体", resolve_max_parallel(&subagent_defaults))));
-                        continue;
-                    }
                     let description = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
                         .and_then(|value| value.get("description").and_then(|item| item.as_str()).map(str::to_string))
                         .unwrap_or_else(|| "研究子任务".into());
@@ -2095,7 +2037,6 @@ pub(crate) async fn run(
                     subagent_id.clone(),
                     arguments,
                     cancel.clone(),
-                    spawn_budget.clone(),
                     true,
                     Vec::new(),
                 )
@@ -2549,6 +2490,7 @@ mod tests {
                 tool: "write_file".into(),
                 detail: "src/a.ts".into(),
                 allowed: true,
+                blocked: None,
                 subagent_id: None,
                 pending: None,
                 target: None,
@@ -2741,15 +2683,5 @@ mod tests {
         definition.steps = Some(8);
         assert_eq!(resolve_steps(&definition, &defaults), Some(8));
         definition.steps = None;
-        assert_eq!(resolve_max_parallel(&defaults), 3);
-        assert_eq!(resolve_max_total(&defaults), 9);
-        // 全局默认也未设置时回退内置；env 仅作未设置项的兜底。
-        let empty = crate::domain::SubagentDefaults::default();
-        assert_eq!(resolve_max_parallel(&empty), 4);
-        assert_eq!(resolve_max_total(&empty), 8);
-        // 文件值超界时 clamp，而不是透传。
-        let wild = crate::domain::SubagentDefaults { max_parallel: Some(99), max_total: Some(0), ..Default::default() };
-        assert_eq!(resolve_max_parallel(&wild), 8);
-        assert_eq!(resolve_max_total(&wild), 1);
     }
 }

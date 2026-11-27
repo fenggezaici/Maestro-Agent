@@ -1415,10 +1415,12 @@ impl ToolRouter {
             }
             "grep_files" => {
                 let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;
+                // 弱模型常猜 pattern/regex——别名宽容，少一条硬错。
+                let query = ["query", "pattern", "regex"].iter().find_map(|key| arguments.get(key).and_then(|v| v.as_str()).filter(|v| !v.is_empty())).unwrap_or("");
                 let glob = arguments.get("glob").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 let ignore_case = arguments.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
                 let context = arguments.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                (fs::grep_files(root, arg("query", tool)?, glob, ignore_case, context)?, None)
+                (fs::grep_files(root, query, glob, ignore_case, context)?, None)
             }
             "repo_map" => {
                 let root = workspace_root.ok_or_else(|| NO_WORKSPACE.to_string())?;

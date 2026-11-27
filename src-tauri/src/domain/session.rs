@@ -186,6 +186,9 @@ pub struct ToolCallView {
     pub tool: String,
     pub detail: String,
     pub allowed: bool,
+    /// 真策略阻断（区别于执行失败）——UI 据此分态渲染「已阻止」vs「失败」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
     /// Set for `spawn_subagent` rows so the UI can open the matching trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_id: Option<String>,

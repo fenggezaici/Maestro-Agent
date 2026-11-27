@@ -122,6 +122,11 @@ fn collect_source_files(root: &Path) -> AppResult<Vec<(String, i64)>> {
     let mut out: Vec<(String, i64)> = all
         .into_iter()
         .filter(|rel| languages::lang_for_path(rel).is_some())
+        // minified/打包产物（chart.umd.min.js 类）符号噪声极大且吃光预算——不进图谱。
+        .filter(|rel| {
+            let lower = rel.to_ascii_lowercase();
+            !lower.contains(".min.") && !lower.contains(".bundle.")
+        })
         .filter_map(|rel| {
             let full = base.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
             let meta = std::fs::metadata(&full).ok()?;

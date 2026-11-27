@@ -2272,6 +2272,7 @@ name = "maestro"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "encoding_rs",
  "futures-util",
  "image",
  "regex",

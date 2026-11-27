@@ -2151,6 +2151,7 @@ fn apply_trace_tool(view: &mut SubagentView, tool: &str, phase: ToolPhase, detai
         tool: tool.into(),
         detail: detail.into(),
         allowed: !matches!(phase, ToolPhase::Failed | ToolPhase::Blocked),
+        blocked: matches!(phase, ToolPhase::Blocked).then_some(true),
         subagent_id: Some(view.id.clone()),
         pending: matches!(phase, ToolPhase::Started | ToolPhase::AwaitingApproval).then_some(true),
         target: (phase == ToolPhase::Started).then(|| detail.to_string()),
@@ -4922,7 +4923,6 @@ mod tests {
             "sub-probe".into(),
             &format!(r#"{{"description":"测试调研","prompt":"调研仓库结构","subagent_type":"{subagent_type}"}}"#),
             rx,
-            Arc::new(std::sync::atomic::AtomicUsize::new(4)),
             false,
             Vec::new(),
         )

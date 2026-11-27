@@ -72,7 +72,7 @@ export interface PlanCard {
   status: PlanStatus;
   draft: PlanDraft;
 }
-export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string; subagentId?: string }
+export interface ToolCallView { runId: number; tool: string; detail: string; allowed: boolean; blocked?: boolean; pending?: boolean; awaitingApproval?: boolean; target?: string; subagentId?: string }
 
 export interface QuestionOption { label: string; description?: string | null }
 export interface UserQuestion {

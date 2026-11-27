@@ -404,7 +404,19 @@ pub fn read_file_full(root: &Path, rel: &str) -> AppResult<String> {
         return Err("文件超过 256KB 限制".into());
     }
     let bytes = std::fs::read(&file).map_err(|_| "文件不可读".to_string())?;
-    String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本文件".to_string())
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(err) => {
+            // 中文遗留代码库现实：GBK 源码并不少见——回退解码并标注，
+            // 强过直接拒读；非 GBK 二进制会产乱码但不影响安全。
+            let bytes = err.into_bytes();
+            let (decoded, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+            if had_errors && decoded.matches('\u{FFFD}').count() > 64 {
+                return Err("非 UTF-8/GBK 文本文件".into());
+            }
+            Ok(format!("（编码回退：GBK 解码，非 UTF-8 原文）\n{decoded}"))
+        }
+    }
 }
 
 /// 图像工具结果的二进制读取：与文本同一套边界（sensitive denylist、
