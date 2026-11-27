@@ -1,7 +1,7 @@
 /// Agent stream hook: owns the `kernel-event` subscription, replay buffer,
 /// and baseline reconciliation. Live effects (refresh on status/sessions)
 /// stay here; state writes go through the kernel store.
-import { useEffect } from 'react';
+import { startTransition, useEffect } from 'react';
 
 import { kernelApi } from '../api/kernel';
 import type { KernelEvent } from '../api/types';
@@ -34,7 +34,14 @@ export function useAgentStream() {
         lastEventSequence = event.sequence;
       }
       const store = useKernelStore.getState();
-      store.dispatch({ type: 'event', event });
+      // 高频流式事件降级为可中断渲染：zustand 状态写入本身仍同步保序，
+      // startTransition 只把订阅者渲染标为低优先级——点击文件/面板交互
+      // 的 urgent 渲染得以插队，不再排在逐 token 的重渲队列后数秒。
+      if (event.type === 'content' || event.type === 'reasoning' || event.type === 'subagent_token') {
+        startTransition(() => store.dispatch({ type: 'event', event }));
+      } else {
+        store.dispatch({ type: 'event', event });
+      }
       store.applySideEffects(event);
       if (event.type === 'backend_error') {
         void kernelApi.snapshot().then((snapshot) => {
