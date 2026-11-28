@@ -171,7 +171,6 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
   }
 
   const currentRun = runs.at(-1);
-  const statusReport = currentRun ? metrics?.[currentRun.id] : undefined;
   const [statusTick, setStatusTick] = useState(0);
   const [projectQuery, setProjectQuery] = useState('');
   const statusStarted = useRef<number | null>(null);
@@ -181,8 +180,10 @@ function Composer({ ref, atBottom, onScrollBottom, onSubmit, attachments, onAtta
     const timer = window.setInterval(() => setStatusTick(performance.now() - (statusStarted.current ?? performance.now())), 100);
     return () => window.clearInterval(timer);
   }, [status, currentRun?.id]);
+  // 纯墙钟：并行子智能体的 LLM 耗时折进同一累加器后，后端 elapsedMs
+  // 既乘性通胀又随「最近汇报流」上下跳变——药丸标题承诺的是总耗时
+  // （含工具/审批/等待），墙钟是唯一诚实且单调的口径。
   const statusElapsed = Math.max(
-    statusReport?.elapsedMs ?? 0,
     currentRun?.createdAt ? Date.now() - currentRun.createdAt * 1000 : 0,
     statusTick,
   );

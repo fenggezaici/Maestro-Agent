@@ -5110,6 +5110,113 @@ mod tests {
         kernel.shutdown().await.unwrap();
     }
 
+    /// 并行 spawn 探针：父级首轮派发 slow+fast 两个子智能体（slow 先派），
+    /// 子流按 prompt 标记区分速度——slow 睡 700ms，fast 即时完工。
+    struct ParallelSpawnProbe;
+
+    impl LlmProvider for ParallelSpawnProbe {
+        fn stream<'a>(
+            self: Arc<Self>,
+            _config: &'a ChatConfig,
+            messages: &'a [crate::domain::ChatMessage],
+            _tools: &'a [crate::domain::ToolSpec],
+            _cancel: &'a mut watch::Receiver<bool>,
+            events: tokio::sync::mpsc::UnboundedSender<crate::adapters::llm::StreamEvent>,
+        ) -> futures_util::future::BoxFuture<'a, AppResult<crate::adapters::llm::TurnOutcome>> {
+            use crate::adapters::llm::{StreamEvent, TurnOutcome};
+            let joined = messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("
+");
+            let is_continuation = messages.iter().any(|m| m.role == "tool");
+            let slow = joined.contains("慢速调研");
+            let fast = joined.contains("快速调研");
+            Box::pin(async move {
+                let done = |content: &str, tool_calls| TurnOutcome {
+                    done: true,
+                    tool_calls,
+                    content: content.to_string(),
+                    thinking: None,
+                    finish_reason: None,
+                    dropped_tool_calls: 0,
+                    input_tokens: None,
+                };
+                if slow {
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    let _ = events.send(StreamEvent::Token("慢完成".into()));
+                    let _ = events.send(StreamEvent::Done);
+                    return Ok(done("慢完成", Vec::new()));
+                }
+                if fast {
+                    let _ = events.send(StreamEvent::Token("快完成".into()));
+                    let _ = events.send(StreamEvent::Done);
+                    return Ok(done("快完成", Vec::new()));
+                }
+                if is_continuation {
+                    let _ = events.send(StreamEvent::Done);
+                    return Ok(done("父级收尾", Vec::new()));
+                }
+                // 父级首轮：slow 先派、fast 后派——逐完成发射下 fast 的 finish
+                // 必须先于 slow 到达（整批捆绑时代则是派发顺序）。
+                let spawns = vec![
+                    crate::domain::ToolCallSpec {
+                        id: "spawn-slow".into(),
+                        name: "spawn_subagent".into(),
+                        arguments: r#"{"subagent_type":"explore","prompt":"慢速调研任务","description":"slow"}"#.into(),
+                    },
+                    crate::domain::ToolCallSpec {
+                        id: "spawn-fast".into(),
+                        name: "spawn_subagent".into(),
+                        arguments: r#"{"subagent_type":"explore","prompt":"快速调研任务","description":"fast"}"#.into(),
+                    },
+                ];
+                let _ = events.send(StreamEvent::Done);
+                Ok(done("派发中", spawns))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_spawn_finish_events_arrive_per_completion_not_batch_order() {
+        let (kernel, events) = test_kernel().await;
+        let probe = Arc::new(ParallelSpawnProbe);
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        let session_id = kernel.database.create_session().await.unwrap().id;
+        kernel
+            .start_model(session_id, "并行调研".into(), Vec::new(), test_config())
+            .await
+            .unwrap();
+        wait_for_idle(&kernel).await;
+        use crate::domain::event::{EventData, ToolPhase};
+        let (slow_seq, fast_seq) = {
+            let captured = events.lock().unwrap();
+            let mut desc_by_id = std::collections::HashMap::new();
+            let mut finish_seq = std::collections::HashMap::new();
+            for event in captured.iter() {
+                if let EventData::ToolCall { tool, phase, detail, subagent_id, .. } = &event.data {
+                    if tool == "spawn_subagent" {
+                        if *phase == ToolPhase::Started {
+                            if let Some(id) = subagent_id {
+                                desc_by_id.insert(id.clone(), detail.clone());
+                            }
+                        }
+                        if *phase == ToolPhase::Finished {
+                            if let Some(id) = subagent_id {
+                                finish_seq.insert(id.clone(), event.sequence);
+                            }
+                        }
+                    }
+                }
+            }
+            let slow_id = desc_by_id.iter().find(|(_, desc)| desc.contains("slow")).map(|(id, _)| id.clone()).expect("slow spawn started");
+            let fast_id = desc_by_id.iter().find(|(_, desc)| desc.contains("fast")).map(|(id, _)| id.clone()).expect("fast spawn started");
+            (
+                finish_seq.get(&slow_id).copied().expect("slow finish emitted"),
+                finish_seq.get(&fast_id).copied().expect("fast finish emitted"),
+            )
+        };
+        assert!(fast_seq < slow_seq, "fast 的 finish 必须先于 slow 到达（fast={fast_seq} slow={slow_seq}）——整批捆绑复活");
+        kernel.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn subagent_compacts_midflight_when_context_fills() {
         let (kernel, _) = test_kernel().await;

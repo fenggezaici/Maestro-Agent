@@ -97,3 +97,35 @@ it('lists session rules and revokes one', async () => {
   await waitFor(() => expect(revokeApprovalRule).toHaveBeenCalledWith(7, { tool: 'run_command', pattern: 'npm', prefix: true }));
   await waitFor(() => expect(screen.queryByText('npm *')).not.toBeInTheDocument());
 });
+
+it('spawn row badge follows the linked subagent trace status, not the batch pending flag', () => {
+  const call: ToolCallView = {
+    runId: 7,
+    tool: 'spawn_subagent',
+    detail: '调研任务',
+    allowed: true,
+    pending: true,
+    subagentId: 'sa-7-1',
+  };
+  const subagent = {
+    id: 'sa-7-1', runId: 7, sessionId: 1, agent: 'explore', description: '调研', prompt: '',
+    status: 'completed' as const, summary: 'done', content: '', reasoning: '', toolCount: 3,
+    timeline: [], startedAt: 0, tools: [],
+  };
+  render(<ToolCallRow call={call} subagent={subagent} />);
+  expect(screen.getByText('完成')).toBeInTheDocument();
+  expect(screen.queryByText('执行中')).not.toBeInTheDocument();
+});
+
+it('spawn row badge falls back to batch state when trace not yet linked', () => {
+  const call: ToolCallView = {
+    runId: 7,
+    tool: 'spawn_subagent',
+    detail: '调研任务',
+    allowed: true,
+    pending: true,
+    subagentId: 'sa-7-2',
+  };
+  render(<ToolCallRow call={call} />);
+  expect(screen.getByText('执行中')).toBeInTheDocument();
+});

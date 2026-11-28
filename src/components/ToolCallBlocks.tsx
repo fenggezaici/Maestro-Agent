@@ -98,8 +98,14 @@ export const ToolCallRow = memo(function ToolCallRow({ call, onSelectFile, onOpe
   const [denyOpen, setDenyOpen] = useState(false);
   const [feedback, setFeedback] = useState('');
   const pending = Boolean(call.pending || call.awaitingApproval);
-  const status = call.awaitingApproval ? '待批准' : call.pending ? '执行中' : call.allowed ? '已执行' : call.blocked ? '已阻止' : '失败';
-  const statusClass = call.awaitingApproval || call.pending ? 'pending' : call.allowed ? 'ok' : call.blocked ? 'blocked' : 'failed';
+  // spawn 行徽章优先呈现子智能体本体真态（trace 按 subagentId 精确键控），
+  // 而非工具调用批次态——用户关心的是子智能体跑到哪了。
+  const subagentStatus = subagent && call.tool === 'spawn_subagent'
+    ? { running: '执行中', completed: '完成', failed: '失败', cancelled: '已取消' }[subagent.status]
+    : undefined;
+  const status = subagentStatus ?? (call.awaitingApproval ? '待批准' : call.pending ? '执行中' : call.allowed ? '已执行' : call.blocked ? '已阻止' : '失败');
+  // 颜色跟随最终显示语义——subagent 真态接管文字时颜色同步（完成不再 amber 脉冲）。
+  const statusClass = status === '待批准' || status === '执行中' ? 'pending' : status === '失败' ? 'failed' : status === '已阻止' ? 'blocked' : 'ok';
   const { icon: Icon, verb, short } = meta(call.tool);
   const target = targetOf(call);
   const writeResult = call.allowed ? writeResultOf(call.detail) : null;

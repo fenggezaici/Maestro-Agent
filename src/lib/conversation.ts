@@ -82,7 +82,11 @@ export function applyToolEventIndexed(
   event: Extract<KernelEvent, { type: 'tool_call' }>,
 ): { next: Record<number, ToolCallView[]>; index: number } {
   const list = [...(current[event.runId] ?? [])];
-  const pendingIndex = list.findIndex((call) => call.tool === event.tool && call.pending);
+  // 逐完成发射后 finish 乱序到达：spawn 事件携带 subagentId 必须精确归行，
+  // 否则先完成的子智能体结果会贴到「同名第一个 pending」的错误行上。
+  const pendingIndex = event.subagentId
+    ? list.findIndex((call) => call.subagentId === event.subagentId && call.pending)
+    : list.findIndex((call) => call.tool === event.tool && call.pending);
   const prev = pendingIndex >= 0 ? list[pendingIndex] : undefined;
   const entry: ToolCallView = {
     runId: event.runId,

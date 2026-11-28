@@ -1638,38 +1638,47 @@ pub(crate) async fn run_subagent(
             if !member_spawns.is_empty() {
                 let futures: Vec<_> = member_spawns
                     .iter()
-                    .map(|(_, member_id, member, arguments, _)| {
+                    .map(|(_, member_id, member, arguments, member_desc)| {
                         let mut grants = member.grants.clone();
                         if let Some(squad) = &squad {
                             grants.extend(squad.squad_grants.clone());
                         }
-                        Box::pin(run_subagent(
-                            kernel.clone(),
-                            config,
-                            session_id,
-                            run_id,
-                            member_id.clone(),
-                            arguments,
-                            cancel.clone(),
-                            false,
-                            grants,
-                        ))
+                        let kernel = kernel.clone();
+                        let member_id = member_id.clone();
+                        let member_desc = member_desc.clone();
+                        let cancel = cancel.clone();
+                        // 逐完成发射：finish emit 在 future 内部完成即发（与父循环同构）。
+                        Box::pin(async move {
+                            let result = run_subagent(
+                                kernel.clone(),
+                                config,
+                                session_id,
+                                run_id,
+                                member_id.clone(),
+                                arguments,
+                                cancel,
+                                false,
+                                grants,
+                            )
+                            .await;
+                            let detail = match &result {
+                                Ok(text) => text.chars().take(256).collect::<String>(),
+                                Err(error) => error.clone(),
+                            };
+                            kernel
+                                .emit_spawn(
+                                    run_id,
+                                    &member_id,
+                                    if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed },
+                                    &format!("{member_desc} · {detail}"),
+                                )
+                                .await;
+                            result
+                        })
                     })
                     .collect();
                 let spawned = join_all(futures).await;
-                for ((index, member_id, member, _, member_desc), result) in member_spawns.into_iter().zip(spawned) {
-                    let detail = match &result {
-                        Ok(text) => text.chars().take(256).collect::<String>(),
-                        Err(error) => error.clone(),
-                    };
-                    kernel
-                        .emit_spawn(
-                            run_id,
-                            &member_id,
-                            if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed },
-                            &format!("{member_desc} · {detail}"),
-                        )
-                        .await;
+                for ((index, _, member, _, _), result) in member_spawns.into_iter().zip(spawned) {
                     // 必选成员核销：派发成功即计（与装配核销同口径）。
                     if result.is_ok() {
                         pending_members.retain(|name| name != &member.agent);
@@ -2050,25 +2059,37 @@ pub(crate) async fn run(
                 };
                 results[index] = Some(result);
             }
-            let spawned = join_all(spawns.iter().map(|(_, subagent_id, arguments, _)| {
-                run_subagent(
-                    kernel.clone(),
-                    &config,
-                    run.session_id,
-                    run.id,
-                    subagent_id.clone(),
-                    arguments,
-                    cancel.clone(),
-                    true,
-                    Vec::new(),
-                )
+            let spawned = join_all(spawns.iter().map(|(_, subagent_id, arguments, description)| {
+                let kernel = kernel.clone();
+                let description = description.clone();
+                let config = &config;
+                let cancel = cancel.clone();
+                // 逐完成发射：finish emit 在 future 内部完成即发出——若等 join_all
+                // 整批收尾才发，先完成的行会被最慢者劫持 stuck「执行中」（实测错位根因）。
+                async move {
+                    let result = run_subagent(
+                        kernel.clone(),
+                        config,
+                        run.session_id,
+                        run.id,
+                        subagent_id.clone(),
+                        arguments,
+                        cancel,
+                        true,
+                        Vec::new(),
+                    )
+                    .await;
+                    let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
+                    kernel.emit_spawn(run.id, subagent_id, if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
+                    result
+                }
             })).await;
-            for ((index, subagent_id, _, description), result) in spawns.into_iter().zip(spawned) {
-                let detail = match &result { Ok(text) => text.chars().take(512).collect::<String>(), Err(error) => error.clone() };
-                kernel.emit_spawn(run.id, &subagent_id, if result.is_ok() { ToolPhase::Finished } else { ToolPhase::Failed }, &format!("{description} · {detail}")).await;
+            for ((index, _, _, _), result) in spawns.into_iter().zip(spawned) {
                 let reminder = spawn_reminders.remove(&index).flatten();
                 results[index] = Some(result.map(|text| {
-                    (reminder.map(|r| format!("{text}\n\n{r}")).unwrap_or(text), Vec::new())
+                    (reminder.map(|r| format!("{text}
+
+{r}")).unwrap_or(text), Vec::new())
                 }));
             }
             if !normal_calls.is_empty() {

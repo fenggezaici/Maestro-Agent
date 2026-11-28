@@ -59,6 +59,23 @@ it('advances the snapshot on task_plan_updated without touching run state', () =
 });
 
 describe('subagent tool rows', () => {
+  it('routes out-of-order parallel finishes to the correct row by subagentId', () => {
+    // 逐完成发射后乱序到达：C 先完成、A 后完成——结果必须各归各行，
+    // 不能贴到「同名第一个 pending」的错误行。
+    let state: ReturnType<typeof applyToolEventIndexed>['next'] = {};
+    for (const [id, sequence] of [['sa-1-a', 1], ['sa-1-b', 2], ['sa-1-c', 3]] as const) {
+      state = applyToolEventIndexed(state, { sequence, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'started', detail: `任务${id}`, subagentId: id }).next;
+    }
+    state = applyToolEventIndexed(state, { sequence: 4, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'finished', detail: 'C的结论', subagentId: 'sa-1-c' }).next;
+    state = applyToolEventIndexed(state, { sequence: 5, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'finished', detail: 'A的结论', subagentId: 'sa-1-a' }).next;
+    const rows = state[1];
+    expect(rows[0].detail).toBe('A的结论');
+    expect(rows[0].pending).toBeFalsy();
+    expect(rows[1].pending).toBeTruthy();
+    expect(rows[2].detail).toBe('C的结论');
+    expect(rows[2].pending).toBeFalsy();
+  });
+
   it('keeps subagentId across started and finished phases', () => {
     const started = applyToolEventIndexed({}, { sequence: 1, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'started', detail: '调研', subagentId: 'sa-1-1' });
     const finished = applyToolEventIndexed(started.next, { sequence: 2, type: 'tool_call', runId: 1, tool: 'spawn_subagent', phase: 'finished', detail: 'done', subagentId: 'sa-1-1' });
