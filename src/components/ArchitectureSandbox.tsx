@@ -31,6 +31,7 @@ import {
 } from '../lib/nodeLibrary';
 import NodeLibrary, { ItemHint } from './NodeLibrary';
 import { sandboxFixtureExtensions } from './workbenchMock';
+import ConfirmDialog from './ConfirmDialog';
 import { Choice } from './ui';
 
 type SandboxNodeData = { nodeType: NodeKind; traceStatus?: TraceStatus } & Record<string, unknown>;
@@ -667,6 +668,8 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   const [issues, setIssues] = useState<{ errors: string[]; warnings: string[] } | null>(null);
   const [loaded, setLoaded] = useState<{ path: string | null; source: string; mergedWith?: string | null } | null>(null);
   const [dirty, setDirty] = useState(false);
+  // 脏标下的作用域切换先经共享确认框暂存目标——替代原生 window.confirm。
+  const [pendingScope, setPendingScope] = useState<'project' | 'global' | null>(null);
   const [showJson, setShowJson] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState('');
@@ -722,8 +725,9 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
     }
   }, [openSquad, setEdges]);
   const enterSquad = useCallback((name: string) => {
+    // 仅真实新建子沙盘条目才算编辑——双击浏览已有军团不得脏标。
+    if (!squadsRef.current[name]) markDirty();
     setSquads((map) => (map[name] ? map : { ...map, [name]: { nodes: [], edges: [] } }));
-    markDirty();
     setOpenSquad(name);
     setSelectedId(null);
     setStatus({ kind: 'info', text: `已进入军团 ${name} 的子沙盘：成员用「派发」出口连成树，扩展「装配」出口连到成员` });
@@ -1176,7 +1180,9 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
   // RF 变更统一经画布适配层回写（主图 useNodesState / 军团 squads 映射）。
   const handleNodesChange = useCallback((changes: NodeChange<SandboxNode>[]) => {
     updateCanvasNodes((items) => applyNodeChanges(changes, items));
-    if (changes.some((c) => c.type !== 'select')) markDirty();
+    // dimensions 是 RF 挂载/重测节点的自动派发——非用户编辑，不得脏标
+    // （否则加载完成下一帧即脏，浏览切换作用域必弹保存提示）。
+    if (changes.some((c) => c.type !== 'select' && c.type !== 'dimensions')) markDirty();
   }, [updateCanvasNodes, markDirty]);
   const handleEdgesChange = useCallback((changes: EdgeChange<SandboxEdge>[]) => {
     updateCanvasEdges((items) => applyEdgeChanges(changes, items));
@@ -1236,7 +1242,7 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
             ) : (
               <>
                 <Layers size={14} />
-                <Choice label="规则作用域" value={scope} onChange={(v) => { if (dirtyRef.current && !window.confirm('未保存的修改将丢失，仍切换作用域？')) return; setScope(v as 'project' | 'global'); }}
+                <Choice label="规则作用域" value={scope} onChange={(v) => { if (dirtyRef.current) setPendingScope(v as 'project' | 'global'); else setScope(v as 'project' | 'global'); }}
                   options={[
                     { value: 'project', label: `项目规则${extensions.hasWorkspace || preview ? '' : '（需工作区）'}` },
                     { value: 'global', label: '全局规则' },
@@ -1398,6 +1404,14 @@ function SandboxInner({ preview, extensions, trace }: SandboxProps) {
           {known.servers.flatMap((server) => server.tools.map((tool) => `mcp__${server.name}__${tool.name}`)).map((tool) => <option key={tool} value={tool} />)}
         </datalist>
       </aside>
+      <ConfirmDialog
+        open={pendingScope !== null}
+        onOpenChange={(open) => { if (!open) setPendingScope(null); }}
+        title="切换规则作用域"
+        description={`当前${scope === 'project' ? '项目' : '全局'}规则有未保存的修改，切换后将丢弃这些修改。仍要切换吗？`}
+        confirmLabel="切换并丢弃"
+        onConfirm={() => { if (pendingScope) setScope(pendingScope); }}
+      />
     </div>
   );
 }
