@@ -114,6 +114,7 @@ fn classify_segment(tokens: &[String]) -> Option<(String, Vec<String>)> {
             args_match(args, HEAD_TAIL_FLAGS, true) && positionals_are_relative(args)
         }
         "wc" => args_match(args, WC_FLAGS, true) && positionals_are_relative(args),
+        "tr" => args_match(args, TR_FLAGS, true),
         "sort" => {
             let expanded = expand_short_clusters(args, "nrubfsVMhz", "kt");
             args_match(&expanded, SORT_FLAGS, true) && positionals_are_relative(&expanded)
@@ -690,7 +691,23 @@ fn args_match(args: &[String], flags: &[FlagSpec], allow_positional: bool) -> bo
                     }
                 }
             }
-            let Some(spec) = flags.iter().find(|spec| spec.name == arg) else {
+            // `--flag=value` 内联形态：值在同一 argv 元素内，无 shell 参与
+            // 不存在注入面——按 valued 规格接受；非 valued 规格拒收。
+            if let Some(eq) = arg.strip_prefix("--").and_then(|rest| rest.find('=')) {
+                let name_end = 2 + eq;
+                let name = &arg[..name_end];
+                let value = &arg[name_end + 1..];
+                if value.is_empty() {
+                    return false;
+                }
+                if !flags.iter().any(|spec| spec.takes_value && spec.name == name) {
+                    return false;
+                }
+                index += 1;
+                continue;
+            }
+            let Some(spec) = flags.iter().find(|spec| spec.name == arg && !spec.takes_value)
+                .or_else(|| flags.iter().find(|spec| spec.name == arg)) else {
                 return false;
             };
             index += 1;
@@ -719,6 +736,12 @@ const GIT_STATUS: &[FlagSpec] = &[
     flag("--branch"),
     flag("-b"),
     flag("--porcelain"),
+    valued("--porcelain"),
+    flag("--long"),
+    valued("--untracked-files"),
+    flag("--untracked-files"),
+    valued("--ignore-submodules"),
+    flag("--ignore-submodules"),
     flag("--"),
 ];
 const GIT_DIFF: &[FlagSpec] = &[
@@ -764,6 +787,8 @@ const GIT_LS_FILES: &[FlagSpec] = &[
     flag("--modified"),
     flag("--deleted"),
     flag("--exclude-standard"),
+    flag("-z"),
+    flag("--stage"),
     flag("--"),
 ];
 const GIT_LS_TREE: &[FlagSpec] = &[
@@ -1033,6 +1058,8 @@ const HEAD_TAIL_FLAGS: &[FlagSpec] = &[
     flag("--follow"),
 ];
 const WC_FLAGS: &[FlagSpec] = &[flag("-l"), flag("-w"), flag("-c"), flag("-m"), flag("-L")];
+// tr 是纯 stdin→stdout 过滤器、从不触碰文件——positional 是字符集数据而非路径。
+const TR_FLAGS: &[FlagSpec] = &[flag("-d"), flag("-s"), flag("-c"), flag("-C"), flag("-t")];
 const LS_FLAGS: &[FlagSpec] = &[
     flag("-l"),
     flag("-a"),
@@ -1072,7 +1099,16 @@ mod tests {
         for command in [
             "git status",
             "git status --short",
+            "git status --porcelain --untracked-files=normal",
+            "git status --porcelain=v1 --branch",
+            "git status --untracked-files all --long",
+            "git status --ignore-submodules=dirty",
+            "git ls-files -z --stage",
+            "wc -l src/main.rs",
+            "wc -l",
             "git diff",
+            "tr -d x",
+            "tr a-z A-Z",
             "git diff --stat",
             "git diff --name-only src/a.ts",
             "git diff --cached",
@@ -1119,6 +1155,9 @@ mod tests {
             "git config --unset user.name",
             "git describe HEAD",
             "git status --short=1",
+            "tr --delete x",
+            "wc --files0-from=x",
+            "tr -x foo",
             "git status -sb extra --stat",
         ] {
             assert!(!safe(command), "{command}");

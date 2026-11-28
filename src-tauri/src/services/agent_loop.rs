@@ -648,7 +648,6 @@ struct SubagentDrainCtx {
     provider: String,
     model: String,
     subagent_id: String,
-    activity: Arc<AtomicU64>,
 }
 
 async fn drain_subagent_stream(
@@ -657,7 +656,7 @@ async fn drain_subagent_stream(
     mut rx: mpsc::UnboundedReceiver<StreamEvent>,
     started: Instant,
 ) -> SubagentCall {
-    let SubagentDrainCtx { run_id, session_id, provider, model, subagent_id, activity } = ctx;
+    let SubagentDrainCtx { run_id, session_id, provider, model, subagent_id } = ctx;
     let mut call = SubagentCall::default();
     let mut last_delta_ms = None;
     // 父 metrics 口径按“本调用”计时（与 stream_turn relay 同构）。
@@ -695,8 +694,6 @@ async fn drain_subagent_stream(
         m.live_surface_tokens = (est > 0).then_some(est);
     };
     while let Some(event) = rx.recv().await {
-        // 任何事件都证明模型流活着——喂饱看门狗。
-        activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         // DSH isTokenDelta：text/reasoning/tool-call delta 都算有效增量。
         let is_delta = matches!(
             event,
@@ -1332,14 +1329,34 @@ pub(crate) async fn run_subagent(
             }
             let round_tools: &[ToolSpec] = if synthesis_round { &[] } else { &tools };
             let mut attempt = 0;
+            // idle 重试独立于网络重试：排队静默作废本轮重排队一次，notes/工具
+            // 工作全保留；连续第二次静默才诚实失败。
+            let mut idle_retried = false;
             let (outcome, text) = loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return ChildOutcome { status: SubagentStatus::Failed, content: notes, error: Some(timeout_message), input_tokens, output_tokens, reasoning_tokens, first_token_ms, elapsed_ms, decode_ms, decode_tokens, last_input_tokens, tool_count };
                 }
-                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx, mut rx_wire) = mpsc::unbounded_channel();
+                let (tx_drain, rx_drain) = mpsc::unbounded_channel();
                 let activity = Arc::new(AtomicU64::new(0));
                 let idle_limit = subagent_idle_timeout();
+                // 时钟基准必须逐次尝试重置——重试后若沿用子智能体起点，
+                // activity=0 而 elapsed 已超阈值，看门狗首 tick 即误杀。
+                let attempt_started = Instant::now();
+                // 导线级活跃测量：转发任务只做 收→打时间戳→转发，不触碰 kernel
+                // 锁、无背压（unbounded）——看门狗测的是 provider 真实产出，
+                // 与下游 drain 的锁车队彻底解耦（此前在 drain 侧测量被每 token
+                // 一次的全局 state 锁饿死，健康流被屠杀）。
+                let activity_tap = activity.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = rx_wire.recv().await {
+                        activity_tap.store(attempt_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        if tx_drain.send(event).is_err() {
+                            break;
+                        }
+                    }
+                });
                 // 与 stream 并发排空：delta 时刻是真实到达时间，usage 逐次累加。
                 let consumer = tokio::spawn(drain_subagent_stream(
                     kernel.clone(),
@@ -1349,13 +1366,12 @@ pub(crate) async fn run_subagent(
                         provider: child_config.provider.name().to_string(),
                         model: child_config.model.clone(),
                         subagent_id: subagent_id.clone(),
-                        activity: activity.clone(),
                     },
-                    rx,
-                    started,
+                    rx_drain,
+                    attempt_started,
                 ));
                 // 三路 select：模型流 / 总deadline / 静默看门狗（每5s查活跃时间戳）。
-                // 看门狗触发=丢弃 stream future 物理取消，不 retry 诚实失败。
+                // 看门狗首次触发=作废本轮重排队一次（工作保留），连续二次才诚实失败。
                 // 块作用域隔离：stream future 借用 cancel/messages，结果移出后
                 // 立刻丢弃 future 终结借用，后续重试/压缩才能再动它们。
                 let (streamed, idle_fired) = {
@@ -1370,7 +1386,9 @@ pub(crate) async fn run_subagent(
                             result = &mut stream_fut => break Some(result),
                             _ = &mut total_sleep => break None,
                             _ = watchdog.tick() => {
-                                let silent_ms = started.elapsed().as_millis() as u64 - activity.load(Ordering::Relaxed);
+                                // saturating：forwarder 的 store 可能落在下方两次读取
+                                // 之间（activity 略大于 elapsed），普通减法会下溢。
+                                let silent_ms = (attempt_started.elapsed().as_millis() as u64).saturating_sub(activity.load(Ordering::Relaxed));
                                 if silent_ms >= idle_limit.as_millis() as u64 {
                                     idle_fired = true;
                                     break None;
@@ -1384,7 +1402,7 @@ pub(crate) async fn run_subagent(
                     (Some(Ok(outcome)), _) => Ok(Ok(outcome)),
                     (Some(Err(error)), _) => Ok(Err(error)),
                     (None, true) => Ok(Err(format!(
-                        "模型流静默超过 {} 秒无任何输出，判定卡死已中止（可经 MAESTRO_SUBAGENT_IDLE_TIMEOUT 调整）",
+                        "模型流静默超过 {} 秒无任何输出（重排队一次仍静默），判定卡死已中止——并行子智能体过多时 provider 排队是主因，可减少并行或换更强模型（MAESTRO_SUBAGENT_IDLE_TIMEOUT 可调）",
                         idle_limit.as_secs()
                     ))),
                     (None, false) => Err(()),
@@ -1403,6 +1421,10 @@ pub(crate) async fn run_subagent(
                 match streamed {
                     Ok(Ok(outcome)) => break (outcome, partial),
                     Ok(Err(error)) => {
+                        if idle_fired && !idle_retried && !*cancel.borrow() {
+                            idle_retried = true;
+                            continue;
+                        }
                         let retryable = attempt == 0
                             && partial.trim().is_empty()
                             && error.contains("网络连接已中断")

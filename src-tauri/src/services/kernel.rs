@@ -5000,10 +5000,113 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = drive_typed_subagent(&kernel, "capped-explore", &test_config()).await;
         let elapsed = started.elapsed().as_secs();
-        // 失败如实以 Err 上抛（ZCode 口径：不 retry、不粉饰），父级拿到诊断原文。
+        // 连续静默=重排队一次仍静默后才诚实失败（Err 上抛，父级拿诊断原文）。
         let error = outcome.unwrap_err();
         assert!(error.contains("静默"), "看门狗诊断应如实标注：{error}");
+        // 重试语义下耗时约 2×5s+，仍须远早于总超时。
         assert!(elapsed < 60, "看门狗必须在总超时前处决（实际 {elapsed}s）");
+        assert!(elapsed >= 9, "首次静默应重排队一轮而非立即杀死（实际 {elapsed}s）");
+        kernel.shutdown().await.unwrap();
+    }
+
+    /// 首次调用永久静默、重试后正常的探针：验证 idle 重试能救活排队静默，
+    /// 且 messages/轮次工作保留（子智能体最终正常完工而非失败）。
+    struct FlakeySilentProbe {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LlmProvider for FlakeySilentProbe {
+        fn stream<'a>(
+            self: Arc<Self>,
+            _config: &'a ChatConfig,
+            _messages: &'a [crate::domain::ChatMessage],
+            _tools: &'a [crate::domain::ToolSpec],
+            _cancel: &'a mut watch::Receiver<bool>,
+            events: tokio::sync::mpsc::UnboundedSender<crate::adapters::llm::StreamEvent>,
+        ) -> futures_util::future::BoxFuture<'a, AppResult<crate::adapters::llm::TurnOutcome>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                use crate::adapters::llm::{StreamEvent, TurnOutcome};
+                if call == 0 {
+                    return std::future::pending::<AppResult<TurnOutcome>>().await;
+                }
+                let _ = events.send(StreamEvent::Token("重试后完工".into()));
+                let _ = events.send(StreamEvent::Done);
+                Ok(TurnOutcome {
+                    done: true,
+                    tool_calls: Vec::new(),
+                    content: "重试后完工".into(),
+                    thinking: None,
+                    finish_reason: None,
+                    dropped_tool_calls: 0,
+                    input_tokens: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_stream_is_retried_once_and_can_recover() {
+        unsafe { std::env::set_var("MAESTRO_SUBAGENT_IDLE_TIMEOUT", "5") };
+        let (kernel, _) = test_kernel().await;
+        let probe = Arc::new(FlakeySilentProbe { calls: std::sync::atomic::AtomicUsize::new(0) });
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        save_capped_explore(&kernel, Some(8), None).await;
+        let started = std::time::Instant::now();
+        let summary = drive_typed_subagent(&kernel, "capped-explore", &test_config()).await.unwrap();
+        let elapsed = started.elapsed().as_secs();
+        assert!(summary.contains("重试后完工"), "重试后续跑应完工：{summary}");
+        assert!(elapsed >= 5, "必须等满一个静默周期才重试（实际 {elapsed}s）");
+        assert!(elapsed < 30, "恢复后不应拖延（实际 {elapsed}s）");
+        kernel.shutdown().await.unwrap();
+    }
+
+    /// 持续产出的流绝不应被看门狗触碰：每 1.5s 一个 token（慢于 drain 但稳
+    /// 定），总时长跨越两个静默周期。验证转发任务链路完整——事件经 导线tap
+    /// →drain 全通且 activity 被持续喂饱。
+    struct TrickleProbe;
+
+    impl LlmProvider for TrickleProbe {
+        fn stream<'a>(
+            self: Arc<Self>,
+            _config: &'a ChatConfig,
+            _messages: &'a [crate::domain::ChatMessage],
+            _tools: &'a [crate::domain::ToolSpec],
+            _cancel: &'a mut watch::Receiver<bool>,
+            events: tokio::sync::mpsc::UnboundedSender<crate::adapters::llm::StreamEvent>,
+        ) -> futures_util::future::BoxFuture<'a, AppResult<crate::adapters::llm::TurnOutcome>> {
+            Box::pin(async move {
+                use crate::adapters::llm::{StreamEvent, TurnOutcome};
+                for i in 0..8 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let piece = if i == 7 { "细流完工" } else { "滴" };
+                    if events.send(StreamEvent::Token(piece.into())).is_err() {
+                        break;
+                    }
+                }
+                let _ = events.send(StreamEvent::Done);
+                Ok(TurnOutcome {
+                    done: true,
+                    tool_calls: Vec::new(),
+                    content: "细流完工".into(),
+                    thinking: None,
+                    finish_reason: None,
+                    dropped_tool_calls: 0,
+                    input_tokens: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steadily_producing_stream_is_never_touched_by_the_watchdog() {
+        unsafe { std::env::set_var("MAESTRO_SUBAGENT_IDLE_TIMEOUT", "5") };
+        let (kernel, _) = test_kernel().await;
+        let probe = Arc::new(TrickleProbe);
+        *kernel.llm_resolver.lock().unwrap() = Arc::new(move |_| probe.clone());
+        save_capped_explore(&kernel, Some(8), None).await;
+        let summary = drive_typed_subagent(&kernel, "capped-explore", &test_config()).await.unwrap();
+        assert!(summary.contains("细流完工"), "持续产出必须存活到完工：{summary}");
         kernel.shutdown().await.unwrap();
     }
 

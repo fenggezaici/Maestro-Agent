@@ -244,10 +244,42 @@ pub fn resolve_program(name: &str, path: &OsStr, workspace_root: &Path) -> Optio
     None
 }
 
-/// Convenience wrapper that reads the process `PATH`.
+/// Convenience wrapper that reads the process `PATH`. On Windows a plain Git
+/// install puts only `Git\cmd` on PATH while the unix tools live in
+/// `Git\usr\bin` — fall back to scanning the well-known install roots so
+/// `ls`/`wc`/`sort` resolve for the typical user.
 pub fn resolve_in_path(name: &str, workspace_root: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    resolve_program(name, &path, workspace_root)
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(found) = resolve_program(name, &path, workspace_root) {
+            return Some(found);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut extra = std::ffi::OsString::new();
+        for base in [std::env::var_os("ProgramFiles"), std::env::var_os("ProgramFiles(x86)")].into_iter().flatten() {
+            let candidate = Path::new(&base).join("Git").join("usr").join("bin");
+            if candidate.is_dir() {
+                if !extra.is_empty() {
+                    extra.push(";");
+                }
+                extra.push(candidate.as_os_str());
+            }
+        }
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            let candidate = Path::new(&base).join("Programs").join("Git").join("usr").join("bin");
+            if candidate.is_dir() {
+                if !extra.is_empty() {
+                    extra.push(";");
+                }
+                extra.push(candidate.as_os_str());
+            }
+        }
+        if !extra.is_empty() {
+            return resolve_program(name, &extra, workspace_root);
+        }
+    }
+    None
 }
 
 fn program_candidates(name: &str) -> Vec<String> {

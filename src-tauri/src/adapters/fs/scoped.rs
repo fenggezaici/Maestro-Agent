@@ -357,7 +357,9 @@ pub fn read_file_lines(
     let start = offset.unwrap_or(1).max(1) as usize;
     let take = limit.unwrap_or(MAX_READ_LINES as u64).min(MAX_READ_LINES as u64) as usize;
     if start > total && total > 0 {
-        return Err(format!("offset {start} 超出文件范围（共 {total} 行）"));
+        // 软化：模型常用越界 offset 探测总行数——如实告知行数而非报错，
+        // 消灭"红墙"噪音（弱模型数行数是刚需，wc 不可用时这是唯一手段）。
+        return Ok(format!("（已到文件末尾，共 {total} 行）"));
     }
     let mut out = String::new();
     let mut rendered = 0usize;
@@ -677,6 +679,10 @@ mod tests {
         // offset 续读能看到尾部行。
         let tail = read_file_lines(root, "many.txt", Some(1400), Some(1)).unwrap();
         assert!(tail.contains("1400\tline-1400"), "{tail}");
+
+        // 越界 offset 软化：返回行数信息而非报错——模型探测总行数不再制造红墙。
+        let end = read_file_lines(root, "many.txt", Some(99999), None).unwrap();
+        assert!(end.contains("已到文件末尾") && end.contains("1400"), "{end}");
     }
 
     #[test]
